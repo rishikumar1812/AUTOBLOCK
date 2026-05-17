@@ -10,3 +10,10 @@ def stop_dl_in_software(dl_name):
     # 3. Select Building
     # 4. Uncheck dl_name
     # 5. Click Start
+libraries required 
+PyAutoGUI dependencies
+PyScreeze
+PyGetWindow
+PyRect
+MouseInfo
+Pillow
