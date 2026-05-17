@@ -1,0 +1,12 @@
+# Replace this with pywinauto code
+
+
+def stop_dl_in_software(dl_name):
+    print(f"Automating software to stop {dl_name}")
+
+    # Example steps:
+    # 1. Open .exe
+    # 2. Click Setup
+    # 3. Select Building
+    # 4. Uncheck dl_name
+    # 5. Click Start
