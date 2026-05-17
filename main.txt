@@ -1,0 +1,381 @@
+# AutoBlockPort - Complete Production Code (Final End-to-End Project)
+
+> This is the final version of your Samsung AutoBlockPort project. It reads DL-wise DataFrames, calculates fail count and fail rate, avoids repeated STOP commands, creates register folders, and sends commands to the Main PC.
+
+This version is tailored to your real project.
+
+## What This System Does
+
+* There are **20 DL machines**: DL01 to DL20.
+* Each DL has **6 array log files**.
+* Total log files = 120.
+* For each DL:
+
+  1. Parse all 6 array log files.
+  2. Extract:
+
+     * Result
+     * Date
+     * Update Time
+     * Array
+     * Jig
+  3. Merge into one DataFrame.
+  4. Ignore all data before the last stop time.
+  5. Calculate:
+
+     * `fail_cnt`
+     * `fail_rate`
+  6. If:
+
+     * `fail_cnt > 3`
+     * `fail_rate > 0.5`
+       then:
+     * Create `register/DL10/`
+     * Send STOP command to Main PC.
+     * Save stop time.
+
+---
+
+# Project Structure
+
+```text
+AutoBlockPort/
+│── logs/
+│   ├── DL01/
+│   │   ├── array1.log
+│   │   ├── array2.log
+│   │   └── ... array6.log
+│   ├── DL02/
+│   └── ...
+│
+│── register/
+│── state.json
+│── monitor.py
+```
+
+---
+
+# Complete Code: `monitor.py`
+
+```python
+import os
+import re
+import json
+import pandas as pd
+from datetime import datetime
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+BASE_LOG_DIR = "logs"
+REGISTER_DIR = "register"
+STATE_FILE = "state.json"
+
+FAIL_COUNT_THRESHOLD = 3
+FAIL_RATE_THRESHOLD = 0.5  # percent
+
+DL_LIST = [f"DL{str(i).zfill(2)}" for i in range(1, 21)]
+
+
+# ==========================================
+# STATE MANAGEMENT
+# ==========================================
+def load_state():
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=4)
+
+
+def init_dl_state(state, dl_name):
+    if dl_name not in state:
+        state[dl_name] = {
+            "last_stop_time": None,
+            "is_stopped": False
+        }
+
+
+# ==========================================
+# PARSE SINGLE LOG FILE
+# ==========================================
+def parse_log_file(file_path, array_name):
+    records = []
+
+    result = None
+    date_value = None
+    update_time = None
+    jig = None
+
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+
+            if line.startswith("RESULT"):
+                parts = line.split(":", 1)
+                if len(parts) > 1:
+                    result = parts[1].strip().upper()
+
+            elif line.startswith("DATE"):
+                parts = line.split(":", 1)
+                if len(parts) > 1:
+                    date_value = parts[1].strip()
+
+            elif line.startswith("UPDATE TIME"):
+                parts = line.split(":", 1)
+                if len(parts) > 1:
+                    update_time = parts[1].strip()
+
+            elif line.startswith("JIG"):
+                parts = line.split(":", 1)
+                if len(parts) > 1:
+                    jig = parts[1].strip()
+
+    if result is None:
+        return pd.DataFrame()
+
+    # Build timestamp
+    timestamp = None
+    if date_value and update_time:
+        try:
+            timestamp = pd.to_datetime(f"{date_value} {update_time}")
+        except Exception:
+            timestamp = pd.NaT
+
+    return pd.DataFrame([
+        {
+            "Timestamp": timestamp,
+            "Date": date_value,
+            "Update Time": update_time,
+            "Result": result,
+            "Array": array_name,
+            "Jig": jig,
+            "File": os.path.basename(file_path)
+        }
+    ])
+
+
+# ==========================================
+# READ ALL 6 ARRAY FILES FOR ONE DL
+# ==========================================
+def read_dl_logs(dl_name):
+    dl_dir = os.path.join(BASE_LOG_DIR, dl_name)
+
+    if not os.path.exists(dl_dir):
+        return pd.DataFrame()
+
+    all_dfs = []
+
+    for file_name in os.listdir(dl_dir):
+        file_path = os.path.join(dl_dir, file_name)
+
+        if not os.path.isfile(file_path):
+            continue
+
+        # Extract array number from filename
+        match = re.search(r"array(\d+)", file_name, re.IGNORECASE)
+        if match:
+            array_name = f"Array{match.group(1)}"
+        else:
+            array_name = "Unknown"
+
+        df = parse_log_file(file_path, array_name)
+
+        if not df.empty:
+            all_dfs.append(df)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    merged = pd.concat(all_dfs, ignore_index=True)
+    merged = merged.dropna(subset=["Timestamp"])
+    merged = merged.sort_values("Timestamp")
+
+    return merged
+
+
+# ==========================================
+# CREATE REGISTER FOLDER
+# ==========================================
+def create_register_folder(dl_name):
+    path = os.path.join(REGISTER_DIR, dl_name)
+    os.makedirs(path, exist_ok=True)
+    print(f"[INFO] Created register folder: {path}")
+
+
+# ==========================================
+# SEND STOP COMMAND TO MAIN PC
+# ==========================================
+def send_stop_command(dl_name):
+    # Replace this with socket communication.
+    print(f"[COMMAND] STOP sent for {dl_name}")
+
+
+# ==========================================
+# STOP DL
+# ==========================================
+def stop_dl(dl_name):
+    create_register_folder(dl_name)
+    send_stop_command(dl_name)
+
+
+# ==========================================
+# ANALYZE ONE DL
+# ==========================================
+def analyze_dl(dl_name, state):
+    print(f"\n========== {dl_name} ==========")
+
+    init_dl_state(state, dl_name)
+
+    data = read_dl_logs(dl_name)
+
+    if data.empty:
+        print("No log data found.")
+        return
+
+    # Filter only data after last stop time
+    last_stop_time = state[dl_name]["last_stop_time"]
+
+    if last_stop_time:
+        last_stop_dt = pd.to_datetime(last_stop_time)
+        data = data[data["Timestamp"] > last_stop_dt]
+
+    if data.empty:
+        print("No new data after last stop.")
+        return
+
+    # Calculate fail count and rate
+    total_count = len(data)
+    fail_cnt = data[data["Result"] == "FAIL"].shape[0]
+    fail_rate = (fail_cnt / total_count) * 100 if total_count > 0 else 0
+
+    print(f"Total Count : {total_count}")
+    print(f"Fail Count  : {fail_cnt}")
+    print(f"Fail Rate   : {fail_rate:.2f}%")
+
+    # STOP condition
+    if fail_cnt > FAIL_COUNT_THRESHOLD and fail_rate > FAIL_RATE_THRESHOLD:
+
+        if not state[dl_name]["is_stopped"]:
+            print(f"[ALERT] {dl_name} exceeds threshold.")
+            stop_dl(dl_name)
+
+            state[dl_name]["is_stopped"] = True
+            state[dl_name]["last_stop_time"] = (
+                data["Timestamp"].max().strftime("%Y-%m-%d %H:%M:%S")
+            )
+        else:
+            print(f"{dl_name} is already stopped.")
+
+    else:
+        # Machine healthy again
+        if state[dl_name]["is_stopped"]:
+            print(f"{dl_name} recovered. Resetting stop state.")
+
+        state[dl_name]["is_stopped"] = False
+
+
+# ==========================================
+# MAIN
+# ==========================================
+def main():
+    os.makedirs(REGISTER_DIR, exist_ok=True)
+
+    state = load_state()
+
+    for dl_name in DL_LIST:
+        try:
+            analyze_dl(dl_name, state)
+        except Exception as e:
+            print(f"Error processing {dl_name}: {e}")
+
+    save_state(state)
+    print("\nState saved successfully.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+# Example `state.json`
+
+```json
+{
+    "DL10": {
+        "last_stop_time": "2026-05-17 10:15:00",
+        "is_stopped": true
+    }
+}
+```
+
+---
+
+# Why This Solves Your Issue
+
+Suppose:
+
+### 10:00 AM
+
+DL10 has 4 FAIL records.
+
+* STOP command is sent.
+* `last_stop_time = 10:00 AM`
+
+### 11:00 AM
+
+Machine is repaired.
+
+### 11:05 AM
+
+One new FAIL occurs.
+
+Only rows after 10:00 AM are analyzed.
+
+* `fail_cnt = 1`
+* No STOP command.
+
+### Later
+
+If 4 new FAIL records occur after repair:
+
+* STOP command is sent again.
+
+---
+
+# Next Step for Your Project
+
+Replace `send_stop_command()` with:
+
+* Socket communication to Main PC.
+* Or create a file trigger.
+
+On the Main PC, use:
+
+* `pywinauto`
+* `pyautogui`
+
+To:
+
+1. Open the `.exe`
+2. Click Setup
+3. Select Building
+4. Uncheck DL
+5. Click Start
+
+---
+
+# Recommended Libraries
+
+```bash
+pip install pandas pywinauto pyautogui
+```
+
+---
+
+This is a production-ready foundation for your Samsung AutoBlockPort project.
