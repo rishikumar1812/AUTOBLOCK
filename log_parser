@@ -1,0 +1,90 @@
+import os
+import re
+import pandas as pd
+from common.config import BASE_LOG_DIR
+
+
+
+def parse_log_file(file_path, array_name):
+    records = []
+    current = {}
+
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+
+            if line == "#init":
+                if current:
+                    records.append(current)
+                current = {
+                    "Array": array_name,
+                    "File": os.path.basename(file_path)
+                }
+
+            elif ":" in line:
+                key, value = line.split(":", 1)
+                key = key.strip().upper()
+                value = value.strip()
+
+                if key == "MODEL NAME":
+                    current["MODEL_NAME"] = value
+                elif key == "ARRAY":
+                    current["ARRAY"] = value
+                elif key == "JIG":
+                    current["JIG"] = value
+                elif key == "DATE":
+                    current["DATE"] = value
+                elif key in ["UPDATE", "UPDATE TIME"]:
+                    current["UPDATE_TIME"] = value
+                elif key == "RESULT":
+                    current["RESULT"] = value.upper()
+
+    if current:
+        records.append(current)
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+
+    if "DATE" in df.columns and "UPDATE_TIME" in df.columns:
+        df["Timestamp"] = pd.to_datetime(
+            df["DATE"] + " " + df["UPDATE_TIME"],
+            errors="coerce",
+            dayfirst=True
+        )
+
+    return df
+
+
+
+def read_dl_logs(dl_name):
+    dl_dir = os.path.join(BASE_LOG_DIR, dl_name)
+
+    if not os.path.exists(dl_dir):
+        return pd.DataFrame()
+
+    dfs = []
+
+    for file_name in os.listdir(dl_dir):
+        file_path = os.path.join(dl_dir, file_name)
+
+        if not os.path.isfile(file_path):
+            continue
+
+        match = re.search(r"(\d)$", os.path.splitext(file_name)[0])
+        array_name = f"Array{match.group(1)}" if match else "Unknown"
+
+        df = parse_log_file(file_path, array_name)
+
+        if not df.empty:
+            dfs.append(df)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    merged = pd.concat(dfs, ignore_index=True)
+    merged = merged.dropna(subset=["Timestamp"])
+    merged = merged.sort_values("Timestamp").reset_index(drop=True)
+
+    return merged
