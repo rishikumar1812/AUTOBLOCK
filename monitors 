@@ -1,0 +1,81 @@
+import os
+from common.config import (
+    DL_LIST,
+    REGISTER_DIR,
+    FAIL_COUNT_THRESHOLD,
+    FAIL_RATE_THRESHOLD,
+)
+from common.state_manager import load_state, save_state, init_dl_state
+from dl_client.log_parser import read_dl_logs
+from dl_client.socket_client import send_stop_command
+
+
+
+def create_register_folder(dl_name):
+    path = os.path.join(REGISTER_DIR, dl_name)
+    os.makedirs(path, exist_ok=True)
+    print(f"Created register folder: {path}")
+
+
+
+def stop_dl(dl_name):
+    create_register_folder(dl_name)
+    send_stop_command(dl_name)
+
+
+
+def analyze_dl(dl_name, state):
+    init_dl_state(state, dl_name)
+
+    df = read_dl_logs(dl_name)
+
+    if df.empty:
+        print(f"{dl_name}: No data")
+        return
+
+    last_stop_time = state[dl_name]["last_stop_time"]
+
+    if last_stop_time:
+        df = df[df["Timestamp"] > last_stop_time]
+
+    if df.empty:
+        print(f"{dl_name}: No new data")
+        return
+
+    total_count = len(df)
+    fail_cnt = df[df["RESULT"] == "FAIL"].shape[0]
+    fail_rate = (fail_cnt / total_count) * 100
+
+    print(
+        f"{dl_name}: total={total_count}, fail_cnt={fail_cnt}, fail_rate={fail_rate:.2f}%"
+    )
+
+    if (
+        fail_cnt > FAIL_COUNT_THRESHOLD
+        and fail_rate > FAIL_RATE_THRESHOLD
+    ):
+        if not state[dl_name]["is_stopped"]:
+            print(f"{dl_name}: STOP triggered")
+            stop_dl(dl_name)
+
+            state[dl_name]["is_stopped"] = True
+            state[dl_name]["last_stop_time"] = str(df["Timestamp"].max())
+        else:
+            print(f"{dl_name}: already stopped")
+    else:
+        state[dl_name]["is_stopped"] = False
+
+
+
+def run_monitor():
+    os.makedirs(REGISTER_DIR, exist_ok=True)
+
+    state = load_state()
+
+    for dl_name in DL_LIST:
+        try:
+            analyze_dl(dl_name, state)
+        except Exception as e:
+            print(f"Error in {dl_name}: {e}")
+
+    save_state(state)
