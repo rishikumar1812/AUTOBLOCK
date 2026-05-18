@@ -1,0 +1,53 @@
+import os
+from datetime import datetime
+
+
+def register_stop_event(dl_name, latest_fail_row):
+    """
+    Save stop event only once for each unique DATE + Update_Time.
+
+    Parameters
+    ----------
+    dl_name : str
+        Example: DL01
+
+    latest_fail_row : pandas.Series
+        Must contain:
+        - DATE
+        - Update_Time
+        - ARRAY
+    """
+
+    log_dir = "log_register"
+    os.makedirs(log_dir, exist_ok=True)
+
+    log_file = os.path.join(log_dir, f"{dl_name}.csv")
+
+    event_date = str(latest_fail_row["DATE"])
+    event_time = str(latest_fail_row["Update_Time"])
+    event_array = str(latest_fail_row["ARRAY"])
+
+    unique_key = f"{event_date}_{event_time}"
+
+    # Check duplicate
+    if os.path.exists(log_file):
+        with open(log_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if unique_key in line:
+                    return False
+
+    write_header = not os.path.exists(log_file)
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        if write_header:
+            f.write("DL_Name,Date,Update_Time,Array,Registered_At\n")
+
+        f.write(
+            f"{dl_name},"
+            f"{event_date},"
+            f"{event_time},"
+            f"{event_array},"
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+
+    return True
