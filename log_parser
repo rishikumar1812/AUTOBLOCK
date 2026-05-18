@@ -1,90 +1,146 @@
 import os
 import re
 import pandas as pd
-from common.config import BASE_LOG_DIR
+from datetime import datetime, date
+
+from register_logger import register_stop_event
 
 
+# =========================================================
+# Check if file was modified today
+# =========================================================
+def is_today(file_path):
+    mod_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+    return mod_time.date() == date.today()
 
-def parse_log_file(file_path, array_name):
-    records = []
+
+# =========================================================
+# Parse one log file
+# =========================================================
+def read_latest_file(file_path):
+    rows = []
     current = {}
 
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
             line = line.strip()
 
-            if line == "#init":
-                if current:
-                    records.append(current)
-                current = {
-                    "Array": array_name,
-                    "File": os.path.basename(file_path)
-                }
+            if line.startswith('#INIT'):
+                # Save previous block if complete
+                required = ['RESULT', 'Update_Time', 'JIG', 'ARRAY', 'DATE']
+                if all(key in current for key in required):
+                    rows.append(current.copy())
+                current = {}
 
-            elif ":" in line:
-                key, value = line.split(":", 1)
-                key = key.strip().upper()
-                value = value.strip()
+            elif line.startswith('RESULT :'):
+                current['RESULT'] = line.split('RESULT :', 1)[1].strip()
 
-                if key == "MODEL NAME":
-                    current["MODEL_NAME"] = value
-                elif key == "ARRAY":
-                    current["ARRAY"] = value
-                elif key == "JIG":
-                    current["JIG"] = value
-                elif key == "DATE":
-                    current["DATE"] = value
-                elif key in ["UPDATE", "UPDATE TIME"]:
-                    current["UPDATE_TIME"] = value
-                elif key == "RESULT":
-                    current["RESULT"] = value.upper()
+            elif line.startswith('TIME :'):
+                current['Update_Time'] = line.split('TIME :', 1)[1].strip()
 
-    if current:
-        records.append(current)
+            elif line.startswith('JIG :'):
+                current['JIG'] = line.split('JIG :', 1)[1].strip()
 
-    if not records:
-        return pd.DataFrame()
+            elif line.startswith('ARRAY :'):
+                current['ARRAY'] = line.split('ARRAY :', 1)[1].strip()
 
-    df = pd.DataFrame(records)
+            elif line.startswith('DATE :'):
+                current['DATE'] = line.split('DATE :', 1)[1].strip()
 
-    if "DATE" in df.columns and "UPDATE_TIME" in df.columns:
-        df["Timestamp"] = pd.to_datetime(
-            df["DATE"] + " " + df["UPDATE_TIME"],
-            errors="coerce",
-            dayfirst=True
-        )
+    # Save last block
+    required = ['RESULT', 'Update_Time', 'JIG', 'ARRAY', 'DATE']
+    if all(key in current for key in required):
+        rows.append(current.copy())
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+
+    df['Time_stamp'] = pd.to_datetime(
+        df['DATE'] + ' ' + df['Update_Time'],
+        format='%Y/%m/%d %H:%M:%S',
+        errors='coerce'
+    )
+
+    df = df.dropna(subset=['Time_stamp'])
+    df = df.sort_values('Time_stamp').reset_index(drop=True)
 
     return df
 
 
+# =========================================================
+# Process all files in logs folder
+# =========================================================
+def process_files(directory):
+    result_messages = []
 
-def read_dl_logs(dl_name):
-    dl_dir = os.path.join(BASE_LOG_DIR, dl_name)
+    # DL01 to DL20
+    dl_files = [[] for _ in range(20)]
 
-    if not os.path.exists(dl_dir):
-        return pd.DataFrame()
+    # Get all files
+    all_files = [
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if os.path.isfile(os.path.join(directory, f))
+    ]
 
-    dfs = []
+    # Group files by DL number
+    for file_path in all_files:
+        file_name = os.path.basename(file_path)
 
-    for file_name in os.listdir(dl_dir):
-        file_path = os.path.join(dl_dir, file_name)
+        match = re.search(r'DL(\d{2})', file_name, re.IGNORECASE)
 
-        if not os.path.isfile(file_path):
+        if match and is_today(file_path):
+            dl_no = int(match.group(1))
+            index = dl_no - 1
+
+            if 0 <= index < 20:
+                dl_files[index].append(file_path)
+
+    # Process each DL
+    for i, files in enumerate(dl_files):
+        if not files:
             continue
 
-        match = re.search(r"(\d)$", os.path.splitext(file_name)[0])
-        array_name = f"Array{match.group(1)}" if match else "Unknown"
+        combined = pd.DataFrame()
 
-        df = parse_log_file(file_path, array_name)
+        for file_path in files:
+            df = read_latest_file(file_path)
+            if df is not None:
+                combined = pd.concat([combined, df], ignore_index=True)
 
-        if not df.empty:
-            dfs.append(df)
+        if combined.empty:
+            continue
 
-    if not dfs:
-        return pd.DataFrame()
+        combined = combined.sort_values('Time_stamp').reset_index(drop=True)
 
-    merged = pd.concat(dfs, ignore_index=True)
-    merged = merged.dropna(subset=["Timestamp"])
-    merged = merged.sort_values("Timestamp").reset_index(drop=True)
+        # Keep latest 60 records
+        if len(combined) > 60:
+            combined = combined.tail(60).reset_index(drop=True)
 
-    return merged
+        # Calculate fail statistics
+        fail_df = combined[combined['RESULT'].str.upper() == 'FAIL']
+        fail_count = len(fail_df)
+        fail_rate = (fail_count / len(combined)) * 100
+
+        dl_name = f'DL{i + 1:02d}'
+
+        # Register only when fail_count becomes exactly 3
+        if fail_count == 3:
+            latest_fail = fail_df.iloc[-1]
+
+            registered = register_stop_event(dl_name, latest_fail)
+
+            if registered:
+                result_messages.append(
+                    f'{dl_name} registered and stopped | '
+                    f'Fail Count = {fail_count}, '
+                    f'Fail Rate = {fail_rate:.2f}%'
+                )
+            else:
+                result_messages.append(
+                    f'{dl_name} already registered.'
+                )
+
+    return result_messages
