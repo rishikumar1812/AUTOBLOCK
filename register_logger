@@ -1,40 +1,46 @@
+"""
+register_logger.py  —  DL PC
+Saves failed DL record to C:\log_register, stamps stop time,
+and sends TCP stop signal to Main PC.
+"""
+
 import os
 import json
 import logging
 from datetime import datetime
+
 from network_sender import send_stop_signal
-from stop_tracker import record_stop          # ← NEW
+from stop_tracker import record_stop
 
 # =========================================================
-# Configuration
+# Configuration  —  EDIT THESE
 # =========================================================
 LOG_REGISTER_DIR = r"C:\log_register"
-MAIN_PC_IP       = "192.168.1.100"            # <-- Change to your Main PC IP
-MAIN_PC_PORT     = 9999
+MAIN_PC_IP       = "192.168.1.100"      # <-- Main PC IP address
+MAIN_PC_PORT     = 9999                 # Must match LISTEN_PORT in main_pc_listener
 
+# =========================================================
+# Logging setup
+# =========================================================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler("dl_register.log"),
+        logging.FileHandler(r"C:\log_register\dl_register.log"),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
 
-# =========================================================
-# Save failed DL record to log_register folder
-# =========================================================
-def save_register_record(dl_name: str, fail_row) -> bool:
+def save_register_record(dl_name: str, fail_row) -> None:
     """
-    Save the failing DL record as a JSON file.
-    Uses a counter suffix so multiple stops per day are each recorded:
-        DL03_20250519_stop1.json
-        DL03_20250519_stop2.json  ← after restart + 3 more fails
+    Save the fail record as a JSON file.
+    Filename includes a stop index so multiple stops per day are all kept:
+        DL03_20260520_stop1.json
+        DL03_20260520_stop2.json  <-- after restart + 3 more fails
     """
     os.makedirs(LOG_REGISTER_DIR, exist_ok=True)
-
     today_str = datetime.now().strftime("%Y%m%d")
 
     # Find next available stop index for today
@@ -50,34 +56,33 @@ def save_register_record(dl_name: str, fail_row) -> bool:
         "dl_name":       dl_name,
         "stop_index":    index,
         "registered_at": datetime.now().isoformat(),
-        "jig":           fail_row.get("JIG", ""),
-        "array":         fail_row.get("ARRAY", ""),
-        "result":        fail_row.get("RESULT", ""),
+        "jig":           str(fail_row.get("JIG", "")),
+        "array":         str(fail_row.get("ARRAY", "")),
+        "result":        str(fail_row.get("RESULT", "")),
         "time_stamp":    str(fail_row.get("Time_stamp", "")),
     }
 
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(record, f, indent=4)
 
-    logger.info(f"{dl_name} stop #{index} record saved → {file_path}")
-    return True
+    logger.info(f"{dl_name} stop #{index} saved → {file_path}")
 
 
-# =========================================================
-# Main entry point called from process_files()
-# =========================================================
 def register_stop_event(dl_name: str, latest_fail_row) -> bool:
     """
-    1. Save record to log_register folder.
-    2. Stamp stop timestamp so fail counter resets after restart.
-    3. Send TCP stop signal to Main PC.
+    Full stop pipeline:
+      1. Save record to log_register folder
+      2. Stamp stop timestamp (resets fail counter after restart)
+      3. Send TCP stop signal to Main PC
+    Always returns True (each call is a new stop cycle).
     """
+    # 1. Save record
     save_register_record(dl_name, latest_fail_row)
 
-    # Stamp the stop time — process_files() will only count FAILs after this
+    # 2. Stamp stop time so process_files resets counter
     record_stop(dl_name)
 
-    # Send network signal to Main PC
+    # 3. Send signal to Main PC
     success = send_stop_signal(
         ip=MAIN_PC_IP,
         port=MAIN_PC_PORT,
@@ -85,8 +90,8 @@ def register_stop_event(dl_name: str, latest_fail_row) -> bool:
     )
 
     if success:
-        logger.info(f"{dl_name} stop signal sent to {MAIN_PC_IP}:{MAIN_PC_PORT}")
+        logger.info(f"{dl_name} stop signal sent OK to {MAIN_PC_IP}:{MAIN_PC_PORT}")
     else:
-        logger.error(f"{dl_name} stop signal FAILED — is the Main PC listener running?")
+        logger.error(f"{dl_name} stop signal FAILED — check Main PC listener is running")
 
     return True
