@@ -1,0 +1,196 @@
+"""
+main_pc_listener.py  —  Run this on the MAIN PC (always on).
+
+Listens for stop commands from DL PC, then automates the EXE:
+  Stop → Setup Manual → uncheck DL checkbox → Save → Start
+
+Install dependencies on Main PC:
+    pip install pywinauto
+
+Usage:
+    python main_pc_listener.py
+"""
+
+import socket
+import json
+import time
+import logging
+import threading
+
+from pywinauto import Application, findwindows
+from pywinauto.keyboard import send_keys
+
+# =========================================================
+# Configuration  —  adjust these to match your setup
+# =========================================================
+LISTEN_IP       = "0.0.0.0"       # Listen on all interfaces
+LISTEN_PORT     = 9999             # Must match MAIN_PC_PORT in register_logger.py
+EXE_TITLE       = "YourAppTitle"   # <-- Window title of the EXE app (partial match is fine)
+SETUP_WIN_TITLE = "Setup Manual"   # <-- Title of the Setup Manual sub-window
+CLICK_DELAY     = 0.5              # Seconds to wait between clicks (increase if UI is slow)
+
+# =========================================================
+# Setup logging
+# =========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("main_pc_listener.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+# =========================================================
+# GUI Automation — stop one DL in the EXE
+# =========================================================
+def automate_stop_dl(dl_name: str):
+    """
+    Automate the EXE to stop a specific DL:
+      1. Find and focus the main EXE window
+      2. Click 'Stop'
+      3. Wait for 'Setup Manual' window
+      4. Uncheck the checkbox for dl_name
+      5. Click 'Save'
+      6. Click 'Start'
+
+    NOTE: Control identifiers (button names, checkbox names) must match
+    your actual EXE. Use the spy() helper at the bottom of this file
+    to discover the real control names.
+    """
+    logger.info(f"Starting GUI automation for {dl_name}...")
+
+    try:
+        # ── Step 1: Connect to the running EXE window ─────────────────────
+        app = Application(backend="uia").connect(title_re=f".*{EXE_TITLE}.*")
+        main_win = app.window(title_re=f".*{EXE_TITLE}.*")
+        main_win.set_focus()
+        time.sleep(CLICK_DELAY)
+
+        # ── Step 2: Click the Stop button ──────────────────────────────────
+        # Replace "Stop" with the exact button name from your EXE
+        main_win.child_window(title="Stop", control_type="Button").click_input()
+        logger.info("Clicked Stop")
+        time.sleep(CLICK_DELAY * 2)  # Give the sub-window time to appear
+
+        # ── Step 3: Find the Setup Manual window ──────────────────────────
+        setup_win = app.window(title_re=f".*{SETUP_WIN_TITLE}.*")
+        setup_win.wait("visible", timeout=10)
+        setup_win.set_focus()
+        time.sleep(CLICK_DELAY)
+
+        # ── Step 4: Uncheck the DL checkbox ───────────────────────────────
+        # The checkbox title is assumed to be the DL name e.g. "DL03"
+        # Adjust title/auto_id/control_type to match your EXE
+        checkbox = setup_win.child_window(title=dl_name, control_type="CheckBox")
+        checkbox.wait("visible", timeout=5)
+
+        # Only uncheck if currently checked
+        if checkbox.get_toggle_state() == 1:   # 1 = checked, 0 = unchecked
+            checkbox.click_input()
+            logger.info(f"Unchecked {dl_name} checkbox")
+        else:
+            logger.info(f"{dl_name} checkbox was already unchecked")
+
+        time.sleep(CLICK_DELAY)
+
+        # ── Step 5: Click Save ─────────────────────────────────────────────
+        setup_win.child_window(title="Save", control_type="Button").click_input()
+        logger.info("Clicked Save")
+        time.sleep(CLICK_DELAY * 2)
+
+        # ── Step 6: Click Start ────────────────────────────────────────────
+        main_win.set_focus()
+        time.sleep(CLICK_DELAY)
+        main_win.child_window(title="Start", control_type="Button").click_input()
+        logger.info(f"Clicked Start — {dl_name} has been stopped and system restarted")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"GUI automation failed for {dl_name}: {e}")
+        return False
+
+
+# =========================================================
+# Handle one incoming connection from DL PC
+# =========================================================
+def handle_client(conn, addr):
+    logger.info(f"Connection from {addr}")
+    try:
+        data = conn.recv(1024)
+        if not data:
+            return
+
+        payload = json.loads(data.decode("utf-8"))
+        command = payload.get("command")
+        dl_name = payload.get("dl")
+
+        logger.info(f"Received command={command}, dl={dl_name}")
+
+        if command == "STOP" and dl_name:
+            success = automate_stop_dl(dl_name)
+            if success:
+                response = {"status": "OK", "dl": dl_name}
+            else:
+                response = {"status": "ERROR", "message": f"GUI automation failed for {dl_name}"}
+        else:
+            response = {"status": "ERROR", "message": "Unknown command or missing DL name"}
+
+        conn.sendall(json.dumps(response).encode("utf-8"))
+
+    except json.JSONDecodeError:
+        logger.error("Received invalid JSON from DL PC")
+        conn.sendall(json.dumps({"status": "ERROR", "message": "Invalid JSON"}).encode("utf-8"))
+    except Exception as e:
+        logger.error(f"Error handling client: {e}")
+    finally:
+        conn.close()
+
+
+# =========================================================
+# TCP Server — runs forever, one thread per connection
+# =========================================================
+def start_listener():
+    logger.info(f"Main PC listener starting on port {LISTEN_PORT}...")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((LISTEN_IP, LISTEN_PORT))
+        server.listen(5)
+        logger.info(f"Listening on {LISTEN_IP}:{LISTEN_PORT} — waiting for DL PC signals...")
+
+        while True:
+            conn, addr = server.accept()
+            # Handle each DL in its own thread so multiple can come in at once
+            thread = threading.Thread(target=handle_client, args=(conn, addr), daemon=True)
+            thread.start()
+
+
+# =========================================================
+# Helper: print all control names in the EXE window
+# Run this ONCE to discover button/checkbox names in your EXE
+# Usage: python main_pc_listener.py spy
+# =========================================================
+def spy_controls():
+    print(f"\nConnecting to window matching: '{EXE_TITLE}'")
+    try:
+        app = Application(backend="uia").connect(title_re=f".*{EXE_TITLE}.*")
+        main_win = app.window(title_re=f".*{EXE_TITLE}.*")
+        print("\n=== Main Window Controls ===")
+        main_win.print_control_identifiers()
+    except Exception as e:
+        print(f"Could not connect: {e}")
+
+
+# =========================================================
+# Entry point
+# =========================================================
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "spy":
+        spy_controls()
+    else:
+        start_listener()
