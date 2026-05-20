@@ -1,7 +1,34 @@
 """
 register_logger.py  —  DL PC
-Saves failed DL record to C:\log_register, stamps stop time,
-and sends TCP stop signal to Main PC.
+Saves failed DL record to C:\log_register.
+One file per DL per day — overwritten each stop cycle,
+with stop_count incrementing inside the file.
+
+Example filename:  DL03_20260520.json
+Example content after 2 stop cycles:
+{
+    "dl_name": "DL03",
+    "stop_count": 2,
+    "last_registered_at": "2026-05-20T11:45:00",
+    "stops": [
+        {
+            "stop_index": 1,
+            "registered_at": "2026-05-20T10:34:22",
+            "jig": "JIG01",
+            "array": "A1",
+            "result": "FAIL",
+            "time_stamp": "2026-05-20 10:34:20"
+        },
+        {
+            "stop_index": 2,
+            "registered_at": "2026-05-20T11:45:00",
+            "jig": "JIG01",
+            "array": "A2",
+            "result": "FAIL",
+            "time_stamp": "2026-05-20 11:44:58"
+        }
+    ]
+}
 """
 
 import os
@@ -17,7 +44,7 @@ from stop_tracker import record_stop
 # =========================================================
 LOG_REGISTER_DIR = r"C:\log_register"
 MAIN_PC_IP       = "192.168.1.100"      # <-- Main PC IP address
-MAIN_PC_PORT     = 9999                 # Must match LISTEN_PORT in main_pc_listener
+MAIN_PC_PORT     = 9999
 
 # =========================================================
 # Logging setup
@@ -35,51 +62,61 @@ logger = logging.getLogger(__name__)
 
 def save_register_record(dl_name: str, fail_row) -> None:
     """
-    Save the fail record as a JSON file.
-    Filename includes a stop index so multiple stops per day are all kept:
-        DL03_20260520_stop1.json
-        DL03_20260520_stop2.json  <-- after restart + 3 more fails
+    One file per DL per day: DL03_20260520.json
+    Each stop cycle APPENDS a new entry inside the same file
+    and increments stop_count — no new files created.
     """
     os.makedirs(LOG_REGISTER_DIR, exist_ok=True)
+
     today_str = datetime.now().strftime("%Y%m%d")
+    file_name = f"{dl_name}_{today_str}.json"          # always same filename
+    file_path = os.path.join(LOG_REGISTER_DIR, file_name)
 
-    # Find next available stop index for today
-    index = 1
-    while True:
-        file_name = f"{dl_name}_{today_str}_stop{index}.json"
-        file_path = os.path.join(LOG_REGISTER_DIR, file_name)
-        if not os.path.exists(file_path):
-            break
-        index += 1
+    # Load existing record if file already exists (from earlier stop today)
+    if os.path.exists(file_path):
+        with open(file_path, "r", encoding="utf-8") as f:
+            record = json.load(f)
+    else:
+        # First stop of the day — create fresh structure
+        record = {
+            "dl_name":           dl_name,
+            "stop_count":        0,
+            "last_registered_at": "",
+            "stops":             []
+        }
 
-    record = {
-        "dl_name":       dl_name,
-        "stop_index":    index,
+    # Increment stop count and append new stop entry
+    record["stop_count"]        += 1
+    record["last_registered_at"] = datetime.now().isoformat()
+    record["stops"].append({
+        "stop_index":    record["stop_count"],
         "registered_at": datetime.now().isoformat(),
         "jig":           str(fail_row.get("JIG", "")),
         "array":         str(fail_row.get("ARRAY", "")),
         "result":        str(fail_row.get("RESULT", "")),
         "time_stamp":    str(fail_row.get("Time_stamp", "")),
-    }
+    })
 
+    # Overwrite the same file
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(record, f, indent=4)
 
-    logger.info(f"{dl_name} stop #{index} saved → {file_path}")
+    logger.info(
+        f"{dl_name} stop #{record['stop_count']} recorded → {file_path}"
+    )
 
 
 def register_stop_event(dl_name: str, latest_fail_row) -> bool:
     """
     Full stop pipeline:
-      1. Save record to log_register folder
-      2. Stamp stop timestamp (resets fail counter after restart)
+      1. Save/update record in log_register (one file per DL per day)
+      2. Stamp stop timestamp so fail counter resets after restart
       3. Send TCP stop signal to Main PC
-    Always returns True (each call is a new stop cycle).
     """
-    # 1. Save record
+    # 1. Save record (updates existing file, no new file created)
     save_register_record(dl_name, latest_fail_row)
 
-    # 2. Stamp stop time so process_files resets counter
+    # 2. Stamp stop time so process_files resets the fail counter
     record_stop(dl_name)
 
     # 3. Send signal to Main PC
