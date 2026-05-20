@@ -1,0 +1,154 @@
+import os
+import re
+import pandas as pd
+from datetime import datetime, date
+
+from register_logger import register_stop_event
+from stop_tracker import get_last_stop_time   # ← NEW
+
+
+# =========================================================
+# Check if file was modified today
+# =========================================================
+def is_today(file_path):
+    mod_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+    return mod_time.date() == date.today()
+
+
+# =========================================================
+# Parse one log file
+# =========================================================
+def read_latest_file(file_path):
+    rows = []
+    current = {}
+
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+
+            if line.startswith('#INIT'):
+                required = ['RESULT', 'Update_Time', 'JIG', 'ARRAY', 'DATE']
+                if all(key in current for key in required):
+                    rows.append(current.copy())
+                current = {}
+
+            elif line.startswith('RESULT :'):
+                current['RESULT'] = line.split('RESULT :', 1)[1].strip()
+
+            elif line.startswith('TIME :'):
+                current['Update_Time'] = line.split('TIME :', 1)[1].strip()
+
+            elif line.startswith('JIG :'):
+                current['JIG'] = line.split('JIG :', 1)[1].strip()
+
+            elif line.startswith('ARRAY :'):
+                current['ARRAY'] = line.split('ARRAY :', 1)[1].strip()
+
+            elif line.startswith('DATE :'):
+                current['DATE'] = line.split('DATE :', 1)[1].strip()
+
+    # Save last block
+    required = ['RESULT', 'Update_Time', 'JIG', 'ARRAY', 'DATE']
+    if all(key in current for key in required):
+        rows.append(current.copy())
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+    df['Time_stamp'] = pd.to_datetime(
+        df['DATE'] + ' ' + df['Update_Time'],
+        format='%Y/%m/%d %H:%M:%S',
+        errors='coerce'
+    )
+    df = df.dropna(subset=['Time_stamp'])
+    df = df.sort_values('Time_stamp').reset_index(drop=True)
+
+    return df
+
+
+# =========================================================
+# Process all files in logs folder
+# =========================================================
+def process_files(directory):
+    result_messages = []
+
+    dl_files = [[] for _ in range(20)]
+
+    all_files = [
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if os.path.isfile(os.path.join(directory, f))
+    ]
+
+    for file_path in all_files:
+        file_name = os.path.basename(file_path)
+        match = re.search(r'DL(\d{2})', file_name, re.IGNORECASE)
+        if match and is_today(file_path):
+            dl_no = int(match.group(1))
+            index = dl_no - 1
+            if 0 <= index < 20:
+                dl_files[index].append(file_path)
+
+    for i, files in enumerate(dl_files):
+        if not files:
+            continue
+
+        combined = pd.DataFrame()
+
+        for file_path in files:
+            df = read_latest_file(file_path)
+            if df is not None:
+                combined = pd.concat([combined, df], ignore_index=True)
+
+        if combined.empty:
+            continue
+
+        combined = combined.sort_values('Time_stamp').reset_index(drop=True)
+
+        # Keep latest 60 records (from full history)
+        if len(combined) > 60:
+            combined = combined.tail(60).reset_index(drop=True)
+
+        dl_name = f'DL{i + 1:02d}'
+
+        # ── NEW: Only count records AFTER the last stop time ──────────────
+        # This means old FAILs before the stop are ignored,
+        # and the counter restarts from 0 after each stop/start cycle.
+        last_stop = get_last_stop_time(dl_name)
+
+        if last_stop is not None:
+            # Filter to only rows that came in after the last stop
+            active_df = combined[combined['Time_stamp'] > pd.Timestamp(last_stop)]
+        else:
+            # Never been stopped — use all records
+            active_df = combined
+
+        if active_df.empty:
+            # No new records since last stop — nothing to evaluate yet
+            continue
+        # ──────────────────────────────────────────────────────────────────
+
+        # Calculate fail statistics on active (post-stop) records only
+        fail_df = active_df[active_df['RESULT'].str.upper() == 'FAIL']
+        fail_count = len(fail_df)
+        fail_rate = (fail_count / len(active_df)) * 100
+
+        # Trigger stop when fail_count hits exactly 3
+        if fail_count == 3:
+            latest_fail = fail_df.iloc[-1]
+
+            registered = register_stop_event(dl_name, latest_fail)
+
+            if registered:
+                result_messages.append(
+                    f'{dl_name} registered and stopped | '
+                    f'Fail Count = {fail_count} (post-restart), '
+                    f'Fail Rate = {fail_rate:.2f}%'
+                )
+            else:
+                result_messages.append(
+                    f'{dl_name} already registered.'
+                )
+
+    return result_messages
