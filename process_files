@@ -1,14 +1,27 @@
+"""
+process_files.py  —  DL PC  (MAIN ENTRY POINT)
+Reads all DL log files, counts FAILs since last stop,
+and triggers stop at exactly 3 fails per cycle.
+
+Run this on a loop/scheduler (e.g. every 30 seconds via Task Scheduler).
+"""
+
 import os
 import re
 import pandas as pd
 from datetime import datetime, date
 
 from register_logger import register_stop_event
-from stop_tracker import get_last_stop_time   # ← NEW
+from stop_tracker import get_last_stop_time
+
+# =========================================================
+# Configuration  —  EDIT THIS
+# =========================================================
+LOG_DIRECTORY = r"C:\logs"    # Folder where DL log files are stored
 
 
 # =========================================================
-# Check if file was modified today
+# Check if a file was modified today
 # =========================================================
 def is_today(file_path):
     mod_time = datetime.fromtimestamp(os.path.getmtime(file_path))
@@ -16,7 +29,7 @@ def is_today(file_path):
 
 
 # =========================================================
-# Parse one log file
+# Parse one log file into a DataFrame
 # =========================================================
 def read_latest_file(file_path):
     rows = []
@@ -47,7 +60,7 @@ def read_latest_file(file_path):
             elif line.startswith('DATE :'):
                 current['DATE'] = line.split('DATE :', 1)[1].strip()
 
-    # Save last block
+    # Flush last block
     required = ['RESULT', 'Update_Time', 'JIG', 'ARRAY', 'DATE']
     if all(key in current for key in required):
         rows.append(current.copy())
@@ -63,16 +76,16 @@ def read_latest_file(file_path):
     )
     df = df.dropna(subset=['Time_stamp'])
     df = df.sort_values('Time_stamp').reset_index(drop=True)
-
     return df
 
 
 # =========================================================
-# Process all files in logs folder
+# Process all DL files and check fail counts
 # =========================================================
-def process_files(directory):
+def process_files(directory=LOG_DIRECTORY):
     result_messages = []
 
+    # Slots for DL01 to DL20
     dl_files = [[] for _ in range(20)]
 
     all_files = [
@@ -81,6 +94,7 @@ def process_files(directory):
         if os.path.isfile(os.path.join(directory, f))
     ]
 
+    # Group today's files by DL number
     for file_path in all_files:
         file_name = os.path.basename(file_path)
         match = re.search(r'DL(\d{2})', file_name, re.IGNORECASE)
@@ -90,12 +104,13 @@ def process_files(directory):
             if 0 <= index < 20:
                 dl_files[index].append(file_path)
 
+    # Evaluate each DL
     for i, files in enumerate(dl_files):
         if not files:
             continue
 
+        # Combine all files for this DL
         combined = pd.DataFrame()
-
         for file_path in files:
             df = read_latest_file(file_path)
             if df is not None:
@@ -106,49 +121,70 @@ def process_files(directory):
 
         combined = combined.sort_values('Time_stamp').reset_index(drop=True)
 
-        # Keep latest 60 records (from full history)
+        # Keep latest 60 records total
         if len(combined) > 60:
             combined = combined.tail(60).reset_index(drop=True)
 
         dl_name = f'DL{i + 1:02d}'
 
-        # ── NEW: Only count records AFTER the last stop time ──────────────
-        # This means old FAILs before the stop are ignored,
-        # and the counter restarts from 0 after each stop/start cycle.
+        # ── Key logic: only count FAILs after the last stop ──────────────
+        # When a DL is stopped, record_stop() stamps the time.
+        # Any FAIL before that stamp is ignored — counter resets to 0.
+        # This means every restart gets a fresh 3-fail budget.
         last_stop = get_last_stop_time(dl_name)
-
         if last_stop is not None:
-            # Filter to only rows that came in after the last stop
             active_df = combined[combined['Time_stamp'] > pd.Timestamp(last_stop)]
         else:
-            # Never been stopped — use all records
-            active_df = combined
+            active_df = combined    # Never stopped before — count everything
 
         if active_df.empty:
-            # No new records since last stop — nothing to evaluate yet
-            continue
-        # ──────────────────────────────────────────────────────────────────
+            continue    # No new records since last stop yet
 
-        # Calculate fail statistics on active (post-stop) records only
-        fail_df = active_df[active_df['RESULT'].str.upper() == 'FAIL']
+        # Count FAILs in the active window
+        fail_df   = active_df[active_df['RESULT'].str.upper() == 'FAIL']
         fail_count = len(fail_df)
-        fail_rate = (fail_count / len(active_df)) * 100
+        fail_rate  = (fail_count / len(active_df)) * 100
 
-        # Trigger stop when fail_count hits exactly 3
+        # Trigger stop at exactly 3 fails in this cycle
         if fail_count == 3:
             latest_fail = fail_df.iloc[-1]
-
-            registered = register_stop_event(dl_name, latest_fail)
+            registered  = register_stop_event(dl_name, latest_fail)
 
             if registered:
                 result_messages.append(
-                    f'{dl_name} registered and stopped | '
-                    f'Fail Count = {fail_count} (post-restart), '
+                    f'{dl_name} STOPPED | '
+                    f'Cycle Fails = {fail_count} | '
                     f'Fail Rate = {fail_rate:.2f}%'
-                )
-            else:
-                result_messages.append(
-                    f'{dl_name} already registered.'
                 )
 
     return result_messages
+
+
+# =========================================================
+# Entry point — run once per scheduler tick
+# =========================================================
+if __name__ == '__main__':
+    import time
+    import logging
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.FileHandler(r"C:\log_register\process_files.log"),
+            logging.StreamHandler()
+        ]
+    )
+
+    POLL_INTERVAL = 30   # seconds between each scan
+
+    print(f"DL Monitor started. Scanning every {POLL_INTERVAL}s. Press Ctrl+C to stop.")
+
+    while True:
+        try:
+            messages = process_files()
+            for msg in messages:
+                print(msg)
+        except Exception as e:
+            print(f"Error during scan: {e}")
+        time.sleep(POLL_INTERVAL)
