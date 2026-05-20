@@ -1,24 +1,21 @@
+"""
+network_sender.py  —  DL PC
+TCP client: sends a stop command to the Main PC listener.
+"""
+
 import socket
 import json
 import logging
 
 logger = logging.getLogger(__name__)
 
-TIMEOUT_SECONDS = 5  # How long to wait for Main PC to respond
+TIMEOUT_SECONDS = 5
 
 
 def send_stop_signal(ip: str, port: int, dl_name: str) -> bool:
     """
-    Send a JSON stop command to the Main PC listener over TCP.
-    Returns True on success, False on any network error.
-
-    Payload format:
-        {"command": "STOP", "dl": "DL03"}
-
-    Expected response from Main PC:
-        {"status": "OK", "dl": "DL03"}
-    or
-        {"status": "ERROR", "message": "..."}
+    Send JSON stop command to Main PC.
+    Returns True if Main PC acknowledged OK, False on any error.
     """
     payload = json.dumps({"command": "STOP", "dl": dl_name}).encode("utf-8")
 
@@ -28,7 +25,6 @@ def send_stop_signal(ip: str, port: int, dl_name: str) -> bool:
             sock.connect((ip, port))
             sock.sendall(payload)
 
-            # Wait for acknowledgement from Main PC
             response_raw = sock.recv(1024)
             response = json.loads(response_raw.decode("utf-8"))
 
@@ -36,15 +32,15 @@ def send_stop_signal(ip: str, port: int, dl_name: str) -> bool:
                 logger.info(f"Main PC acknowledged STOP for {dl_name}")
                 return True
             else:
-                logger.error(f"Main PC returned error: {response.get('message', 'Unknown')}")
+                logger.error(f"Main PC error: {response.get('message', 'Unknown')}")
                 return False
 
     except socket.timeout:
-        logger.error(f"Timeout: Main PC at {ip}:{port} did not respond within {TIMEOUT_SECONDS}s")
+        logger.error(f"Timeout: Main PC {ip}:{port} did not respond in {TIMEOUT_SECONDS}s")
         return False
     except ConnectionRefusedError:
         logger.error(f"Connection refused: Is the listener running on {ip}:{port}?")
         return False
     except Exception as e:
-        logger.error(f"Unexpected network error sending to {ip}:{port} — {e}")
+        logger.error(f"Network error sending to {ip}:{port} — {e}")
         return False
