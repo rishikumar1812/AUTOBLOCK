@@ -1,0 +1,67 @@
+"""
+stop_tracker.py  —  Runs on DL PC.
+
+Tracks the timestamp of the last stop event per DL.
+This allows process_files() to only count FAIL records
+that occurred AFTER the last stop — so old fails never
+re-trigger a stop, and the counter resets to 0 after each stop.
+"""
+
+import os
+import json
+import logging
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+# One JSON file stores all DL stop times
+STOP_TRACKER_PATH = r"C:\log_register\stop_tracker.json"
+
+
+def _load() -> dict:
+    """Load the stop tracker file. Returns empty dict if missing."""
+    if not os.path.exists(STOP_TRACKER_PATH):
+        return {}
+    try:
+        with open(STOP_TRACKER_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Could not load stop_tracker: {e}")
+        return {}
+
+
+def _save(data: dict):
+    """Save the stop tracker file."""
+    os.makedirs(os.path.dirname(STOP_TRACKER_PATH), exist_ok=True)
+    try:
+        with open(STOP_TRACKER_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        logger.error(f"Could not save stop_tracker: {e}")
+
+
+def record_stop(dl_name: str):
+    """
+    Call this when a DL is successfully stopped.
+    Saves the current timestamp as the last stop time for that DL.
+    """
+    data = _load()
+    now_str = datetime.now().isoformat()
+    data[dl_name] = {"last_stop": now_str}
+    _save(data)
+    logger.info(f"{dl_name} stop time recorded: {now_str}")
+
+
+def get_last_stop_time(dl_name: str) -> datetime | None:
+    """
+    Returns the datetime of the last stop for a DL,
+    or None if it has never been stopped.
+    """
+    data = _load()
+    entry = data.get(dl_name)
+    if not entry:
+        return None
+    try:
+        return datetime.fromisoformat(entry["last_stop"])
+    except Exception:
+        return None
