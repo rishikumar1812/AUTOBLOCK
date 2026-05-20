@@ -1,0 +1,143 @@
+============================================================
+  DL MONITOR SYSTEM — BUILD & DEPLOY GUIDE
+============================================================
+
+FOLDER STRUCTURE
+----------------
+DL_PC\
+    process_files.py      <- Main loop, reads logs, detects fails
+    register_logger.py    <- Saves record, stamps stop time, sends signal
+    network_sender.py     <- TCP client to Main PC
+    stop_tracker.py       <- Tracks last stop time per DL
+
+MAIN_PC\
+    main_pc_listener.py   <- TCP server + pywinauto EXE automation
+
+BUILD_SCRIPTS\
+    build_DL_PC.bat       <- Builds dl_monitor.exe
+    build_MAIN_PC.bat     <- Builds main_pc_listener.exe
+    README.txt            <- This file
+
+
+============================================================
+STEP 1 — EDIT CONFIGURATION (before building)
+============================================================
+
+In DL_PC\register_logger.py:
+    MAIN_PC_IP       = "192.168.1.100"   <- set to your Main PC's IP
+    MAIN_PC_PORT     = 9999
+    LOG_REGISTER_DIR = r"C:\log_register"
+
+In DL_PC\process_files.py:
+    LOG_DIRECTORY = r"C:\logs"           <- folder where log files are
+
+In MAIN_PC\main_pc_listener.py:
+    LISTEN_PORT     = 9999               <- must match MAIN_PC_PORT above
+    EXE_TITLE       = "YourAppTitle"     <- partial title of the EXE window
+    SETUP_WIN_TITLE = "Setup Manual"     <- title of the sub-window
+    CLICK_DELAY     = 0.6               <- increase if EXE is slow
+
+
+============================================================
+STEP 2 — FIND EXE CONTROL NAMES (Main PC only)
+============================================================
+
+You need the exact button/checkbox names inside the EXE.
+Do this ONCE before building:
+
+1. Install Python + pywinauto on any PC temporarily:
+       pip install pywinauto
+
+2. Open the EXE on Main PC so it is running.
+
+3. Run:
+       python main_pc_listener.py spy
+
+4. It prints all control names. Note the exact names for:
+       - Stop button
+       - Save button
+       - Start button
+       - DL checkboxes (e.g. "DL01", "DL_01", "Line 1", etc.)
+
+5. Update main_pc_listener.py  child_window(title=...) calls
+   to match those exact names.
+
+
+============================================================
+STEP 3 — BUILD THE EXE FILES
+============================================================
+
+You need Python on ONE machine temporarily (can be any laptop).
+After building, the .exe files run anywhere with NO Python needed.
+
+--- Build dl_monitor.exe (for DL PC) ---
+1. Copy the entire DL_PC\ folder to a machine with Python
+2. Also copy BUILD_SCRIPTS\build_DL_PC.bat into the DL_PC\ folder
+3. Double-click build_DL_PC.bat
+4. Find the output at:  DL_PC\dist\dl_monitor.exe
+
+--- Build main_pc_listener.exe (for Main PC) ---
+1. Copy the entire MAIN_PC\ folder to a machine with Python
+2. Also copy BUILD_SCRIPTS\build_MAIN_PC.bat into the MAIN_PC\ folder
+3. Double-click build_MAIN_PC.bat
+4. Find the output at:  MAIN_PC\dist\main_pc_listener.exe
+
+
+============================================================
+STEP 4 — DEPLOY
+============================================================
+
+On DL PC:
+    1. Copy dl_monitor.exe to any folder e.g. C:\DL_Monitor\
+    2. Double-click to run — it scans every 30 seconds automatically
+    3. To auto-start on boot:
+       - Press Win+R → shell:startup
+       - Drop a shortcut to dl_monitor.exe there
+
+On Main PC:
+    1. Copy main_pc_listener.exe to any folder e.g. C:\DL_Monitor\
+    2. Double-click to run — it waits silently for signals from DL PC
+    3. To auto-start on boot:
+       - Press Win+R → shell:startup
+       - Drop a shortcut to main_pc_listener.exe there
+    4. Allow it through Windows Firewall if prompted
+       (it needs to receive on port 9999)
+
+
+============================================================
+STEP 5 — VERIFY IT WORKS
+============================================================
+
+On Main PC — confirm listener is running:
+    You should see in the console:
+    "Listening on 0.0.0.0:9999 — ready for DL PC signals."
+
+On DL PC — confirm it connects:
+    When a DL hits 3 fails, you should see in the console:
+    "DL03 STOPPED | Cycle Fails = 3 | Fail Rate = xx.xx%"
+
+On Main PC — confirm automation ran:
+    "DL03: Clicked Stop"
+    "DL03: Unchecked"
+    "DL03: Clicked Save"
+    "DL03: Clicked Start — automation complete"
+
+Log files are saved to C:\log_register\ on DL PC.
+
+
+============================================================
+FAIL COUNTER RESET LOGIC
+============================================================
+
+Each DL has an independent counter that resets after every stop:
+
+  Fail 1, 2, 3  ->  STOP triggered  ->  counter resets to 0
+  (Main PC restarts DL)
+  Fail 4, 5     ->  count = 2, nothing happens
+  Fail 6        ->  count = 3  ->  STOP triggered again
+
+Old FAILs before the stop are never counted again.
+Each stop saves a new file:  DL03_20260520_stop1.json
+                              DL03_20260520_stop2.json  etc.
+
+============================================================
