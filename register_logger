@@ -1,53 +1,92 @@
 import os
+import json
+import logging
 from datetime import datetime
+from network_sender import send_stop_signal
+from stop_tracker import record_stop          # ← NEW
+
+# =========================================================
+# Configuration
+# =========================================================
+LOG_REGISTER_DIR = r"C:\log_register"
+MAIN_PC_IP       = "192.168.1.100"            # <-- Change to your Main PC IP
+MAIN_PC_PORT     = 9999
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("dl_register.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 
-def register_stop_event(dl_name, latest_fail_row):
+# =========================================================
+# Save failed DL record to log_register folder
+# =========================================================
+def save_register_record(dl_name: str, fail_row) -> bool:
     """
-    Save stop event only once for each unique DATE + Update_Time.
-
-    Parameters
-    ----------
-    dl_name : str
-        Example: DL01
-
-    latest_fail_row : pandas.Series
-        Must contain:
-        - DATE
-        - Update_Time
-        - ARRAY
+    Save the failing DL record as a JSON file.
+    Uses a counter suffix so multiple stops per day are each recorded:
+        DL03_20250519_stop1.json
+        DL03_20250519_stop2.json  ← after restart + 3 more fails
     """
+    os.makedirs(LOG_REGISTER_DIR, exist_ok=True)
 
-    log_dir = "log_register"
-    os.makedirs(log_dir, exist_ok=True)
+    today_str = datetime.now().strftime("%Y%m%d")
 
-    log_file = os.path.join(log_dir, f"{dl_name}.csv")
+    # Find next available stop index for today
+    index = 1
+    while True:
+        file_name = f"{dl_name}_{today_str}_stop{index}.json"
+        file_path = os.path.join(LOG_REGISTER_DIR, file_name)
+        if not os.path.exists(file_path):
+            break
+        index += 1
 
-    event_date = str(latest_fail_row["DATE"])
-    event_time = str(latest_fail_row["Update_Time"])
-    event_array = str(latest_fail_row["ARRAY"])
+    record = {
+        "dl_name":       dl_name,
+        "stop_index":    index,
+        "registered_at": datetime.now().isoformat(),
+        "jig":           fail_row.get("JIG", ""),
+        "array":         fail_row.get("ARRAY", ""),
+        "result":        fail_row.get("RESULT", ""),
+        "time_stamp":    str(fail_row.get("Time_stamp", "")),
+    }
 
-    unique_key = f"{event_date}_{event_time}"
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=4)
 
-    # Check duplicate
-    if os.path.exists(log_file):
-        with open(log_file, "r", encoding="utf-8") as f:
-            for line in f:
-                if unique_key in line:
-                    return False
+    logger.info(f"{dl_name} stop #{index} record saved → {file_path}")
+    return True
 
-    write_header = not os.path.exists(log_file)
 
-    with open(log_file, "a", encoding="utf-8") as f:
-        if write_header:
-            f.write("DL_Name,Date,Update_Time,Array,Registered_At\n")
+# =========================================================
+# Main entry point called from process_files()
+# =========================================================
+def register_stop_event(dl_name: str, latest_fail_row) -> bool:
+    """
+    1. Save record to log_register folder.
+    2. Stamp stop timestamp so fail counter resets after restart.
+    3. Send TCP stop signal to Main PC.
+    """
+    save_register_record(dl_name, latest_fail_row)
 
-        f.write(
-            f"{dl_name},"
-            f"{event_date},"
-            f"{event_time},"
-            f"{event_array},"
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        )
+    # Stamp the stop time — process_files() will only count FAILs after this
+    record_stop(dl_name)
+
+    # Send network signal to Main PC
+    success = send_stop_signal(
+        ip=MAIN_PC_IP,
+        port=MAIN_PC_PORT,
+        dl_name=dl_name
+    )
+
+    if success:
+        logger.info(f"{dl_name} stop signal sent to {MAIN_PC_IP}:{MAIN_PC_PORT}")
+    else:
+        logger.error(f"{dl_name} stop signal FAILED — is the Main PC listener running?")
 
     return True
