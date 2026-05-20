@@ -1,0 +1,12 @@
+📁 DL_PC\
+    process_files.py
+    register_logger.py
+    network_sender.py
+    stop_tracker.py
+
+📁 MAIN_PC\
+    main_pc_listener.py
+
+📁 BUILD_SCRIPTS\
+    DOUBLE_CLICK_ME_TO_BUILD.py   ← just double-click this
+    build_all.py
