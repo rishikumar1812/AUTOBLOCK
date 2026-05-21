@@ -1,0 +1,369 @@
+"""
+main_pc_popup.py  —  MAIN PC
+Combines the TCP listener (receives stop signals from DL PC)
+with a popup toast notification when any DL is blocked.
+Also shows a small always-on-top tray window listing blocked DLs.
+
+Run this INSTEAD of main_pc_listener.py — it replaces it entirely.
+"""
+
+import os
+import json
+import time
+import socket
+import logging
+import threading
+import tkinter as tk
+from tkinter import font as tkfont
+from datetime import datetime
+from pywinauto import Application
+
+# =========================================================
+# Configuration  —  EDIT THESE
+# =========================================================
+LISTEN_IP       = "0.0.0.0"
+LISTEN_PORT     = 9999
+EXE_TITLE       = "YourAppTitle"    # <-- partial title of your EXE window
+SETUP_WIN_TITLE = "Setup Manual"    # <-- title of setup sub-window
+CLICK_DELAY     = 0.6
+
+# =========================================================
+# Colors
+# =========================================================
+BG_MAIN   = "#1a1a2e"
+BG_CARD   = "#16213e"
+BG_HEADER = "#0f3460"
+COL_BLOCK = "#e94560"
+COL_OK    = "#00d4aa"
+COL_TEXT  = "#e0e0e0"
+COL_MUTED = "#7a7a9a"
+COL_WHITE = "#ffffff"
+
+# =========================================================
+# Logging
+# =========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("main_pc_listener.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# =========================================================
+# Shared state
+# =========================================================
+_gui_lock     = threading.Lock()        # one DL through GUI at a time
+_blocked_dls  = {}                      # {dl_name: timestamp_str}
+_state_lock   = threading.Lock()
+_popup_queue  = []                      # DL names waiting for popup
+_queue_lock   = threading.Lock()
+
+
+# =========================================================
+# GUI Automation (same as before)
+# =========================================================
+def automate_stop_dl(dl_name: str) -> bool:
+    with _gui_lock:
+        logger.info(f"Starting GUI automation for {dl_name} ...")
+        try:
+            app      = Application(backend="uia").connect(title_re=f".*{EXE_TITLE}.*")
+            main_win = app.window(title_re=f".*{EXE_TITLE}.*")
+            main_win.set_focus()
+            time.sleep(CLICK_DELAY)
+
+            main_win.child_window(title="Stop", control_type="Button").click_input()
+            logger.info(f"{dl_name}: Clicked Stop")
+            time.sleep(CLICK_DELAY * 2)
+
+            setup_win = app.window(title_re=f".*{SETUP_WIN_TITLE}.*")
+            setup_win.wait("visible", timeout=10)
+            setup_win.set_focus()
+            time.sleep(CLICK_DELAY)
+
+            checkbox = setup_win.child_window(title=dl_name, control_type="CheckBox")
+            checkbox.wait("visible", timeout=5)
+            if checkbox.get_toggle_state() == 1:
+                checkbox.click_input()
+                logger.info(f"{dl_name}: Unchecked")
+            time.sleep(CLICK_DELAY)
+
+            setup_win.child_window(title="Save", control_type="Button").click_input()
+            logger.info(f"{dl_name}: Clicked Save")
+            time.sleep(CLICK_DELAY * 2)
+
+            main_win.set_focus()
+            time.sleep(CLICK_DELAY)
+            main_win.child_window(title="Start", control_type="Button").click_input()
+            logger.info(f"{dl_name}: Automation complete")
+            return True
+
+        except Exception as e:
+            logger.error(f"GUI automation FAILED for {dl_name}: {e}")
+            return False
+
+
+# =========================================================
+# TCP handler — runs in background thread
+# =========================================================
+def handle_client(conn, addr):
+    logger.info(f"Connection from {addr}")
+    try:
+        data = conn.recv(1024)
+        if not data:
+            return
+
+        payload = json.loads(data.decode("utf-8"))
+        command = payload.get("command")
+        dl_name = payload.get("dl")
+
+        logger.info(f"Received: command={command}  dl={dl_name}")
+
+        if command == "STOP" and dl_name:
+            # Record blocked state
+            ts = datetime.now().strftime("%H:%M:%S")
+            with _state_lock:
+                _blocked_dls[dl_name] = ts
+
+            # Queue popup
+            with _queue_lock:
+                _popup_queue.append(dl_name)
+
+            # Run automation
+            success = automate_stop_dl(dl_name)
+            if success:
+                response = {"status": "OK", "dl": dl_name}
+            else:
+                response = {"status": "ERROR",
+                            "message": f"GUI automation failed for {dl_name}"}
+        else:
+            response = {"status": "ERROR", "message": "Unknown command"}
+
+        conn.sendall(json.dumps(response).encode("utf-8"))
+
+    except json.JSONDecodeError:
+        conn.sendall(json.dumps({"status": "ERROR",
+                                  "message": "Invalid JSON"}).encode("utf-8"))
+    except Exception as e:
+        logger.error(f"Client handler error: {e}")
+    finally:
+        conn.close()
+
+
+def start_tcp_server():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((LISTEN_IP, LISTEN_PORT))
+        server.listen(5)
+        logger.info(f"TCP listener on port {LISTEN_PORT} — ready.")
+        while True:
+            conn, addr = server.accept()
+            threading.Thread(target=handle_client,
+                             args=(conn, addr), daemon=True).start()
+
+
+# =========================================================
+# Toast popup window
+# =========================================================
+def show_toast(root, dl_name: str):
+    """
+    Show a popup notification in the top-right corner of the screen.
+    Auto-dismisses after 6 seconds. Click to dismiss early.
+    """
+    toast = tk.Toplevel(root)
+    toast.overrideredirect(True)       # no title bar
+    toast.attributes("-topmost", True) # always on top
+    toast.attributes("-alpha", 0.95)
+    toast.configure(bg=BG_CARD)
+
+    sw = root.winfo_screenwidth()
+    w, h = 320, 110
+    x = sw - w - 24
+    y = 60
+    toast.geometry(f"{w}x{h}+{x}+{y}")
+
+    # Red accent bar on left
+    tk.Frame(toast, bg=COL_BLOCK, width=6).pack(side=tk.LEFT, fill=tk.Y)
+
+    body = tk.Frame(toast, bg=BG_CARD, padx=14, pady=10)
+    body.pack(fill=tk.BOTH, expand=True)
+
+    f_big  = tkfont.Font(family="Segoe UI", size=13, weight="bold")
+    f_med  = tkfont.Font(family="Segoe UI", size=10)
+    f_sml  = tkfont.Font(family="Segoe UI", size=8)
+
+    tk.Label(body, text="⛔  DL BLOCKED",
+             font=f_big, bg=BG_CARD, fg=COL_BLOCK).pack(anchor="w")
+    tk.Label(body, text=f"{dl_name} has been stopped",
+             font=f_med, bg=BG_CARD, fg=COL_TEXT).pack(anchor="w", pady=(2, 0))
+    ts = datetime.now().strftime("%H:%M:%S")
+    tk.Label(body, text=f"Time: {ts}   •   Click to dismiss",
+             font=f_sml, bg=BG_CARD, fg=COL_MUTED).pack(anchor="w", pady=(4, 0))
+
+    # Click anywhere on toast to close
+    def dismiss(e=None):
+        toast.destroy()
+
+    toast.bind("<Button-1>", dismiss)
+    for child in toast.winfo_children():
+        child.bind("<Button-1>", dismiss)
+
+    # Auto-dismiss after 6 seconds with fade
+    def fade_out(alpha=0.95):
+        alpha -= 0.05
+        if alpha <= 0:
+            toast.destroy()
+            return
+        try:
+            toast.attributes("-alpha", alpha)
+            toast.after(120, lambda: fade_out(alpha))
+        except tk.TclError:
+            pass
+
+    toast.after(4500, fade_out)
+
+
+# =========================================================
+# Tray status window (small, always on top)
+# =========================================================
+class TrayWindow:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("DL Monitor")
+        self.root.configure(bg=BG_MAIN)
+        self.root.attributes("-topmost", True)
+        self.root.resizable(False, False)
+
+        # Position bottom-right
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        self.root.geometry(f"260x340+{sw-276}+{sh-380}")
+
+        self.f_title  = tkfont.Font(family="Segoe UI", size=10, weight="bold")
+        self.f_body   = tkfont.Font(family="Segoe UI", size=9)
+        self.f_small  = tkfont.Font(family="Segoe UI", size=8)
+
+        self._build()
+        self._poll_queue()
+        self._refresh_list()
+
+    def _build(self):
+        # Header
+        hdr = tk.Frame(self.root, bg=BG_HEADER, pady=7)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="DL Monitor  •  Main PC",
+                 font=self.f_title, bg=BG_HEADER, fg=COL_WHITE).pack(padx=10)
+
+        # Status label
+        self.lbl_status = tk.Label(self.root, text="● Listening on port 9999",
+                                    font=self.f_small, bg=BG_MAIN, fg=COL_OK)
+        self.lbl_status.pack(pady=(6, 2))
+
+        # Blocked DL list
+        tk.Label(self.root, text="Blocked DLs today:",
+                 font=self.f_small, bg=BG_MAIN, fg=COL_MUTED).pack(anchor="w", padx=10)
+
+        self.list_frame = tk.Frame(self.root, bg=BG_MAIN)
+        self.list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+        self.lbl_none = tk.Label(self.list_frame, text="None blocked",
+                                  font=self.f_small, bg=BG_MAIN, fg=COL_MUTED)
+        self.lbl_none.pack(pady=8)
+
+        # Separator
+        tk.Frame(self.root, bg=BG_HEADER, height=1).pack(fill=tk.X)
+
+        # Footer
+        ft = tk.Frame(self.root, bg=BG_MAIN, pady=6)
+        ft.pack(fill=tk.X)
+        self.lbl_time = tk.Label(ft, text="", font=self.f_small,
+                                  bg=BG_MAIN, fg=COL_MUTED)
+        self.lbl_time.pack()
+
+        # Clear button
+        tk.Button(ft, text="Clear list",
+                  command=self._clear_blocked,
+                  bg=BG_HEADER, fg=COL_TEXT,
+                  font=self.f_small, relief=tk.FLAT,
+                  padx=8, pady=3, cursor="hand2").pack(pady=(2, 0))
+
+    def _refresh_list(self):
+        # Destroy old entries
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+
+        with _state_lock:
+            blocked = dict(_blocked_dls)
+
+        if not blocked:
+            tk.Label(self.list_frame, text="None blocked",
+                     font=self.f_small, bg=BG_MAIN, fg=COL_MUTED).pack(pady=8)
+        else:
+            for dl, ts in sorted(blocked.items()):
+                row = tk.Frame(self.list_frame, bg=BG_CARD, pady=3, padx=8)
+                row.pack(fill=tk.X, pady=2)
+                tk.Label(row, text=dl, font=self.f_body,
+                         bg=BG_CARD, fg=COL_BLOCK, width=6,
+                         anchor="w").pack(side=tk.LEFT)
+                tk.Label(row, text=f"stopped at {ts}",
+                         font=self.f_small, bg=BG_CARD,
+                         fg=COL_MUTED).pack(side=tk.LEFT)
+
+        now = datetime.now().strftime("%H:%M:%S")
+        self.lbl_time.config(text=f"Updated: {now}")
+        self.root.after(5000, self._refresh_list)
+
+    def _poll_queue(self):
+        """Check if any new DL needs a popup toast."""
+        with _queue_lock:
+            while _popup_queue:
+                dl = _popup_queue.pop(0)
+                show_toast(self.root, dl)
+        self.root.after(500, self._poll_queue)
+
+    def _clear_blocked(self):
+        with _state_lock:
+            _blocked_dls.clear()
+        self._refresh_list()
+
+
+# =========================================================
+# Spy helper — discover EXE control names
+# Usage: python main_pc_popup.py spy
+# =========================================================
+def spy_controls():
+    print(f"\nConnecting to window: '{EXE_TITLE}' ...")
+    try:
+        app      = Application(backend="uia").connect(title_re=f".*{EXE_TITLE}.*")
+        main_win = app.window(title_re=f".*{EXE_TITLE}.*")
+        print("\n=== Main Window Controls ===")
+        main_win.print_control_identifiers()
+        print("\nOpen Setup Manual in the EXE then press Enter ...")
+        input()
+        setup_win = app.window(title_re=f".*{SETUP_WIN_TITLE}.*")
+        print("\n=== Setup Manual Controls ===")
+        setup_win.print_control_identifiers()
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+# =========================================================
+# Entry point
+# =========================================================
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "spy":
+        spy_controls()
+        sys.exit(0)
+
+    # Start TCP server in background
+    tcp_thread = threading.Thread(target=start_tcp_server, daemon=True)
+    tcp_thread.start()
+
+    # Start Tkinter UI on main thread
+    root = tk.Tk()
+    app  = TrayWindow(root)
+    root.mainloop()
