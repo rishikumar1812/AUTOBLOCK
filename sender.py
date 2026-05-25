@@ -1,10 +1,17 @@
 import socket
 
-sock = socket.socket()
-sock.connect(("192.168.29.82", 9999))
+client = socket.socket()
 
-sock.send(b"HELLO")
+client.connect(
+    ("192.168.1.100", 9999)
+)
 
-print(sock.recv(1024))
+client.send(
+    b"HELLO WORLD"
+)
 
-sock.close()
+print(
+    client.recv(1024)
+)
+
+client.close()
