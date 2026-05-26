@@ -1,349 +1,92 @@
-"""
-dl_dashboard.py  —  DL PC
-Live dashboard showing all 20 DLs.
-
-Imports shared logic directly from:
-  process_files.py  → read_latest_file(), is_today()
-  stop_tracker.py   → get_last_stop_time()
-
-Place this file in the SAME folder as all other DL_PC files:
-  dl_dashboard.py
-  process_files.py
-  register_logger.py
-  network_sender.py
-  stop_tracker.py
-"""
-
-import os
-import re
-import json
-import tkinter as tk
-from tkinter import font as tkfont
-from datetime import datetime, date
-import pandas as pd
-import threading
-
-# ── Import from your existing files ───────────────────────
-from process_files import read_latest_file, is_today   # reuse parsers
-from stop_tracker  import get_last_stop_time           # reuse stop time
-
-# =========================================================
-# Configuration  —  EDIT THESE
-# =========================================================
-LOG_DIRECTORY    = r"C:\logs"           # same as in process_files.py
-LOG_REGISTER_DIR = r"C:\log_register"  # same as in register_logger.py
-REFRESH_INTERVAL = 10000               # ms — how often dashboard refreshes
-WARN_AT_FAILS    = 2                   # yellow at this many fails
-BLOCK_AT_FAILS   = 3                   # red at this many fails
-
-# =========================================================
-# Colors
-# =========================================================
-BG_MAIN   = "#1a1a2e"
-BG_CARD   = "#16213e"
-BG_HEADER = "#0f3460"
-COL_OK    = "#00d4aa"
-COL_WARN  = "#f5a623"
-COL_BLOCK = "#e94560"
-COL_TEXT  = "#e0e0e0"
-COL_MUTED = "#7a7a9a"
-COL_WHITE = "#ffffff"
+import sys
+from PyQt6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QLabel,
+    QVBoxLayout
+)
+from PyQt6.QtCore import Qt, QTimer
 
 
-# =========================================================
-# Read stop_count from the JSON that register_logger.py wrote
-# =========================================================
-def get_stop_count_today(dl_name: str) -> int:
-    """
-    register_logger.py writes: DL03_20260520.json with stop_count inside.
-    We just read that same file — no duplicated logic.
-    """
-    today_str = date.today().strftime("%Y%m%d")
-    path = os.path.join(LOG_REGISTER_DIR, f"{dl_name}_{today_str}.json")
-    try:
-        if os.path.exists(path):
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return data.get('stop_count', 0)
-    except Exception:
-        pass
-    return 0
+class DLDashboard(QWidget):
 
+    def __init__(self):
 
-# =========================================================
-# Compute stats for all 20 DLs
-# Uses read_latest_file() and is_today() from process_files.py
-# Uses get_last_stop_time()            from stop_tracker.py
-# =========================================================
-def compute_dl_stats() -> list:
-    """
-    Returns a list of 20 dicts, one per DL, with:
-      name, total, fails, rate, status, stops_today
-    """
-    dl_files = [[] for _ in range(20)]
-    stats    = []
+        super().__init__()
 
-    # Guard: log directory must exist
-    if not os.path.isdir(LOG_DIRECTORY):
-        for i in range(20):
-            stats.append({
-                'name': f'DL{i+1:02d}', 'total': 0,
-                'fails': 0, 'rate': 0.0,
-                'status': 'NO DIR', 'stops_today': 0
-            })
-        return stats
+        self.setWindowTitle("AutoBlock DL")
 
-    # Group today's files by DL number — reuses is_today() from process_files.py
-    for fname in os.listdir(LOG_DIRECTORY):
-        fpath = os.path.join(LOG_DIRECTORY, fname)
-        if not os.path.isfile(fpath):
-            continue
-        match = re.search(r'DL(\d{2})', fname, re.IGNORECASE)
-        if match and is_today(fpath):
-            idx = int(match.group(1)) - 1
-            if 0 <= idx < 20:
-                dl_files[idx].append(fpath)
+        self.setFixedSize(500, 220)
 
-    for i, files in enumerate(dl_files):
-        dl_name     = f'DL{i+1:02d}'
-        stops_today = get_stop_count_today(dl_name)
-
-        if not files:
-            stats.append({
-                'name': dl_name, 'total': 0,
-                'fails': 0, 'rate': 0.0,
-                'status': 'NO FILE', 'stops_today': stops_today
-            })
-            continue
-
-        # Combine all files for this DL — reuses read_latest_file() from process_files.py
-        combined = pd.DataFrame()
-        for fpath in files:
-            df = read_latest_file(fpath)
-            if df is not None:
-                combined = pd.concat([combined, df], ignore_index=True)
-
-        if combined.empty:
-            stats.append({
-                'name': dl_name, 'total': 0,
-                'fails': 0, 'rate': 0.0,
-                'status': 'EMPTY', 'stops_today': stops_today
-            })
-            continue
-
-        combined = combined.sort_values('Time_stamp').reset_index(drop=True)
-        if len(combined) > 60:
-            combined = combined.tail(60).reset_index(drop=True)
-
-        # Apply post-stop cutoff — reuses get_last_stop_time() from stop_tracker.py
-        last_stop = get_last_stop_time(dl_name)
-        if last_stop is not None:
-            active = combined[combined['Time_stamp'] > pd.Timestamp(last_stop)]
-        else:
-            active = combined
-
-        total = len(active)
-        fails = int(active[active['RESULT'].str.upper() == 'FAIL'].shape[0]) if total > 0 else 0
-        rate  = (fails / total * 100) if total > 0 else 0.0
-
-        if fails >= BLOCK_AT_FAILS:
-            status = 'BLOCKED'
-        elif fails >= WARN_AT_FAILS:
-            status = 'WARNING'
-        else:
-            status = 'OK'
-
-        stats.append({
-            'name': dl_name, 'total': total,
-            'fails': fails, 'rate': rate,
-            'status': status, 'stops_today': stops_today
-        })
-
-    return stats
-
-
-# =========================================================
-# Dashboard UI
-# =========================================================
-class DLDashboard:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("DL Monitor Dashboard")
-        self.root.configure(bg=BG_MAIN)
-        self.root.resizable(True, True)
-
-        self.f_title  = tkfont.Font(family="Segoe UI", size=16, weight="bold")
-        self.f_name   = tkfont.Font(family="Segoe UI", size=11, weight="bold")
-        self.f_val    = tkfont.Font(family="Segoe UI", size=11)
-        self.f_status = tkfont.Font(family="Segoe UI", size=9,  weight="bold")
-        self.f_sub    = tkfont.Font(family="Segoe UI", size=8)
-        self.f_time   = tkfont.Font(family="Segoe UI", size=8)
-
-        self._build_header()
-        self._build_summary_bar()
-        self._build_grid()
-        self._build_footer()
-
-        self.refresh()
-
-    # ── Header ────────────────────────────────────────────
-    def _build_header(self):
-        hdr = tk.Frame(self.root, bg=BG_HEADER, pady=10)
-        hdr.pack(fill=tk.X)
-        tk.Label(hdr, text="DL Monitor Dashboard",
-                 font=self.f_title, bg=BG_HEADER, fg=COL_WHITE).pack(side=tk.LEFT, padx=20)
-        self.lbl_time = tk.Label(hdr, text="",
-                                  font=self.f_time, bg=BG_HEADER, fg=COL_MUTED)
-        self.lbl_time.pack(side=tk.RIGHT, padx=20)
-
-    # ── Summary bar ───────────────────────────────────────
-    def _build_summary_bar(self):
-        bar = tk.Frame(self.root, bg=BG_MAIN, pady=8)
-        bar.pack(fill=tk.X, padx=16)
-
-        def summary_card(label, color):
-            f = tk.Frame(bar, bg=BG_CARD, padx=18, pady=8)
-            f.pack(side=tk.LEFT, padx=6)
-            n = tk.Label(f, text="0", font=self.f_name, bg=BG_CARD, fg=color)
-            n.pack()
-            tk.Label(f, text=label, font=self.f_sub, bg=BG_CARD, fg=COL_MUTED).pack()
-            return n
-
-        self.sum_ok    = summary_card("OK",       COL_OK)
-        self.sum_warn  = summary_card("WARNING",  COL_WARN)
-        self.sum_block = summary_card("BLOCKED",  COL_BLOCK)
-        self.sum_total = summary_card("TOTAL DLs", COL_TEXT)
-
-        tk.Button(bar, text="⟳  Refresh Now",
-                  command=self.refresh,
-                  bg=BG_HEADER, fg=COL_WHITE, font=self.f_sub,
-                  relief=tk.FLAT, padx=12, pady=6, cursor="hand2",
-                  activebackground=BG_MAIN, activeforeground=COL_WHITE
-                  ).pack(side=tk.RIGHT, padx=6)
-
-    # ── 4-column grid of DL cards ─────────────────────────
-    def _build_grid(self):
-        outer = tk.Frame(self.root, bg=BG_MAIN)
-        outer.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
-
-        self.grid_frame = tk.Frame(outer, bg=BG_MAIN)
-        self.grid_frame.pack(fill=tk.BOTH, expand=True)
-
-        for col in range(4):
-            self.grid_frame.columnconfigure(col, weight=1)
-
-        self.cards = []
-        for i in range(20):
-            card = self._make_card(self.grid_frame, i // 4, i % 4, f"DL{i+1:02d}")
-            self.cards.append(card)
-
-    def _make_card(self, parent, row, col, dl_name):
-        frame = tk.Frame(parent, bg=BG_CARD, padx=10, pady=8)
-        frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
-
-        top = tk.Frame(frame, bg=BG_CARD)
-        top.pack(fill=tk.X)
-        tk.Label(top, text=dl_name, font=self.f_name,
-                 bg=BG_CARD, fg=COL_WHITE).pack(side=tk.LEFT)
-        lbl_status = tk.Label(top, text="OK", font=self.f_status,
-                               bg=COL_OK, fg=BG_MAIN, padx=6, pady=1)
-        lbl_status.pack(side=tk.RIGHT)
-
-        tk.Frame(frame, bg=BG_HEADER, height=1).pack(fill=tk.X, pady=4)
-
-        lbl_fail = tk.Label(frame, text="0", font=self.f_name,
-                             bg=BG_CARD, fg=COL_OK)
-        lbl_fail.pack()
-        tk.Label(frame, text="fails this cycle", font=self.f_sub,
-                 bg=BG_CARD, fg=COL_MUTED).pack()
-
-        lbl_rate = tk.Label(frame, text="0.00%", font=self.f_val,
-                             bg=BG_CARD, fg=COL_TEXT)
-        lbl_rate.pack()
-        tk.Label(frame, text="fail rate", font=self.f_sub,
-                 bg=BG_CARD, fg=COL_MUTED).pack()
-
-        lbl_total = tk.Label(frame, text="0 records", font=self.f_sub,
-                              bg=BG_CARD, fg=COL_MUTED)
-        lbl_total.pack(pady=(2, 0))
-
-        lbl_stops = tk.Label(frame, text="stops today: 0", font=self.f_sub,
-                              bg=BG_CARD, fg=COL_MUTED)
-        lbl_stops.pack()
-
-        return {
-            'frame': frame, 'status': lbl_status,
-            'fail': lbl_fail, 'rate': lbl_rate,
-            'total': lbl_total, 'stops': lbl_stops,
+        self.setStyleSheet("""
+        QWidget{
+            background:#2b2b2b;
+            color:white;
         }
+        QLabel{
+            font-size:16px;
+            font-weight:bold;
+        }
+        """)
 
-    # ── Footer ────────────────────────────────────────────
-    def _build_footer(self):
-        ft = tk.Frame(self.root, bg=BG_HEADER, pady=4)
-        ft.pack(fill=tk.X, side=tk.BOTTOM)
-        tk.Label(ft,
-                 text=f"Log dir: {LOG_DIRECTORY}   |   "
-                      f"Refresh every {REFRESH_INTERVAL//1000}s   |   "
-                      f"Warn ≥{WARN_AT_FAILS} fails   |   "
-                      f"Block ≥{BLOCK_AT_FAILS} fails",
-                 font=self.f_sub, bg=BG_HEADER, fg=COL_MUTED).pack()
+        layout = QVBoxLayout()
 
-    # ── Refresh ───────────────────────────────────────────
-    def refresh(self):
-        threading.Thread(target=self._fetch_and_update, daemon=True).start()
+        self.dl_name = QLabel("DL01")
+        self.status = QLabel("STATUS : RUNNING")
+        self.fail_count = QLabel("FAIL COUNT : 0 / 3")
+        self.fail_rate = QLabel("FAIL RATE : 0.00 %")
+        self.last_stop = QLabel("LAST STOP : -")
 
-    def _fetch_and_update(self):
-        stats = compute_dl_stats()
-        self.root.after(0, lambda: self._update_ui(stats))
+        self.dl_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-    def _update_ui(self, stats):
-        ok_count = warn_count = block_count = 0
+        self.dl_name.setStyleSheet("""
+        font-size:26px;
+        color:#00C853;
+        """)
 
-        for i, s in enumerate(stats):
-            card   = self.cards[i]
-            status = s['status']
-            fails  = s['fails']
+        layout.addWidget(self.dl_name)
+        layout.addWidget(self.status)
+        layout.addWidget(self.fail_count)
+        layout.addWidget(self.fail_rate)
+        layout.addWidget(self.last_stop)
 
-            if status == 'BLOCKED':
-                color = COL_BLOCK
-                block_count += 1
-            elif status == 'WARNING':
-                color = COL_WARN
-                warn_count += 1
-            else:
-                color = COL_OK
-                if status == 'OK':
-                    ok_count += 1
+        self.setLayout(layout)
 
-            card['status'].config(text=status, bg=color,
-                                  fg=BG_MAIN if status != 'BLOCKED' else COL_WHITE)
-            card['fail'].config(text=str(fails), fg=color)
-            card['rate'].config(text=f"{s['rate']:.2f}%")
-            card['total'].config(text=f"{s['total']} records")
-            card['stops'].config(text=f"stops today: {s['stops_today']}")
-            card['frame'].config(
-                highlightbackground=color,
-                highlightthickness=1 if status != 'OK' else 0,
-                highlightcolor=color
-            )
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.refresh_data)
+        self.timer.start(3000)
 
-        self.sum_ok.config(text=str(ok_count))
-        self.sum_warn.config(text=str(warn_count))
-        self.sum_block.config(text=str(block_count))
-        self.sum_total.config(text="20")
+    def refresh_data(self):
 
-        now = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
-        self.lbl_time.config(text=f"Last updated: {now}")
+        # Replace with real values
+        dl_name = "DL01"
+        fail_count = 1
+        fail_rate = 5.0
+        last_stop = "-"
 
-        self.root.after(REFRESH_INTERVAL, self.refresh)
+        self.dl_name.setText(dl_name)
+
+        if fail_count >= 3:
+            status = "STOPPED"
+            color = "#D50000"
+        else:
+            status = "RUNNING"
+            color = "#00C853"
+
+        self.status.setText(f"STATUS : {status}")
+        self.fail_count.setText(f"FAIL COUNT : {fail_count} / 3")
+        self.fail_rate.setText(f"FAIL RATE : {fail_rate:.2f} %")
+        self.last_stop.setText(f"LAST STOP : {last_stop}")
+
+        self.dl_name.setStyleSheet(f"""
+        font-size:26px;
+        color:{color};
+        """)
 
 
-# =========================================================
-# Entry point
-# =========================================================
-if __name__ == '__main__':
-    root = tk.Tk()
-    root.geometry("900x620")
-    root.minsize(700, 500)
-    DLDashboard(root)
-    root.mainloop()
+app = QApplication(sys.argv)
+
+window = DLDashboard()
+window.show()
+
+sys.exit(app.exec())
