@@ -1,0 +1,62 @@
+"""
+config_loader.py  —  DL PC  (SHARED)
+Single source of truth for config.json.
+All other files import get_config() instead of hardcoding paths.
+
+Place this file in the SAME folder as all other DL_PC files.
+"""
+
+import os
+import json
+
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+_DEFAULTS = {
+    "paths": {
+        "log_directory":    r"C:\logs",
+        "log_register_dir": r"C:\DL_PC\log_register",
+    },
+    "network": {
+        "main_pc_ip":       "192.168.1.100",
+        "ping_timeout_sec": 1,
+        "main_pc_port":     9999,
+    },
+    "monitor": {
+        "poll_interval_sec":  30,
+        "max_records_window": 60,
+        "dl_count":           20,
+    },
+    "thresholds": {
+        "warn_at_fails":  2,
+        "block_at_fails": 3,
+    },
+    "dashboard": {
+        "refresh_interval_ms": 10000,
+        "window_width":        1100,
+        "window_height":       680,
+    },
+}
+
+
+def get_config() -> dict:
+    """
+    Load config.json and return it as a dict.
+    Any missing key falls back to _DEFAULTS — never crashes.
+    Called fresh each time so runtime edits (via dashboard) are
+    picked up on the next call without restarting any process.
+    """
+    try:
+        if os.path.exists(_CONFIG_PATH):
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Deep-merge: fill in any missing sections/keys from defaults
+            for section, values in _DEFAULTS.items():
+                if section not in data:
+                    data[section] = values
+                else:
+                    for k, v in values.items():
+                        data[section].setdefault(k, v)
+            return data
+    except Exception as e:
+        print(f"[config_loader] Failed to load config.json: {e} — using defaults")
+    return _DEFAULTS
