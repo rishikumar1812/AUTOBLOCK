@@ -1,50 +1,68 @@
 """
 process_files.py  —  DL PC  (MAIN ENTRY POINT)
 Reads all DL log files, counts FAILs since last stop,
-and triggers stop at every 3 fails per cycle.
+and triggers stop at every 3 fails per cycle (configurable).
 
-Run this on a loop/scheduler (e.g. every 30 seconds via Task Scheduler).
+Every scan tick:
+  1. Groups today's DL log files by DL number
+  2. Parses and combines records for each DL
+  3. Loads stop_tracker.json ONCE — iterates all DLs in memory
+  4. Applies post-stop filter per DL (only FAILs after last stop)
+  5. Triggers stop pipeline at fail_count >= block_at_fails threshold
+
+Run via Task Scheduler every 30 seconds (configurable in config.json).
 """
 
 import os
 import re
 import json
-import pandas as pd
+import logging
+import time
 from datetime import datetime, date
 
+import pandas as pd
+
+from config_loader import get_config
 from register_logger import register_stop_event
-from stop_tracker import get_last_stop_time
-from config_loader import get_config          # ← NEW
-
-# =========================================================
-# Configuration — loaded from config.json, not hardcoded
-# =========================================================
-def _cfg():
-    return get_config()
-
-def LOG_DIRECTORY()    -> str: return _cfg()["paths"]["log_directory"]
-def LOG_REGISTER_DIR() -> str: return _cfg()["paths"]["log_register_dir"]
-def MAX_RECORDS()      -> int: return int(_cfg()["monitor"]["max_records_window"])
-def DL_COUNT()         -> int: return int(_cfg()["monitor"]["dl_count"])
-def BLOCK_AT_FAILS()   -> int: return int(_cfg()["thresholds"]["block_at_fails"])
-def POLL_INTERVAL()    -> int: return int(_cfg()["monitor"]["poll_interval_sec"])
+from stop_tracker import get_all_stop_times
 
 
 # =========================================================
-# Read stop_count from JSON written by register_logger.py
-# Needed to survive same-day process restarts.
+# Config accessors — live from config.json each call
 # =========================================================
-def get_stop_count_today(dl_name: str) -> int:
-    today_str = date.today().strftime("%Y%m%d")
-    path = os.path.join(LOG_REGISTER_DIR(), f"{dl_name}_{today_str}.json")
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return int(data.get("stop_count", 0))
-    except Exception:
-        pass
-    return 0
+def _cfg():                return get_config()
+def LOG_DIRECTORY()  -> str: return _cfg()["paths"]["log_directory"]
+def LOG_REG_DIR()    -> str: return _cfg()["paths"]["log_register_dir"]
+def MAX_RECORDS()    -> int: return int(_cfg()["monitor"]["max_records_window"])
+def DL_COUNT()       -> int: return int(_cfg()["monitor"]["dl_count"])
+def BLOCK_AT_FAILS() -> int: return int(_cfg()["thresholds"]["block_at_fails"])
+def POLL_INTERVAL()  -> int: return int(_cfg()["monitor"]["poll_interval_sec"])
+
+
+# =========================================================
+# Logging setup — writes to log_register_dir/process_files.log
+# =========================================================
+def _setup_logger() -> logging.Logger:
+    log_dir = get_config()["paths"]["log_register_dir"]
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "process_files.log")
+
+    logger = logging.getLogger("process_files")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(fmt)
+
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+    return logger
+
+logger = _setup_logger()
 
 
 # =========================================================
@@ -59,38 +77,48 @@ def is_today(file_path: str) -> bool:
 # Parse one log file into a DataFrame
 # =========================================================
 def read_latest_file(file_path: str):
-    rows = []
+    """
+    Parses block-based DL log file.
+    Each block starts with #INIT and contains RESULT, TIME,
+    JIG, ARRAY, DATE fields.
+    Returns DataFrame or None if file has no valid blocks.
+    """
+    rows    = []
     current = {}
-
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-
-            if line.startswith("#INIT"):
-                required = ["RESULT", "Update_Time", "JIG", "ARRAY", "DATE"]
-                if all(key in current for key in required):
-                    rows.append(current.copy())
-                current = {}
-
-            elif line.startswith("RESULT :"):
-                current["RESULT"] = line.split("RESULT :", 1)[1].strip()
-
-            elif line.startswith("TIME :"):
-                current["Update_Time"] = line.split("TIME :", 1)[1].strip()
-
-            elif line.startswith("JIG :"):
-                current["JIG"] = line.split("JIG :", 1)[1].strip()
-
-            elif line.startswith("ARRAY :"):
-                current["ARRAY"] = line.split("ARRAY :", 1)[1].strip()
-
-            elif line.startswith("DATE :"):
-                current["DATE"] = line.split("DATE :", 1)[1].strip()
-
-    # Flush last block
     required = ["RESULT", "Update_Time", "JIG", "ARRAY", "DATE"]
-    if all(key in current for key in required):
-        rows.append(current.copy())
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+
+                if line.startswith("#INIT"):
+                    if all(k in current for k in required):
+                        rows.append(current.copy())
+                    current = {}
+
+                elif line.startswith("RESULT :"):
+                    current["RESULT"] = line.split("RESULT :", 1)[1].strip()
+
+                elif line.startswith("TIME :"):
+                    current["Update_Time"] = line.split("TIME :", 1)[1].strip()
+
+                elif line.startswith("JIG :"):
+                    current["JIG"] = line.split("JIG :", 1)[1].strip()
+
+                elif line.startswith("ARRAY :"):
+                    current["ARRAY"] = line.split("ARRAY :", 1)[1].strip()
+
+                elif line.startswith("DATE :"):
+                    current["DATE"] = line.split("DATE :", 1)[1].strip()
+
+        # Flush last block
+        if all(k in current for k in required):
+            rows.append(current.copy())
+
+    except Exception as e:
+        logger.error(f"[process_files] Could not read {file_path}: {e}")
+        return None
 
     if not rows:
         return None
@@ -107,81 +135,119 @@ def read_latest_file(file_path: str):
 
 
 # =========================================================
-# Process all DL files — called every scheduler tick
+# Main scan — called every scheduler tick
 # =========================================================
-def process_files():
+def process_files() -> list:
+    """
+    Scan all DL log files, evaluate fail counts, trigger stops.
+    Returns list of result message strings for logging.
+    """
     result_messages = []
-    directory = LOG_DIRECTORY()
+    directory       = LOG_DIRECTORY()
+    dl_count        = DL_COUNT()
+    block_threshold = BLOCK_AT_FAILS()
 
-    dl_files = [[] for _ in range(DL_COUNT())]
+    logger.info(f"[process_files] Scan started — dir: {directory} | "
+                f"DLs: {dl_count} | block at: {block_threshold} fails")
 
-    all_files = [
-        os.path.join(directory, f)
-        for f in os.listdir(directory)
-        if os.path.isfile(os.path.join(directory, f))
-    ]
+    # Guard: log directory must exist
+    if not os.path.isdir(directory):
+        logger.error(f"[process_files] Log directory not found: {directory}")
+        return result_messages
 
-    # Group today's files by DL number
-    for file_path in all_files:
-        file_name = os.path.basename(file_path)
-        match = re.search(r"DL(\d{2})", file_name, re.IGNORECASE)
-        if match and is_today(file_path):
-            dl_no = int(match.group(1))
-            index = dl_no - 1
-            if 0 <= index < DL_COUNT():
-                dl_files[index].append(file_path)
+    # ── Group today's files by DL number ─────────────────
+    dl_files = [[] for _ in range(dl_count)]
 
+    for fname in os.listdir(directory):
+        fpath = os.path.join(directory, fname)
+        if not os.path.isfile(fpath):
+            continue
+        match = re.search(r"DL(\d{2})", fname, re.IGNORECASE)
+        if match and is_today(fpath):
+            idx = int(match.group(1)) - 1
+            if 0 <= idx < dl_count:
+                dl_files[idx].append(fpath)
+
+    # ── Load stop_tracker.json ONCE for all DLs ──────────
+    # Avoids 20 separate disk reads (one per DL) every tick.
+    all_stops = get_all_stop_times()
+
+    # ── Evaluate each DL ─────────────────────────────────
     for i, files in enumerate(dl_files):
+        dl_name = f"DL{i + 1:02d}"
+
         if not files:
+            logger.debug(f"[process_files] {dl_name} — no files today, skipping")
             continue
 
         # Combine all files for this DL
         combined = pd.DataFrame()
-        for file_path in files:
-            df = read_latest_file(file_path)
+        for fpath in files:
+            df = read_latest_file(fpath)
             if df is not None:
                 combined = pd.concat([combined, df], ignore_index=True)
 
         if combined.empty:
+            logger.warning(f"[process_files] {dl_name} — files found but no valid records")
             continue
 
-        combined  = combined.sort_values("Time_stamp").reset_index(drop=True)
-        dl_name   = f"DL{i + 1:02d}"
+        combined = combined.sort_values("Time_stamp").reset_index(drop=True)
 
-        # Apply post-stop filter FIRST, then limit window
-        last_stop = get_last_stop_time(dl_name)
-        if last_stop is not None:
-            active_df = combined[combined["Time_stamp"] > pd.Timestamp(last_stop)]
+        # ── Apply post-stop filter FIRST, then tail ───────
+        # Filter first so tail() never cuts off recent post-stop records.
+        last_stop_str = all_stops.get(dl_name, {}).get("last_stop")
+        if last_stop_str:
+            try:
+                last_stop_ts = datetime.fromisoformat(last_stop_str)
+                active_df    = combined[combined["Time_stamp"] > pd.Timestamp(last_stop_ts)]
+            except Exception as e:
+                logger.error(f"[process_files] {dl_name} — bad last_stop value: {e}")
+                active_df = combined
         else:
-            active_df = combined
+            active_df = combined   # Never stopped before — count everything
 
         if len(active_df) > MAX_RECORDS():
             active_df = active_df.tail(MAX_RECORDS()).reset_index(drop=True)
 
         if active_df.empty:
+            logger.info(f"[process_files] {dl_name} — no new records since last stop")
             continue
 
-        # Count FAILs and check threshold
+        # ── Count FAILs ───────────────────────────────────
+        total      = len(active_df)
         fail_df    = active_df[active_df["RESULT"].str.upper() == "FAIL"]
         fail_count = len(fail_df)
-        fail_rate  = (fail_count / len(active_df)) * 100
+        fail_rate  = (fail_count / total) * 100
 
-        if fail_count >= BLOCK_AT_FAILS():
+        logger.info(
+            f"[process_files] {dl_name} — "
+            f"records: {total} | fails: {fail_count} | rate: {fail_rate:.1f}%"
+        )
+
+        # ── Trigger stop at threshold ──────────────────────
+        # >= handles burst case where 2 fails land in same tick
+        if fail_count >= block_threshold:
             latest_fail = fail_df.iloc[-1]
             registered  = register_stop_event(dl_name, latest_fail)
 
             if registered:
-                result_messages.append(
+                msg = (
                     f"{dl_name} STOPPED | "
                     f"Cycle Fails = {fail_count} | "
                     f"Fail Rate = {fail_rate:.2f}%"
                 )
+                logger.warning(f"[process_files] {msg}")
+                result_messages.append(msg)
             elif registered is None:
-                result_messages.append(
-                    f"{dl_name} WARNING: register_stop_event returned None "
-                    f"(check register_logger.py). Fail count = {fail_count}"
+                logger.error(
+                    f"[process_files] {dl_name} — register_stop_event returned None, "
+                    f"check register_logger.py"
                 )
 
+    logger.info(
+        f"[process_files] Scan complete — "
+        f"{len(result_messages)} stop(s) triggered this tick"
+    )
     return result_messages
 
 
@@ -189,28 +255,15 @@ def process_files():
 # Entry point
 # =========================================================
 if __name__ == "__main__":
-    import time
-    import logging
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(
-                os.path.join(LOG_REGISTER_DIR(), "process_files.log")
-            ),
-            logging.StreamHandler(),
-        ],
-    )
-
     interval = POLL_INTERVAL()
-    print(f"DL Monitor started. Scanning every {interval}s. Press Ctrl+C to stop.")
+    logger.info(
+        f"[process_files] DL Monitor started — "
+        f"scanning every {interval}s. Press Ctrl+C to stop."
+    )
 
     while True:
         try:
-            messages = process_files()
-            for msg in messages:
-                logging.info(msg)
+            process_files()
         except Exception as e:
-            logging.error(f"Error during scan: {e}")
+            logger.error(f"[process_files] Unhandled error during scan: {e}")
         time.sleep(POLL_INTERVAL())
