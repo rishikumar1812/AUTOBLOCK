@@ -1,7 +1,7 @@
 """
 config_loader.py  —  DL PC  (SHARED)
 Single source of truth for config.json.
-All other files import get_config() instead of hardcoding paths.
+All other files import get_config() instead of hardcoding values.
 
 Place this file in the SAME folder as all other DL_PC files.
 """
@@ -18,8 +18,8 @@ _DEFAULTS = {
     },
     "network": {
         "main_pc_ip":       "192.168.1.100",
-        "ping_timeout_sec": 1,
         "main_pc_port":     9999,
+        "ping_timeout_sec": 1,
     },
     "monitor": {
         "poll_interval_sec":  30,
@@ -40,10 +40,10 @@ _DEFAULTS = {
 
 def get_config() -> dict:
     """
-    Load config.json and return it as a dict.
+    Load config.json and return as a dict.
     Any missing key falls back to _DEFAULTS — never crashes.
-    Called fresh each time so runtime edits (via dashboard) are
-    picked up on the next call without restarting any process.
+    Called fresh each time so runtime edits (via dashboard)
+    are picked up on the next call without restarting any process.
     """
     try:
         if os.path.exists(_CONFIG_PATH):
@@ -60,3 +60,18 @@ def get_config() -> dict:
     except Exception as e:
         print(f"[config_loader] Failed to load config.json: {e} — using defaults")
     return _DEFAULTS
+
+
+def save_config(cfg: dict) -> bool:
+    """
+    Write updated config back to config.json.
+    Returns True on success, False on failure.
+    Used by dl_dashboard.py when operator edits IP or thresholds.
+    """
+    try:
+        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+        return True
+    except Exception as e:
+        print(f"[config_loader] Failed to save config.json: {e}")
+        return False
