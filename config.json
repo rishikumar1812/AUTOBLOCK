@@ -1,5 +1,5 @@
 {
-    "_comment": "DL Monitor Configuration — edit this file, not the Python scripts.",
+    "_comment": "DL Monitor Configuration — edit this file only, never the Python scripts.",
 
     "paths": {
         "log_directory":    "C:\\logs",
@@ -8,6 +8,7 @@
 
     "network": {
         "main_pc_ip":       "192.168.1.100",
+        "main_pc_port":     9999,
         "ping_timeout_sec": 1
     },
 
