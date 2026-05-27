@@ -1,92 +1,736 @@
-import sys
-from PyQt6.QtWidgets import (
-    QApplication,
-    QWidget,
-    QLabel,
-    QVBoxLayout
-)
-from PyQt6.QtCore import Qt, QTimer
+"""
+dl_dashboard.py  —  DL PC
+Live dashboard showing all 20 DLs.
+
+Features:
+  - All settings loaded from config.json (no hardcoded values)
+  - Main PC IP section (top-right) with live ping status dot
+  - Click any DL card to open a full detail popup
+  - Threshold editor: change warn/block fail counts from the UI
+  - Summary bar: OK / WARNING / BLOCKED counts
+  - Auto-refresh every N seconds (configured in config.json)
+
+Place this file in the SAME folder as all other DL_PC files:
+  dl_dashboard.py
+  process_files.py
+  register_logger.py
+  network_sender.py
+  stop_tracker.py
+  config.json          ← NEW
+"""
+
+import os
+import re
+import json
+import subprocess
+import platform
+import tkinter as tk
+from tkinter import font as tkfont, simpledialog, messagebox
+from datetime import datetime, date
+import pandas as pd
+import threading
+
+# ── Import shared logic from existing files ───────────────
+from process_files import read_latest_file, is_today
+from stop_tracker  import get_last_stop_time
+
+# =========================================================
+# Load config.json
+# Looks for config.json in the same folder as this script.
+# Falls back to safe defaults if any key is missing.
+# =========================================================
+_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def _load_config() -> dict:
+    defaults = {
+        "paths":      {"log_directory": r"C:\logs", "log_register_dir": r"C:\DL_PC\log_register"},
+        "network":    {"main_pc_ip": "192.168.1.100", "ping_timeout_sec": 1},
+        "monitor":    {"poll_interval_sec": 30, "max_records_window": 60, "dl_count": 20},
+        "thresholds": {"warn_at_fails": 2, "block_at_fails": 3},
+        "dashboard":  {"refresh_interval_ms": 10000, "window_width": 1100, "window_height": 680},
+    }
+    try:
+        if os.path.exists(_CONFIG_PATH):
+            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Deep-merge: defaults fill in any missing keys
+            for section, values in defaults.items():
+                if section not in data:
+                    data[section] = values
+                else:
+                    for k, v in values.items():
+                        data[section].setdefault(k, v)
+            return data
+    except Exception as e:
+        print(f"[config] Failed to load config.json: {e} — using defaults")
+    return defaults
+
+def _save_config(cfg: dict) -> None:
+    try:
+        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+    except Exception as e:
+        print(f"[config] Failed to save config.json: {e}")
+
+# Initial load
+CFG = _load_config()
+
+# Convenience accessors (re-read from CFG dict so live edits take effect)
+def LOG_DIRECTORY()       -> str: return CFG["paths"]["log_directory"]
+def LOG_REGISTER_DIR()    -> str: return CFG["paths"]["log_register_dir"]
+def MAIN_PC_IP()          -> str: return CFG["network"]["main_pc_ip"]
+def PING_TIMEOUT()        -> int: return int(CFG["network"]["ping_timeout_sec"])
+def MAX_RECORDS()         -> int: return int(CFG["monitor"]["max_records_window"])
+def DL_COUNT()            -> int: return int(CFG["monitor"]["dl_count"])
+def WARN_AT_FAILS()       -> int: return int(CFG["thresholds"]["warn_at_fails"])
+def BLOCK_AT_FAILS()      -> int: return int(CFG["thresholds"]["block_at_fails"])
+def REFRESH_INTERVAL_MS() -> int: return int(CFG["dashboard"]["refresh_interval_ms"])
 
 
-class DLDashboard(QWidget):
+# =========================================================
+# Colors
+# =========================================================
+BG_MAIN   = "#0d1117"
+BG_CARD   = "#161b22"
+BG_HEADER = "#1c2128"
+BG_POPUP  = "#161b22"
+COL_OK    = "#3fb950"
+COL_WARN  = "#d29922"
+COL_BLOCK = "#f85149"
+COL_TEXT  = "#c9d1d9"
+COL_MUTED = "#6e7681"
+COL_WHITE = "#ffffff"
+COL_ACCT  = "#58a6ff"
+COL_BORDER= "#30363d"
 
-    def __init__(self):
 
-        super().__init__()
-
-        self.setWindowTitle("AutoBlock DL")
-
-        self.setFixedSize(500, 220)
-
-        self.setStyleSheet("""
-        QWidget{
-            background:#2b2b2b;
-            color:white;
-        }
-        QLabel{
-            font-size:16px;
-            font-weight:bold;
-        }
-        """)
-
-        layout = QVBoxLayout()
-
-        self.dl_name = QLabel("DL01")
-        self.status = QLabel("STATUS : RUNNING")
-        self.fail_count = QLabel("FAIL COUNT : 0 / 3")
-        self.fail_rate = QLabel("FAIL RATE : 0.00 %")
-        self.last_stop = QLabel("LAST STOP : -")
-
-        self.dl_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        self.dl_name.setStyleSheet("""
-        font-size:26px;
-        color:#00C853;
-        """)
-
-        layout.addWidget(self.dl_name)
-        layout.addWidget(self.status)
-        layout.addWidget(self.fail_count)
-        layout.addWidget(self.fail_rate)
-        layout.addWidget(self.last_stop)
-
-        self.setLayout(layout)
-
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.refresh_data)
-        self.timer.start(3000)
-
-    def refresh_data(self):
-
-        # Replace with real values
-        dl_name = "DL01"
-        fail_count = 1
-        fail_rate = 5.0
-        last_stop = "-"
-
-        self.dl_name.setText(dl_name)
-
-        if fail_count >= 3:
-            status = "STOPPED"
-            color = "#D50000"
+# =========================================================
+# Ping helper — works on Windows and Linux
+# =========================================================
+def ping_host(ip: str, timeout: int = 1) -> bool:
+    """Returns True if host is reachable."""
+    try:
+        system = platform.system().lower()
+        if system == "windows":
+            cmd = ["ping", "-n", "1", "-w", str(timeout * 1000), ip]
         else:
-            status = "RUNNING"
-            color = "#00C853"
-
-        self.status.setText(f"STATUS : {status}")
-        self.fail_count.setText(f"FAIL COUNT : {fail_count} / 3")
-        self.fail_rate.setText(f"FAIL RATE : {fail_rate:.2f} %")
-        self.last_stop.setText(f"LAST STOP : {last_stop}")
-
-        self.dl_name.setStyleSheet(f"""
-        font-size:26px;
-        color:{color};
-        """)
+            cmd = ["ping", "-c", "1", "-W", str(timeout), ip]
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout + 2,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 
-app = QApplication(sys.argv)
+# =========================================================
+# Read stop_count from JSON that register_logger.py wrote
+# =========================================================
+def get_stop_count_today(dl_name: str) -> int:
+    today_str = date.today().strftime("%Y%m%d")
+    path = os.path.join(LOG_REGISTER_DIR(), f"{dl_name}_{today_str}.json")
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return int(data.get("stop_count", 0))
+    except Exception:
+        pass
+    return 0
 
-window = DLDashboard()
-window.show()
 
-sys.exit(app.exec())
+def get_last_stop_str(dl_name: str) -> str:
+    """Human-readable last stop time, or '—' if never stopped."""
+    ts = get_last_stop_time(dl_name)
+    if ts is None:
+        return "—"
+    try:
+        return pd.Timestamp(ts).strftime("%H:%M:%S")
+    except Exception:
+        return str(ts)
+
+
+# =========================================================
+# Compute stats for all DLs
+# =========================================================
+def compute_dl_stats() -> list:
+    dl_files = [[] for _ in range(DL_COUNT())]
+    stats    = []
+
+    if not os.path.isdir(LOG_DIRECTORY()):
+        for i in range(DL_COUNT()):
+            stats.append({
+                "name": f"DL{i+1:02d}", "total": 0, "fails": 0,
+                "rate": 0.0, "status": "NO DIR",
+                "stops_today": 0, "last_stop": "—",
+            })
+        return stats
+
+    for fname in os.listdir(LOG_DIRECTORY()):
+        fpath = os.path.join(LOG_DIRECTORY(), fname)
+        if not os.path.isfile(fpath):
+            continue
+        match = re.search(r"DL(\d{2})", fname, re.IGNORECASE)
+        if match and is_today(fpath):
+            idx = int(match.group(1)) - 1
+            if 0 <= idx < DL_COUNT():
+                dl_files[idx].append(fpath)
+
+    for i, files in enumerate(dl_files):
+        dl_name     = f"DL{i+1:02d}"
+        stops_today = get_stop_count_today(dl_name)
+        last_stop   = get_last_stop_str(dl_name)
+
+        if not files:
+            stats.append({
+                "name": dl_name, "total": 0, "fails": 0,
+                "rate": 0.0, "status": "NO FILE",
+                "stops_today": stops_today, "last_stop": last_stop,
+            })
+            continue
+
+        combined = pd.DataFrame()
+        for fpath in files:
+            df = read_latest_file(fpath)
+            if df is not None:
+                combined = pd.concat([combined, df], ignore_index=True)
+
+        if combined.empty:
+            stats.append({
+                "name": dl_name, "total": 0, "fails": 0,
+                "rate": 0.0, "status": "EMPTY",
+                "stops_today": stops_today, "last_stop": last_stop,
+            })
+            continue
+
+        combined  = combined.sort_values("Time_stamp").reset_index(drop=True)
+
+        # Filter first, then tail — prevents new records being dropped
+        raw_stop  = get_last_stop_time(dl_name)
+        if raw_stop is not None:
+            active = combined[combined["Time_stamp"] > pd.Timestamp(raw_stop)]
+        else:
+            active = combined
+
+        if len(active) > MAX_RECORDS():
+            active = active.tail(MAX_RECORDS()).reset_index(drop=True)
+
+        total = len(active)
+        fails = int(active[active["RESULT"].str.upper() == "FAIL"].shape[0]) if total > 0 else 0
+        rate  = (fails / total * 100) if total > 0 else 0.0
+
+        if fails >= BLOCK_AT_FAILS():
+            status = "BLOCKED"
+        elif fails >= WARN_AT_FAILS():
+            status = "WARNING"
+        else:
+            status = "OK"
+
+        stats.append({
+            "name": dl_name, "total": total, "fails": fails,
+            "rate": rate, "status": status,
+            "stops_today": stops_today, "last_stop": last_stop,
+        })
+
+    return stats
+
+
+# =========================================================
+# Detail Popup — opens when a DL card is clicked
+# =========================================================
+class DetailPopup(tk.Toplevel):
+    def __init__(self, parent, stat: dict):
+        super().__init__(parent)
+        self.title(f"{stat['name']} — Detail")
+        self.configure(bg=BG_POPUP)
+        self.resizable(False, False)
+        self.grab_set()                         # modal
+
+        f_title  = tkfont.Font(family="Consolas", size=14, weight="bold")
+        f_label  = tkfont.Font(family="Consolas", size=10)
+        f_value  = tkfont.Font(family="Consolas", size=12, weight="bold")
+        f_small  = tkfont.Font(family="Consolas", size=9)
+
+        status  = stat["status"]
+        color   = COL_BLOCK if status == "BLOCKED" else (COL_WARN if status == "WARNING" else COL_OK)
+
+        # ── Title bar ───────────────────────────────────────
+        hdr = tk.Frame(self, bg=color, pady=10, padx=20)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text=stat["name"], font=f_title,
+                 bg=color, fg=BG_MAIN).pack(side=tk.LEFT)
+        tk.Label(hdr, text=status, font=f_title,
+                 bg=color, fg=BG_MAIN).pack(side=tk.RIGHT)
+
+        # ── Stats grid ──────────────────────────────────────
+        body = tk.Frame(self, bg=BG_POPUP, padx=24, pady=20)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        rows = [
+            ("Fail Count",   str(stat["fails"]),              color),
+            ("Fail Rate",    f"{stat['rate']:.2f}%",          COL_TEXT),
+            ("Total Records",str(stat["total"]),               COL_TEXT),
+            ("Last Stop",    stat["last_stop"],                COL_WARN),
+            ("Stops Today",  str(stat["stops_today"]),         COL_TEXT),
+            ("Warn Threshold", f"≥ {WARN_AT_FAILS()} fails",  COL_WARN),
+            ("Block Threshold",f"≥ {BLOCK_AT_FAILS()} fails", COL_BLOCK),
+        ]
+
+        for r, (label, value, val_color) in enumerate(rows):
+            tk.Label(body, text=label, font=f_label,
+                     bg=BG_POPUP, fg=COL_MUTED,
+                     anchor="w", width=18).grid(row=r, column=0, sticky="w", pady=4)
+            tk.Label(body, text=value, font=f_value,
+                     bg=BG_POPUP, fg=val_color,
+                     anchor="w").grid(row=r, column=1, sticky="w", padx=12, pady=4)
+
+        # ── Divider ─────────────────────────────────────────
+        tk.Frame(body, bg=COL_BORDER, height=1).grid(
+            row=len(rows), column=0, columnspan=2, sticky="ew", pady=10)
+
+        # ── Timestamp ───────────────────────────────────────
+        tk.Label(body,
+                 text=f"Snapshot at  {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}",
+                 font=f_small, bg=BG_POPUP, fg=COL_MUTED).grid(
+                 row=len(rows)+1, column=0, columnspan=2, sticky="w")
+
+        # ── Close button ────────────────────────────────────
+        tk.Button(self, text="Close", command=self.destroy,
+                  bg=BG_HEADER, fg=COL_TEXT, font=f_label,
+                  relief=tk.FLAT, padx=20, pady=8, cursor="hand2",
+                  activebackground=COL_BORDER, activeforeground=COL_WHITE
+                  ).pack(pady=(0, 16))
+
+        # Centre popup over parent
+        self.update_idletasks()
+        px = parent.winfo_x() + (parent.winfo_width()  - self.winfo_width())  // 2
+        py = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{px}+{py}")
+
+
+# =========================================================
+# Threshold Editor Popup
+# =========================================================
+class ThresholdEditor(tk.Toplevel):
+    def __init__(self, parent, on_save_callback):
+        super().__init__(parent)
+        self.title("Edit Fail Thresholds")
+        self.configure(bg=BG_POPUP)
+        self.resizable(False, False)
+        self.grab_set()
+        self.on_save = on_save_callback
+
+        f_label = tkfont.Font(family="Consolas", size=10)
+        f_title = tkfont.Font(family="Consolas", size=12, weight="bold")
+
+        tk.Label(self, text="Fail Thresholds", font=f_title,
+                 bg=BG_POPUP, fg=COL_WHITE).pack(pady=(16, 4))
+        tk.Label(self, text="Changes are saved to config.json immediately.",
+                 font=tkfont.Font(family="Consolas", size=8),
+                 bg=BG_POPUP, fg=COL_MUTED).pack(pady=(0, 12))
+
+        form = tk.Frame(self, bg=BG_POPUP, padx=24, pady=8)
+        form.pack()
+
+        # Warn threshold
+        tk.Label(form, text="Warn at fails  ≥", font=f_label,
+                 bg=BG_POPUP, fg=COL_WARN, anchor="w", width=20
+                 ).grid(row=0, column=0, sticky="w", pady=6)
+        self.warn_var = tk.StringVar(value=str(WARN_AT_FAILS()))
+        tk.Entry(form, textvariable=self.warn_var, width=6,
+                 font=f_label, bg=BG_HEADER, fg=COL_WHITE,
+                 insertbackground=COL_WHITE, relief=tk.FLAT
+                 ).grid(row=0, column=1, padx=8)
+
+        # Block threshold
+        tk.Label(form, text="Block at fails ≥", font=f_label,
+                 bg=BG_POPUP, fg=COL_BLOCK, anchor="w", width=20
+                 ).grid(row=1, column=0, sticky="w", pady=6)
+        self.block_var = tk.StringVar(value=str(BLOCK_AT_FAILS()))
+        tk.Entry(form, textvariable=self.block_var, width=6,
+                 font=f_label, bg=BG_HEADER, fg=COL_WHITE,
+                 insertbackground=COL_WHITE, relief=tk.FLAT
+                 ).grid(row=1, column=1, padx=8)
+
+        btn_row = tk.Frame(self, bg=BG_POPUP)
+        btn_row.pack(pady=16)
+        tk.Button(btn_row, text="Save", command=self._save,
+                  bg=COL_OK, fg=BG_MAIN, font=f_label,
+                  relief=tk.FLAT, padx=16, pady=6, cursor="hand2"
+                  ).pack(side=tk.LEFT, padx=8)
+        tk.Button(btn_row, text="Cancel", command=self.destroy,
+                  bg=BG_HEADER, fg=COL_TEXT, font=f_label,
+                  relief=tk.FLAT, padx=16, pady=6, cursor="hand2"
+                  ).pack(side=tk.LEFT, padx=8)
+
+        self.update_idletasks()
+        px = parent.winfo_x() + (parent.winfo_width()  - self.winfo_width())  // 2
+        py = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{px}+{py}")
+
+    def _save(self):
+        try:
+            warn  = int(self.warn_var.get())
+            block = int(self.block_var.get())
+            if warn < 1 or block < 1:
+                raise ValueError("Must be ≥ 1")
+            if warn >= block:
+                raise ValueError("Warn must be less than Block")
+        except ValueError as e:
+            messagebox.showerror("Invalid Input",
+                                 f"Please enter valid integers.\n{e}",
+                                 parent=self)
+            return
+
+        CFG["thresholds"]["warn_at_fails"]  = warn
+        CFG["thresholds"]["block_at_fails"] = block
+        _save_config(CFG)
+        self.on_save()
+        self.destroy()
+
+
+# =========================================================
+# IP Editor Popup
+# =========================================================
+class IPEditor(tk.Toplevel):
+    def __init__(self, parent, on_save_callback):
+        super().__init__(parent)
+        self.title("Edit Main PC IP")
+        self.configure(bg=BG_POPUP)
+        self.resizable(False, False)
+        self.grab_set()
+        self.on_save = on_save_callback
+
+        f_label = tkfont.Font(family="Consolas", size=10)
+        f_title = tkfont.Font(family="Consolas", size=12, weight="bold")
+
+        tk.Label(self, text="Main PC IP Address", font=f_title,
+                 bg=BG_POPUP, fg=COL_WHITE).pack(pady=(16, 4))
+        tk.Label(self, text="Used for ping/connection check.",
+                 font=tkfont.Font(family="Consolas", size=8),
+                 bg=BG_POPUP, fg=COL_MUTED).pack(pady=(0, 12))
+
+        form = tk.Frame(self, bg=BG_POPUP, padx=24, pady=8)
+        form.pack()
+
+        tk.Label(form, text="IP Address", font=f_label,
+                 bg=BG_POPUP, fg=COL_TEXT, anchor="w", width=12
+                 ).grid(row=0, column=0, sticky="w", pady=6)
+        self.ip_var = tk.StringVar(value=MAIN_PC_IP())
+        tk.Entry(form, textvariable=self.ip_var, width=20,
+                 font=f_label, bg=BG_HEADER, fg=COL_WHITE,
+                 insertbackground=COL_WHITE, relief=tk.FLAT
+                 ).grid(row=0, column=1, padx=8)
+
+        btn_row = tk.Frame(self, bg=BG_POPUP)
+        btn_row.pack(pady=16)
+        tk.Button(btn_row, text="Save", command=self._save,
+                  bg=COL_OK, fg=BG_MAIN, font=f_label,
+                  relief=tk.FLAT, padx=16, pady=6, cursor="hand2"
+                  ).pack(side=tk.LEFT, padx=8)
+        tk.Button(btn_row, text="Cancel", command=self.destroy,
+                  bg=BG_HEADER, fg=COL_TEXT, font=f_label,
+                  relief=tk.FLAT, padx=16, pady=6, cursor="hand2"
+                  ).pack(side=tk.LEFT, padx=8)
+
+        self.update_idletasks()
+        px = parent.winfo_x() + (parent.winfo_width()  - self.winfo_width())  // 2
+        py = parent.winfo_y() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{px}+{py}")
+
+    def _save(self):
+        ip = self.ip_var.get().strip()
+        if not ip:
+            messagebox.showerror("Invalid Input", "IP address cannot be empty.", parent=self)
+            return
+        CFG["network"]["main_pc_ip"] = ip
+        _save_config(CFG)
+        self.on_save()
+        self.destroy()
+
+
+# =========================================================
+# Main Dashboard
+# =========================================================
+class DLDashboard:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("DL Monitor Dashboard")
+        self.root.configure(bg=BG_MAIN)
+        self.root.resizable(True, True)
+        self._after_id   = None
+        self._ping_ok    = None     # None = unknown, True/False = result
+        self._last_stats = []
+
+        self.f_title  = tkfont.Font(family="Consolas", size=15, weight="bold")
+        self.f_name   = tkfont.Font(family="Consolas", size=11, weight="bold")
+        self.f_val    = tkfont.Font(family="Consolas", size=10)
+        self.f_status = tkfont.Font(family="Consolas", size=8,  weight="bold")
+        self.f_sub    = tkfont.Font(family="Consolas", size=8)
+        self.f_time   = tkfont.Font(family="Consolas", size=8)
+
+        self._build_header()
+        self._build_summary_bar()
+        self._build_grid()
+        self._build_footer()
+        self.refresh()
+
+    # ── Header ────────────────────────────────────────────
+    def _build_header(self):
+        hdr = tk.Frame(self.root, bg=BG_HEADER, pady=10)
+        hdr.pack(fill=tk.X)
+
+        # Left: title
+        tk.Label(hdr, text="DL Monitor Dashboard",
+                 font=self.f_title, bg=BG_HEADER, fg=COL_WHITE).pack(side=tk.LEFT, padx=20)
+
+        # Right: IP block
+        ip_block = tk.Frame(hdr, bg=BG_HEADER)
+        ip_block.pack(side=tk.RIGHT, padx=16)
+
+        tk.Label(ip_block, text="MAIN PC", font=self.f_sub,
+                 bg=BG_HEADER, fg=COL_MUTED).pack(anchor="e")
+
+        ip_row = tk.Frame(ip_block, bg=BG_HEADER)
+        ip_row.pack(anchor="e")
+
+        # Green/red dot
+        self.lbl_dot = tk.Label(ip_row, text="●", font=self.f_val,
+                                 bg=BG_HEADER, fg=COL_MUTED)
+        self.lbl_dot.pack(side=tk.LEFT, padx=(0, 4))
+
+        # IP label — click to edit
+        self.lbl_ip = tk.Label(ip_row, text=MAIN_PC_IP(),
+                                font=self.f_name, bg=BG_HEADER, fg=COL_ACCT,
+                                cursor="hand2")
+        self.lbl_ip.pack(side=tk.LEFT)
+        self.lbl_ip.bind("<Button-1>", lambda e: self._open_ip_editor())
+
+        tk.Label(ip_block, text="click to edit", font=self.f_sub,
+                 bg=BG_HEADER, fg=COL_MUTED).pack(anchor="e")
+
+        # Centre: timestamp
+        self.lbl_time = tk.Label(hdr, text="", font=self.f_time,
+                                  bg=BG_HEADER, fg=COL_MUTED)
+        self.lbl_time.pack(side=tk.RIGHT, padx=20)
+
+    # ── Summary bar ───────────────────────────────────────
+    def _build_summary_bar(self):
+        bar = tk.Frame(self.root, bg=BG_MAIN, pady=8)
+        bar.pack(fill=tk.X, padx=16)
+
+        def summary_card(label, color):
+            f = tk.Frame(bar, bg=BG_CARD, padx=18, pady=8,
+                         highlightbackground=COL_BORDER, highlightthickness=1)
+            f.pack(side=tk.LEFT, padx=6)
+            n = tk.Label(f, text="0", font=self.f_name, bg=BG_CARD, fg=color)
+            n.pack()
+            tk.Label(f, text=label, font=self.f_sub, bg=BG_CARD, fg=COL_MUTED).pack()
+            return n
+
+        self.sum_ok    = summary_card("OK",       COL_OK)
+        self.sum_warn  = summary_card("WARNING",  COL_WARN)
+        self.sum_block = summary_card("BLOCKED",  COL_BLOCK)
+
+        # Right-side buttons
+        btn_frame = tk.Frame(bar, bg=BG_MAIN)
+        btn_frame.pack(side=tk.RIGHT, padx=6)
+
+        tk.Button(btn_frame, text="⚙  Thresholds",
+                  command=self._open_threshold_editor,
+                  bg=BG_HEADER, fg=COL_TEXT, font=self.f_sub,
+                  relief=tk.FLAT, padx=12, pady=6, cursor="hand2",
+                  activebackground=COL_BORDER, activeforeground=COL_WHITE
+                  ).pack(side=tk.LEFT, padx=4)
+
+        tk.Button(btn_frame, text="⟳  Refresh Now",
+                  command=self.refresh,
+                  bg=BG_HEADER, fg=COL_WHITE, font=self.f_sub,
+                  relief=tk.FLAT, padx=12, pady=6, cursor="hand2",
+                  activebackground=COL_BORDER, activeforeground=COL_WHITE
+                  ).pack(side=tk.LEFT, padx=4)
+
+    # ── 4-column card grid ────────────────────────────────
+    def _build_grid(self):
+        outer = tk.Frame(self.root, bg=BG_MAIN)
+        outer.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
+
+        self.grid_frame = tk.Frame(outer, bg=BG_MAIN)
+        self.grid_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols = 4
+        for c in range(cols):
+            self.grid_frame.columnconfigure(c, weight=1)
+
+        self.cards = []
+        count = DL_COUNT()
+        for i in range(count):
+            card = self._make_card(self.grid_frame, i // cols, i % cols, f"DL{i+1:02d}", i)
+            self.cards.append(card)
+
+    def _make_card(self, parent, row, col, dl_name, index):
+        frame = tk.Frame(parent, bg=BG_CARD, padx=10, pady=8,
+                         highlightbackground=COL_BORDER, highlightthickness=1,
+                         cursor="hand2")
+        frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+
+        # Clicking opens detail popup
+        frame.bind("<Button-1>", lambda e, idx=index: self._open_detail(idx))
+
+        top = tk.Frame(frame, bg=BG_CARD)
+        top.pack(fill=tk.X)
+        top.bind("<Button-1>", lambda e, idx=index: self._open_detail(idx))
+
+        tk.Label(top, text=dl_name, font=self.f_name,
+                 bg=BG_CARD, fg=COL_WHITE, cursor="hand2").pack(side=tk.LEFT)
+
+        lbl_status = tk.Label(top, text="OK", font=self.f_status,
+                               bg=COL_OK, fg=BG_MAIN, padx=6, pady=1)
+        lbl_status.pack(side=tk.RIGHT)
+
+        tk.Frame(frame, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
+
+        lbl_fail = tk.Label(frame, text="0", font=self.f_name,
+                             bg=BG_CARD, fg=COL_OK, cursor="hand2")
+        lbl_fail.pack()
+        tk.Label(frame, text="fails this cycle", font=self.f_sub,
+                 bg=BG_CARD, fg=COL_MUTED).pack()
+
+        lbl_rate = tk.Label(frame, text="0.00%", font=self.f_val,
+                             bg=BG_CARD, fg=COL_TEXT)
+        lbl_rate.pack()
+        tk.Label(frame, text="fail rate", font=self.f_sub,
+                 bg=BG_CARD, fg=COL_MUTED).pack()
+
+        lbl_last = tk.Label(frame, text="last stop: —", font=self.f_sub,
+                             bg=BG_CARD, fg=COL_MUTED)
+        lbl_last.pack(pady=(4, 0))
+
+        # Bind all child labels too so clicks propagate
+        for widget in [lbl_fail, lbl_rate, lbl_last]:
+            widget.bind("<Button-1>", lambda e, idx=index: self._open_detail(idx))
+
+        return {
+            "frame": frame, "status": lbl_status,
+            "fail": lbl_fail, "rate": lbl_rate, "last": lbl_last,
+        }
+
+    # ── Footer ────────────────────────────────────────────
+    def _build_footer(self):
+        self.footer_lbl = tk.Label(
+            self.root,
+            text=self._footer_text(),
+            font=self.f_sub, bg=BG_HEADER, fg=COL_MUTED, pady=4,
+        )
+        self.footer_lbl.pack(fill=tk.X, side=tk.BOTTOM)
+
+    def _footer_text(self) -> str:
+        return (
+            f"Log dir: {LOG_DIRECTORY()}   |   "
+            f"Refresh every {REFRESH_INTERVAL_MS()//1000}s   |   "
+            f"Warn ≥{WARN_AT_FAILS()} fails   |   "
+            f"Block ≥{BLOCK_AT_FAILS()} fails   |   "
+            f"config: {_CONFIG_PATH}"
+        )
+
+    # ── Popups ────────────────────────────────────────────
+    def _open_detail(self, index: int):
+        if not self._last_stats or index >= len(self._last_stats):
+            return
+        DetailPopup(self.root, self._last_stats[index])
+
+    def _open_threshold_editor(self):
+        ThresholdEditor(self.root, on_save_callback=self._on_config_changed)
+
+    def _open_ip_editor(self):
+        IPEditor(self.root, on_save_callback=self._on_config_changed)
+
+    def _on_config_changed(self):
+        """Called after any config save — refreshes footer and IP label."""
+        self.lbl_ip.config(text=MAIN_PC_IP())
+        self.footer_lbl.config(text=self._footer_text())
+        self.refresh()
+
+    # ── Refresh cycle ─────────────────────────────────────
+    def refresh(self):
+        # Cancel any pending timer so manual refresh doesn't stack timers
+        if self._after_id:
+            self.root.after_cancel(self._after_id)
+            self._after_id = None
+        threading.Thread(target=self._fetch_and_update, daemon=True).start()
+
+    def _fetch_and_update(self):
+        try:
+            stats   = compute_dl_stats()
+            ping_ok = ping_host(MAIN_PC_IP(), PING_TIMEOUT())
+            self.root.after(0, lambda: self._update_ui(stats, ping_ok))
+        except Exception as e:
+            print(f"[dashboard] Refresh error: {e}")
+            # Keep retrying even on error
+            self._after_id = self.root.after(REFRESH_INTERVAL_MS(), self.refresh)
+
+    def _update_ui(self, stats: list, ping_ok: bool):
+        self._last_stats = stats
+        ok_count = warn_count = block_count = 0
+
+        for i, s in enumerate(stats):
+            if i >= len(self.cards):
+                break
+            card   = self.cards[i]
+            status = s["status"]
+            fails  = s["fails"]
+
+            if status == "BLOCKED":
+                color = COL_BLOCK
+                block_count += 1
+            elif status == "WARNING":
+                color = COL_WARN
+                warn_count += 1
+            else:
+                color = COL_OK
+                if status == "OK":
+                    ok_count += 1
+
+            card["status"].config(
+                text=status, bg=color,
+                fg=BG_MAIN if status != "BLOCKED" else COL_WHITE,
+            )
+            card["fail"].config(text=str(fails), fg=color)
+            card["rate"].config(text=f"{s['rate']:.2f}%")
+            card["last"].config(text=f"last stop: {s['last_stop']}")
+            card["frame"].config(
+                highlightbackground=color if status != "OK" else COL_BORDER,
+                highlightthickness=1,
+            )
+
+        # Summary bar
+        self.sum_ok.config(text=str(ok_count))
+        self.sum_warn.config(text=str(warn_count))
+        self.sum_block.config(text=str(block_count))
+
+        # Ping dot
+        self.lbl_dot.config(fg=COL_OK if ping_ok else COL_BLOCK)
+        self.lbl_ip.config(text=MAIN_PC_IP())
+
+        # Timestamp
+        now = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+        self.lbl_time.config(text=f"Last updated: {now}")
+
+        # Schedule next refresh — store ID so manual refresh can cancel it
+        self._after_id = self.root.after(REFRESH_INTERVAL_MS(), self.refresh)
+
+
+# =========================================================
+# Entry point
+# =========================================================
+if __name__ == "__main__":
+    root = tk.Tk()
+    w = CFG["dashboard"]["window_width"]
+    h = CFG["dashboard"]["window_height"]
+    root.geometry(f"{w}x{h}")
+    root.minsize(800, 540)
+    DLDashboard(root)
+    root.mainloop()
