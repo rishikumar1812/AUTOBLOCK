@@ -1,10 +1,7 @@
 """
 process_files.py  —  DL PC  (MAIN ENTRY POINT)
-Reads all DL log files, counts FAILs since the beginning of today,
-and triggers a stop at every 3rd cumulative fail (3, 6, 9, ...).
-
-Stop history is persisted in C:\log_register\DLxx_YYYYMMDD.json so
-a same-day system/process restart does NOT lose the counter.
+Reads all DL log files, counts FAILs since last stop,
+and triggers stop at every 3 fails per cycle.
 
 Run this on a loop/scheduler (e.g. every 30 seconds via Task Scheduler).
 """
@@ -17,27 +14,29 @@ from datetime import datetime, date
 
 from register_logger import register_stop_event
 from stop_tracker import get_last_stop_time
+from config_loader import get_config          # ← NEW
 
 # =========================================================
-# Configuration  —  EDIT THIS
+# Configuration — loaded from config.json, not hardcoded
 # =========================================================
-LOG_DIRECTORY    = r"C:\logs"           # Folder where DL log files live
-LOG_REGISTER_DIR = r"C:\log_register"  # Same folder register_logger.py writes to
+def _cfg():
+    return get_config()
+
+def LOG_DIRECTORY()    -> str: return _cfg()["paths"]["log_directory"]
+def LOG_REGISTER_DIR() -> str: return _cfg()["paths"]["log_register_dir"]
+def MAX_RECORDS()      -> int: return int(_cfg()["monitor"]["max_records_window"])
+def DL_COUNT()         -> int: return int(_cfg()["monitor"]["dl_count"])
+def BLOCK_AT_FAILS()   -> int: return int(_cfg()["thresholds"]["block_at_fails"])
+def POLL_INTERVAL()    -> int: return int(_cfg()["monitor"]["poll_interval_sec"])
 
 
 # =========================================================
-# Read how many stops have already been registered today
-# so we know the next fail threshold even after a restart.
-#
-# register_logger.py writes:
-#   C:\log_register\DL03_20260527.json  →  { "stop_count": 2, ... }
-#
-# stop_count=2 means 2 stops fired today  →  6 fails already crossed
-# Next threshold = (stop_count + 1) * 3  →  9
+# Read stop_count from JSON written by register_logger.py
+# Needed to survive same-day process restarts.
 # =========================================================
 def get_stop_count_today(dl_name: str) -> int:
     today_str = date.today().strftime("%Y%m%d")
-    path = os.path.join(LOG_REGISTER_DIR, f"{dl_name}_{today_str}.json")
+    path = os.path.join(LOG_REGISTER_DIR(), f"{dl_name}_{today_str}.json")
     try:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
@@ -51,7 +50,7 @@ def get_stop_count_today(dl_name: str) -> int:
 # =========================================================
 # Check if a file was modified today
 # =========================================================
-def is_today(file_path):
+def is_today(file_path: str) -> bool:
     mod_time = datetime.fromtimestamp(os.path.getmtime(file_path))
     return mod_time.date() == date.today()
 
@@ -59,7 +58,7 @@ def is_today(file_path):
 # =========================================================
 # Parse one log file into a DataFrame
 # =========================================================
-def read_latest_file(file_path):
+def read_latest_file(file_path: str):
     rows = []
     current = {}
 
@@ -108,12 +107,13 @@ def read_latest_file(file_path):
 
 
 # =========================================================
-# Process all DL files and check fail counts
+# Process all DL files — called every scheduler tick
 # =========================================================
-def process_files(directory=LOG_DIRECTORY):
+def process_files():
     result_messages = []
+    directory = LOG_DIRECTORY()
 
-    dl_files = [[] for _ in range(20)]
+    dl_files = [[] for _ in range(DL_COUNT())]
 
     all_files = [
         os.path.join(directory, f)
@@ -128,10 +128,9 @@ def process_files(directory=LOG_DIRECTORY):
         if match and is_today(file_path):
             dl_no = int(match.group(1))
             index = dl_no - 1
-            if 0 <= index < 20:
+            if 0 <= index < DL_COUNT():
                 dl_files[index].append(file_path)
 
-    # Evaluate each DL
     for i, files in enumerate(dl_files):
         if not files:
             continue
@@ -146,62 +145,30 @@ def process_files(directory=LOG_DIRECTORY):
         if combined.empty:
             continue
 
-        combined = combined.sort_values("Time_stamp").reset_index(drop=True)
+        combined  = combined.sort_values("Time_stamp").reset_index(drop=True)
+        dl_name   = f"DL{i + 1:02d}"
 
-        dl_name = f"DL{i + 1:02d}"
-
-        # ── Step 1: apply post-stop filter FIRST, then limit window ──────
-        # This ensures recent records after the last stop are never
-        # accidentally dropped by the tail() cut.
+        # Apply post-stop filter FIRST, then limit window
         last_stop = get_last_stop_time(dl_name)
         if last_stop is not None:
             active_df = combined[combined["Time_stamp"] > pd.Timestamp(last_stop)]
         else:
-            active_df = combined  # Never stopped before — count everything
+            active_df = combined
 
-        # Keep latest 60 records of the active window only
-        if len(active_df) > 60:
-            active_df = active_df.tail(60).reset_index(drop=True)
+        if len(active_df) > MAX_RECORDS():
+            active_df = active_df.tail(MAX_RECORDS()).reset_index(drop=True)
 
         if active_df.empty:
-            continue  # No new records since last stop yet
+            continue
 
-        # ── Step 2: count FAILs in the active window ──────────────────────
-        fail_count = int(
-            active_df[active_df["RESULT"].str.upper() == "FAIL"].shape[0]
-        )
-        fail_rate = (fail_count / len(active_df)) * 100
+        # Count FAILs and check threshold
+        fail_df    = active_df[active_df["RESULT"].str.upper() == "FAIL"]
+        fail_count = len(fail_df)
+        fail_rate  = (fail_count / len(active_df)) * 100
 
-        # ── Step 3: determine the next stop threshold ─────────────────────
-        #
-        # Logic (survives same-day restart because stop_count comes from JSON):
-        #
-        #   stops_today = 0  →  next threshold = 3   (first stop)
-        #   stops_today = 1  →  next threshold = 6   (second stop)
-        #   stops_today = 2  →  next threshold = 9   (third stop)  …etc.
-        #
-        # fail_count is counted only AFTER the last stop timestamp,
-        # so it always represents "fails since the last stop".
-        # Each new cycle of 3 fails triggers the next stop.
-        #
-        # Example across restarts:
-        #   Cycle 1 → 3 fails → STOP registered (stop_count becomes 1)
-        #   Operator restarts DL.  get_last_stop_time() now returns that stamp.
-        #   active_df resets (only records after that stamp).
-        #   fail_count restarts from 0 within this new window.
-        #   Cycle 2 → 3 more fails → STOP registered (stop_count becomes 2)
-        #   …and so on.
-        #
-        # Because fail_count resets to 0 after each stop (new active window),
-        # the threshold is always simply 3 — we use >= 3 to handle
-        # bursts where 2 fails land in the same scan tick.
-
-        if fail_count >= 3:
-            # Find the fail that pushed us over the threshold
-            fail_df     = active_df[active_df["RESULT"].str.upper() == "FAIL"]
+        if fail_count >= BLOCK_AT_FAILS():
             latest_fail = fail_df.iloc[-1]
-
-            registered = register_stop_event(dl_name, latest_fail)
+            registered  = register_stop_event(dl_name, latest_fail)
 
             if registered:
                 result_messages.append(
@@ -210,7 +177,6 @@ def process_files(directory=LOG_DIRECTORY):
                     f"Fail Rate = {fail_rate:.2f}%"
                 )
             elif registered is None:
-                # register_stop_event returned None — log the problem
                 result_messages.append(
                     f"{dl_name} WARNING: register_stop_event returned None "
                     f"(check register_logger.py). Fail count = {fail_count}"
@@ -220,7 +186,7 @@ def process_files(directory=LOG_DIRECTORY):
 
 
 # =========================================================
-# Entry point — run once per scheduler tick
+# Entry point
 # =========================================================
 if __name__ == "__main__":
     import time
@@ -230,14 +196,15 @@ if __name__ == "__main__":
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.FileHandler(r"C:\log_register\process_files.log"),
+            logging.FileHandler(
+                os.path.join(LOG_REGISTER_DIR(), "process_files.log")
+            ),
             logging.StreamHandler(),
         ],
     )
 
-    POLL_INTERVAL = 30  # seconds between each scan
-
-    print(f"DL Monitor started. Scanning every {POLL_INTERVAL}s. Press Ctrl+C to stop.")
+    interval = POLL_INTERVAL()
+    print(f"DL Monitor started. Scanning every {interval}s. Press Ctrl+C to stop.")
 
     while True:
         try:
@@ -246,4 +213,4 @@ if __name__ == "__main__":
                 logging.info(msg)
         except Exception as e:
             logging.error(f"Error during scan: {e}")
-        time.sleep(POLL_INTERVAL)
+        time.sleep(POLL_INTERVAL())
