@@ -1,6 +1,6 @@
 """
 register_logger.py  —  DL PC
-Saves failed DL record to C:\log_register.
+Saves failed DL record to log_register directory.
 One file per DL per day — overwritten each stop cycle,
 with stop_count incrementing inside the file.
 
@@ -38,24 +38,31 @@ from datetime import datetime
 
 from network_sender import send_stop_signal
 from stop_tracker import record_stop
+from config_loader import get_config          # ← NEW
 
 # =========================================================
-# Configuration  —  EDIT THESE
+# Configuration — loaded from config.json, not hardcoded
 # =========================================================
-LOG_REGISTER_DIR = r"C:\log_register"
-MAIN_PC_IP       = "192.168.1.100"      # <-- Main PC IP address
-MAIN_PC_PORT     = 9999
+def _cfg():
+    return get_config()
+
+def LOG_REGISTER_DIR() -> str: return _cfg()["paths"]["log_register_dir"]
+def MAIN_PC_IP()       -> str: return _cfg()["network"]["main_pc_ip"]
+def MAIN_PC_PORT()     -> int: return int(_cfg()["network"]["main_pc_port"])
+
 
 # =========================================================
 # Logging setup
 # =========================================================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler(r"C:\log_register\dl_register.log"),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(
+            os.path.join(get_config()["paths"]["log_register_dir"], "dl_register.log")
+        ),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -66,11 +73,12 @@ def save_register_record(dl_name: str, fail_row) -> None:
     Each stop cycle APPENDS a new entry inside the same file
     and increments stop_count — no new files created.
     """
-    os.makedirs(LOG_REGISTER_DIR, exist_ok=True)
+    log_dir = LOG_REGISTER_DIR()
+    os.makedirs(log_dir, exist_ok=True)
 
     today_str = datetime.now().strftime("%Y%m%d")
-    file_name = f"{dl_name}_{today_str}.json"          # always same filename
-    file_path = os.path.join(LOG_REGISTER_DIR, file_name)
+    file_name = f"{dl_name}_{today_str}.json"
+    file_path = os.path.join(log_dir, file_name)
 
     # Load existing record if file already exists (from earlier stop today)
     if os.path.exists(file_path):
@@ -79,21 +87,21 @@ def save_register_record(dl_name: str, fail_row) -> None:
     else:
         # First stop of the day — create fresh structure
         record = {
-            "dl_name":           dl_name,
-            "stop_count":        0,
+            "dl_name":            dl_name,
+            "stop_count":         0,
             "last_registered_at": "",
-            "stops":             []
+            "stops":              [],
         }
 
     # Increment stop count and append new stop entry
-    record["stop_count"]        += 1
-    record["last_registered_at"] = datetime.now().isoformat()
+    record["stop_count"]         += 1
+    record["last_registered_at"]  = datetime.now().isoformat()
     record["stops"].append({
         "stop_index":    record["stop_count"],
         "registered_at": datetime.now().isoformat(),
-        "jig":           str(fail_row.get("JIG", "")),
-        "array":         str(fail_row.get("ARRAY", "")),
-        "result":        str(fail_row.get("RESULT", "")),
+        "jig":           str(fail_row.get("JIG",        "")),
+        "array":         str(fail_row.get("ARRAY",      "")),
+        "result":        str(fail_row.get("RESULT",     "")),
         "time_stamp":    str(fail_row.get("Time_stamp", "")),
     })
 
@@ -113,22 +121,26 @@ def register_stop_event(dl_name: str, latest_fail_row) -> bool:
       2. Stamp stop timestamp so fail counter resets after restart
       3. Send TCP stop signal to Main PC
     """
-    # 1. Save record (updates existing file, no new file created)
+    # 1. Save record
     save_register_record(dl_name, latest_fail_row)
 
     # 2. Stamp stop time so process_files resets the fail counter
     record_stop(dl_name)
 
-    # 3. Send signal to Main PC
+    # 3. Send signal to Main PC — IP and port from config.json
     success = send_stop_signal(
-        ip=MAIN_PC_IP,
-        port=MAIN_PC_PORT,
-        dl_name=dl_name
+        ip=MAIN_PC_IP(),
+        port=MAIN_PC_PORT(),
+        dl_name=dl_name,
     )
 
     if success:
-        logger.info(f"{dl_name} stop signal sent OK to {MAIN_PC_IP}:{MAIN_PC_PORT}")
+        logger.info(
+            f"{dl_name} stop signal sent OK to {MAIN_PC_IP()}:{MAIN_PC_PORT()}"
+        )
     else:
-        logger.error(f"{dl_name} stop signal FAILED — check Main PC listener is running")
+        logger.error(
+            f"{dl_name} stop signal FAILED — check Main PC listener is running"
+        )
 
     return True
