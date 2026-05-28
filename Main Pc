@@ -1,200 +1,204 @@
 """
-main_pc_listener.py  —  MAIN PC  (MAIN ENTRY POINT)
-TCP server: receives stop commands from DL PC,
-then automates the EXE via pywinauto.
+main_pc_listener.py  —  Main PC  (ENTRY POINT)
+TCP listener that receives stop signals from DL PCs
+and triggers the full automation sequence.
 
-Flow automated:
-  Main window -> Stop -> Setup Manual window -> uncheck DL -> Save -> Start
+Flow:
+  DL PC sends:  {"command": "STOP", "dl": "DL03"}
+  Main PC:
+    1. Acknowledges with {"status": "OK"}
+    2. Edits Data.ini  — uncheck DL03 building
+    3. Automates InLine_Pro GUI — Stop→SetUp→OK→Start→Yes→OK
+
+Each stop is handled in its own thread so multiple DL stops
+arriving close together are queued and processed one at a time
+via a sequential task queue (prevents simultaneous GUI clicks).
+
+Install dependencies:
+    pip install pywinauto
 """
 
 import socket
 import json
-import time
 import logging
+import os
 import threading
-from pywinauto import Application
+import queue
+import time
 
-# =========================================================
-# Configuration  —  EDIT THESE
-# =========================================================
-LISTEN_IP       = "0.0.0.0"        # Listen on all network interfaces
-LISTEN_PORT     = 9999              # Must match MAIN_PC_PORT in register_logger.py
-EXE_TITLE       = "YourAppTitle"   # <-- Partial window title of the EXE (e.g. "DL Monitor")
-SETUP_WIN_TITLE = "Setup Manual"   # <-- Exact title of the Setup Manual sub-window
-CLICK_DELAY     = 0.6              # Seconds between clicks — increase if EXE is slow
+from config_loader import get_config
+from inline_automation import run_stop_sequence
+
 
 # =========================================================
 # Logging setup
 # =========================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler("main_pc_listener.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+def _setup_logger() -> logging.Logger:
+    log_dir = get_config()["paths"]["log_dir"]
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "main_pc_listener.log")
 
-# Prevent two DLs from automating the EXE at the same time
-_gui_lock = threading.Lock()
+    logger = logging.getLogger("main_pc_listener")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(fmt)
+
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+    return logger
+
+logger = _setup_logger()
 
 
 # =========================================================
-# GUI Automation
+# Sequential task queue
+# Ensures InLine_Pro GUI is only automated one DL at a time.
+# If DL03 and DL07 stop signals arrive 1 second apart,
+# DL07 waits in queue until DL03 sequence finishes.
 # =========================================================
-def automate_stop_dl(dl_name: str) -> bool:
-    """
-    Use pywinauto to:
-      1. Focus the EXE main window
-      2. Click Stop
-      3. Wait for Setup Manual window
-      4. Uncheck the DL checkbox
-      5. Click Save
-      6. Click Start
+_task_queue: queue.Queue = queue.Queue()
 
-    IMPORTANT: Run  python main_pc_listener.py spy  first to see
-    the exact control names inside your EXE, then update the
-    child_window(title=...) calls below to match.
+
+def _queue_worker() -> None:
     """
-    with _gui_lock:     # Only one DL at a time through the GUI
-        logger.info(f"Starting GUI automation for {dl_name} ...")
+    Background thread — processes stop tasks one at a time.
+    Runs forever until a None sentinel is pushed to the queue.
+    """
+    logger.info("[listener] Task queue worker started")
+    while True:
+        dl_name = _task_queue.get()
+        if dl_name is None:
+            logger.info("[listener] Task queue worker stopping")
+            break
         try:
-            # Step 1 — Connect to the running EXE
-            app      = Application(backend="uia").connect(title_re=f".*{EXE_TITLE}.*")
-            main_win = app.window(title_re=f".*{EXE_TITLE}.*")
-            main_win.set_focus()
-            time.sleep(CLICK_DELAY)
-
-            # Step 2 — Click Stop
-            # Adjust title= to match what spy() shows for your Stop button
-            main_win.child_window(title="Stop", control_type="Button").click_input()
-            logger.info(f"{dl_name}: Clicked Stop")
-            time.sleep(CLICK_DELAY * 2)
-
-            # Step 3 — Wait for Setup Manual window
-            setup_win = app.window(title_re=f".*{SETUP_WIN_TITLE}.*")
-            setup_win.wait("visible", timeout=10)
-            setup_win.set_focus()
-            time.sleep(CLICK_DELAY)
-
-            # Step 4 — Uncheck the DL checkbox
-            # Assumes checkbox title = dl_name e.g. "DL03"
-            # If different, update title= to match spy() output
-            checkbox = setup_win.child_window(title=dl_name, control_type="CheckBox")
-            checkbox.wait("visible", timeout=5)
-
-            if checkbox.get_toggle_state() == 1:    # 1=checked, 0=unchecked
-                checkbox.click_input()
-                logger.info(f"{dl_name}: Unchecked")
+            logger.info(f"[listener] Processing stop task for {dl_name}")
+            success = run_stop_sequence(dl_name)
+            if success:
+                logger.info(f"[listener] {dl_name} — automation completed OK")
             else:
-                logger.info(f"{dl_name}: Already unchecked")
-            time.sleep(CLICK_DELAY)
-
-            # Step 5 — Click Save
-            setup_win.child_window(title="Save", control_type="Button").click_input()
-            logger.info(f"{dl_name}: Clicked Save")
-            time.sleep(CLICK_DELAY * 2)
-
-            # Step 6 — Click Start
-            main_win.set_focus()
-            time.sleep(CLICK_DELAY)
-            main_win.child_window(title="Start", control_type="Button").click_input()
-            logger.info(f"{dl_name}: Clicked Start — automation complete")
-
-            return True
-
+                logger.error(
+                    f"[listener] {dl_name} — automation FAILED after all retries. "
+                    f"Manual intervention required."
+                )
         except Exception as e:
-            logger.error(f"GUI automation FAILED for {dl_name}: {e}")
-            return False
+            logger.error(f"[listener] {dl_name} — unhandled error: {e}")
+        finally:
+            _task_queue.task_done()
 
 
 # =========================================================
-# Handle one client connection from DL PC
+# Handle one incoming connection from a DL PC
 # =========================================================
-def handle_client(conn, addr):
-    logger.info(f"Connection from {addr}")
+def _handle_connection(conn: socket.socket, addr: tuple) -> None:
+    """
+    Receive JSON payload, validate, acknowledge, queue the stop task.
+    Each connection runs in its own thread so the listener
+    never blocks while waiting for data.
+    """
     try:
-        data = conn.recv(1024)
-        if not data:
+        raw  = conn.recv(1024)
+        data = json.loads(raw.decode("utf-8"))
+
+        command = data.get("command", "").upper()
+        dl_name = data.get("dl", "").upper()
+
+        logger.info(
+            f"[listener] Received from {addr[0]}:{addr[1]} — "
+            f"command: {command} | dl: {dl_name}"
+        )
+
+        # Validate
+        if command != "STOP":
+            _send_response(conn, "ERROR", f"Unknown command: {command}")
             return
 
-        payload = json.loads(data.decode("utf-8"))
-        command = payload.get("command")
-        dl_name = payload.get("dl")
+        if not dl_name or not dl_name.startswith("DL"):
+            _send_response(conn, "ERROR", f"Invalid DL name: {dl_name}")
+            return
 
-        logger.info(f"Received: command={command}  dl={dl_name}")
+        # Acknowledge immediately — DL PC gets OK before automation runs
+        _send_response(conn, "OK", f"Stop queued for {dl_name}")
 
-        if command == "STOP" and dl_name:
-            success = automate_stop_dl(dl_name)
-            if success:
-                response = {"status": "OK",    "dl": dl_name}
-            else:
-                response = {"status": "ERROR", "message": f"GUI automation failed for {dl_name}"}
-        else:
-            response = {"status": "ERROR", "message": "Unknown command or missing DL name"}
+        # Queue the automation task
+        _task_queue.put(dl_name)
+        logger.info(f"[listener] {dl_name} queued for automation")
 
-        conn.sendall(json.dumps(response).encode("utf-8"))
+    except json.JSONDecodeError as e:
+        logger.error(f"[listener] Bad JSON from {addr}: {e}")
+        _send_response(conn, "ERROR", "Invalid JSON payload")
 
-    except json.JSONDecodeError:
-        logger.error("Received invalid JSON")
-        conn.sendall(json.dumps({"status": "ERROR", "message": "Invalid JSON"}).encode("utf-8"))
     except Exception as e:
-        logger.error(f"Client handler error: {e}")
+        logger.error(f"[listener] Error handling connection from {addr}: {e}")
+
     finally:
         conn.close()
 
 
+def _send_response(conn: socket.socket, status: str, message: str = "") -> None:
+    """Send JSON response back to DL PC."""
+    try:
+        payload = json.dumps({"status": status, "message": message})
+        conn.sendall(payload.encode("utf-8"))
+    except Exception as e:
+        logger.error(f"[listener] Failed to send response: {e}")
+
+
 # =========================================================
-# TCP Server — runs forever
+# Main listener loop
 # =========================================================
-def start_listener():
-    logger.info(f"Main PC listener starting on port {LISTEN_PORT} ...")
+def start_listener() -> None:
+    """
+    Start TCP listener and queue worker.
+    Blocks forever — run this as the main process.
+    """
+    cfg  = get_config()
+    host = cfg["listener"]["host"]
+    port = int(cfg["listener"]["port"])
+
+    # Start the sequential task queue worker
+    worker = threading.Thread(target=_queue_worker, daemon=True)
+    worker.start()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((LISTEN_IP, LISTEN_PORT))
-        server.listen(5)
-        logger.info(f"Listening on {LISTEN_IP}:{LISTEN_PORT} — ready for DL PC signals.")
+        server.bind((host, port))
+        server.listen(20)   # backlog of 20 — handles all DLs stopping at once
+
+        logger.info(
+            f"[listener] Main PC listener started — "
+            f"listening on {host}:{port}"
+        )
 
         while True:
-            conn, addr = server.accept()
-            thread = threading.Thread(
-                target=handle_client, args=(conn, addr), daemon=True
-            )
-            thread.start()
+            try:
+                conn, addr = server.accept()
+                logger.info(f"[listener] Connection from {addr[0]}:{addr[1]}")
+                # Each connection handled in its own thread
+                t = threading.Thread(
+                    target=_handle_connection,
+                    args=(conn, addr),
+                    daemon=True,
+                )
+                t.start()
 
+            except KeyboardInterrupt:
+                logger.info("[listener] Shutdown requested — stopping")
+                _task_queue.put(None)   # stop queue worker
+                break
 
-# =========================================================
-# Helper: print all controls in the EXE window
-# Run ONCE to discover button/checkbox titles before configuring above
-# Usage:  python main_pc_listener.py spy
-# =========================================================
-def spy_controls():
-    print(f"\nConnecting to window matching: '{EXE_TITLE}' ...")
-    try:
-        app      = Application(backend="uia").connect(title_re=f".*{EXE_TITLE}.*")
-        main_win = app.window(title_re=f".*{EXE_TITLE}.*")
-        print("\n=== Main Window Controls ===")
-        main_win.print_control_identifiers()
-
-        print("\n\nOpen the Setup Manual window in the EXE now, then press Enter ...")
-        input()
-        setup_win = app.window(title_re=f".*{SETUP_WIN_TITLE}.*")
-        print("\n=== Setup Manual Window Controls ===")
-        setup_win.print_control_identifiers()
-
-    except Exception as e:
-        print(f"Could not connect: {e}")
-        print("Make sure the EXE is running and EXE_TITLE is set correctly.")
+            except Exception as e:
+                logger.error(f"[listener] Listener error: {e}")
+                time.sleep(1)   # brief pause before retrying accept
 
 
 # =========================================================
 # Entry point
 # =========================================================
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "spy":
-        spy_controls()
-    else:
-        start_listener()
+    start_listener()
