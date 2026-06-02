@@ -1,28 +1,507 @@
-from PyQt6.QtWidgets import (
-    QApplication,
-    QMessageBox
-)
+"""
+main_pc_popup.py  —  Main PC  (ENTRY POINT)
+Replaces main_pc_listener.py entirely.
+
+Combines:
+  - TCP listener     : receives STOP signals from DL PCs
+  - Sequential queue : one GUI automation at a time
+  - ini_editor       : unchecks building in Data.ini
+  - inline_automation: Stop→SetUp→OK→Start→Yes→OK in InLine_Pro
+  - Toast popup      : top-right notification on every stop
+  - Tray window      : always-on-top panel listing blocked DLs today
+  - Spy tool         : python main_pc_popup.py spy  (discover button names)
+
+All settings read from config.json — nothing hardcoded.
+
+Install:  pip install pywinauto
+Run:      python main_pc_popup.py
+"""
+
+import os
+import sys
+import json
+import time
+import queue
+import socket
+import logging
+import threading
+import tkinter as tk
+from tkinter import font as tkfont
+from datetime import datetime
+
+from config_loader import get_config
+from ini_editor import uncheck_dl
+from inline_automation import run_stop_sequence
 
 
-def show_stop_popup(dl_name):
+# =========================================================
+# Config accessors
+# =========================================================
+def _listen_host()  -> str: return get_config()["listener"]["host"]
+def _listen_port()  -> int: return int(get_config()["listener"]["port"])
+def _log_dir()      -> str: return get_config()["paths"]["log_dir"]
+def _window_title() -> str: return get_config()["app"]["window_title"]
+def _exe_name()     -> str: return get_config()["app"]["exe_name"]
 
-    app = QApplication.instance()
 
-    if app is None:
-        app = QApplication([])
+# =========================================================
+# Logging — writes to log_dir/main_pc_popup.log
+# =========================================================
+def _setup_logger() -> logging.Logger:
+    log_dir = _log_dir()
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "main_pc_popup.log")
 
-    msg = QMessageBox()
+    logger = logging.getLogger("main_pc_popup")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    msg.setWindowTitle(
-        "AUTO BLOCK ALERT"
-    )
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(fmt)
 
-    msg.setIcon(
-        QMessageBox.Icon.Warning
-    )
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
 
-    msg.setText(
-        f"{dl_name} STOPPED"
-    )
+        logger.addHandler(fh)
+        logger.addHandler(sh)
+    return logger
 
-    msg.exec()
+logger = _setup_logger()
+
+
+# =========================================================
+# Shared state — thread-safe
+# =========================================================
+_task_queue  : queue.Queue = queue.Queue()   # sequential automation queue
+_blocked_dls : dict        = {}              # {dl_name: timestamp_str}
+_popup_queue : list        = []              # DL names waiting for toast
+_state_lock  = threading.Lock()
+_queue_lock  = threading.Lock()
+
+
+# =========================================================
+# Colors
+# =========================================================
+BG_MAIN   = "#0d1117"
+BG_CARD   = "#161b22"
+BG_HEADER = "#1c2128"
+COL_BLOCK = "#f85149"
+COL_OK    = "#3fb950"
+COL_WARN  = "#d29922"
+COL_TEXT  = "#c9d1d9"
+COL_MUTED = "#6e7681"
+COL_WHITE = "#ffffff"
+COL_ACCT  = "#58a6ff"
+COL_BORDER= "#30363d"
+
+
+# =========================================================
+# Sequential task queue worker
+# Processes stop tasks ONE AT A TIME so GUI automation
+# never runs concurrently for two DLs.
+#
+# If DL03 and DL07 arrive 1s apart:
+#   DL03 → automation starts immediately
+#   DL07 → waits in queue until DL03 finishes
+# =========================================================
+def _queue_worker() -> None:
+    logger.info("[queue] Task queue worker started")
+    while True:
+        dl_name = _task_queue.get()
+        if dl_name is None:
+            logger.info("[queue] Worker stopping")
+            break
+        try:
+            logger.info(f"[queue] Processing stop for {dl_name}")
+            success = run_stop_sequence(dl_name)
+            if success:
+                logger.info(f"[queue] {dl_name} — automation OK")
+            else:
+                logger.error(
+                    f"[queue] {dl_name} — automation FAILED after all retries. "
+                    f"Manual intervention required."
+                )
+        except Exception as e:
+            logger.error(f"[queue] {dl_name} — unhandled error: {e}")
+        finally:
+            _task_queue.task_done()
+
+
+# =========================================================
+# TCP connection handler — one thread per connection
+# =========================================================
+def _handle_connection(conn: socket.socket, addr: tuple) -> None:
+    """
+    Receive JSON stop signal, validate, acknowledge immediately,
+    then queue automation task and record blocked state.
+    """
+    try:
+        raw     = conn.recv(1024)
+        data    = json.loads(raw.decode("utf-8"))
+        command = data.get("command", "").upper()
+        dl_name = data.get("dl", "").upper()
+
+        logger.info(
+            f"[listener] {addr[0]}:{addr[1]} → "
+            f"command={command} dl={dl_name}"
+        )
+
+        # Validate
+        if command != "STOP":
+            _send_response(conn, "ERROR", f"Unknown command: {command}")
+            return
+
+        if not dl_name or not dl_name.startswith("DL"):
+            _send_response(conn, "ERROR", f"Invalid DL name: {dl_name}")
+            return
+
+        # ── Acknowledge IMMEDIATELY ────────────────────────
+        # DL PC gets OK response before automation even starts.
+        # This prevents DL PC from timing out waiting for a reply
+        # while automation (3s × 6 clicks = ~18s) is running.
+        _send_response(conn, "OK", f"Stop queued for {dl_name}")
+
+        # ── Record blocked state ───────────────────────────
+        ts = datetime.now().strftime("%H:%M:%S")
+        with _state_lock:
+            _blocked_dls[dl_name] = ts
+
+        # ── Queue toast popup ──────────────────────────────
+        with _queue_lock:
+            _popup_queue.append(dl_name)
+
+        # ── Queue automation task ──────────────────────────
+        _task_queue.put(dl_name)
+        logger.info(f"[listener] {dl_name} queued for automation")
+
+    except json.JSONDecodeError as e:
+        logger.error(f"[listener] Bad JSON from {addr}: {e}")
+        _send_response(conn, "ERROR", "Invalid JSON payload")
+    except Exception as e:
+        logger.error(f"[listener] Error from {addr}: {e}")
+    finally:
+        conn.close()
+
+
+def _send_response(conn: socket.socket, status: str, message: str = "") -> None:
+    try:
+        conn.sendall(json.dumps({"status": status, "message": message}).encode("utf-8"))
+    except Exception as e:
+        logger.error(f"[listener] Failed to send response: {e}")
+
+
+# =========================================================
+# TCP listener — background thread
+# =========================================================
+def _start_tcp_listener() -> None:
+    host = _listen_host()
+    port = _listen_port()
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((host, port))
+        server.listen(20)
+        logger.info(f"[listener] Listening on {host}:{port}")
+
+        while True:
+            try:
+                conn, addr = server.accept()
+                threading.Thread(
+                    target=_handle_connection,
+                    args=(conn, addr),
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                logger.error(f"[listener] Accept error: {e}")
+                time.sleep(1)
+
+
+# =========================================================
+# Toast popup — top-right, auto-dismiss with fade
+# =========================================================
+def show_toast(root: tk.Tk, dl_name: str) -> None:
+    """
+    Show a non-blocking popup toast in the top-right corner.
+    Auto-fades after 4.5s. Click anywhere to dismiss early.
+    """
+    toast = tk.Toplevel(root)
+    toast.overrideredirect(True)
+    toast.attributes("-topmost", True)
+    toast.attributes("-alpha", 0.96)
+    toast.configure(bg=BG_CARD)
+
+    sw   = root.winfo_screenwidth()
+    w, h = 330, 115
+    toast.geometry(f"{w}x{h}+{sw - w - 24}+60")
+
+    # Red left accent bar
+    tk.Frame(toast, bg=COL_BLOCK, width=6).pack(side=tk.LEFT, fill=tk.Y)
+
+    body = tk.Frame(toast, bg=BG_CARD, padx=14, pady=12)
+    body.pack(fill=tk.BOTH, expand=True)
+
+    f_big = tkfont.Font(family="Consolas", size=13, weight="bold")
+    f_med = tkfont.Font(family="Consolas", size=10)
+    f_sml = tkfont.Font(family="Consolas", size=8)
+
+    tk.Label(body, text="⛔  DL BLOCKED",
+             font=f_big, bg=BG_CARD, fg=COL_BLOCK).pack(anchor="w")
+    tk.Label(body, text=f"{dl_name}  has been stopped",
+             font=f_med, bg=BG_CARD, fg=COL_TEXT).pack(anchor="w", pady=(3, 0))
+    tk.Label(body,
+             text=f"{datetime.now().strftime('%H:%M:%S')}   •   click to dismiss",
+             font=f_sml, bg=BG_CARD, fg=COL_MUTED).pack(anchor="w", pady=(4, 0))
+
+    def dismiss(e=None):
+        try:
+            toast.destroy()
+        except tk.TclError:
+            pass
+
+    def fade_out(alpha: float = 0.96) -> None:
+        alpha -= 0.05
+        if alpha <= 0:
+            dismiss()
+            return
+        try:
+            toast.attributes("-alpha", alpha)
+            toast.after(120, lambda: fade_out(alpha))
+        except tk.TclError:
+            pass
+
+    toast.bind("<Button-1>", dismiss)
+    for w in toast.winfo_children():
+        w.bind("<Button-1>", dismiss)
+        for ww in w.winfo_children():
+            ww.bind("<Button-1>", dismiss)
+
+    toast.after(4500, fade_out)
+
+
+# =========================================================
+# Tray window — always-on-top, bottom-right
+# Shows blocked DLs, listener status, queue depth
+# =========================================================
+class TrayWindow:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("DL Monitor — Main PC")
+        self.root.configure(bg=BG_MAIN)
+        self.root.attributes("-topmost", True)
+        self.root.resizable(False, False)
+
+        # Position bottom-right
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        self.root.geometry(f"280x400+{sw - 296}+{sh - 440}")
+
+        self.f_title = tkfont.Font(family="Consolas", size=10, weight="bold")
+        self.f_body  = tkfont.Font(family="Consolas", size=9)
+        self.f_small = tkfont.Font(family="Consolas", size=8)
+
+        self._build()
+        self._poll_popup_queue()
+        self._refresh()
+
+    # ── Build static layout ───────────────────────────────
+    def _build(self) -> None:
+        # Header
+        hdr = tk.Frame(self.root, bg=BG_HEADER, pady=8)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="DL Monitor  •  Main PC",
+                 font=self.f_title, bg=BG_HEADER, fg=COL_WHITE).pack(padx=10)
+
+        # Listener status row
+        status_row = tk.Frame(self.root, bg=BG_MAIN, pady=4)
+        status_row.pack(fill=tk.X, padx=10)
+        tk.Label(status_row, text="Listener",
+                 font=self.f_small, bg=BG_MAIN, fg=COL_MUTED).pack(side=tk.LEFT)
+        self.lbl_listener = tk.Label(
+            status_row,
+            text=f"● port {_listen_port()}",
+            font=self.f_small, bg=BG_MAIN, fg=COL_OK,
+        )
+        self.lbl_listener.pack(side=tk.LEFT, padx=6)
+
+        # Queue depth row
+        queue_row = tk.Frame(self.root, bg=BG_MAIN)
+        queue_row.pack(fill=tk.X, padx=10)
+        tk.Label(queue_row, text="Queue",
+                 font=self.f_small, bg=BG_MAIN, fg=COL_MUTED).pack(side=tk.LEFT)
+        self.lbl_queue = tk.Label(
+            queue_row, text="0 pending",
+            font=self.f_small, bg=BG_MAIN, fg=COL_TEXT,
+        )
+        self.lbl_queue.pack(side=tk.LEFT, padx=6)
+
+        # InLine_Pro app status row
+        app_row = tk.Frame(self.root, bg=BG_MAIN, pady=2)
+        app_row.pack(fill=tk.X, padx=10)
+        tk.Label(app_row, text="InLine_Pro",
+                 font=self.f_small, bg=BG_MAIN, fg=COL_MUTED).pack(side=tk.LEFT)
+        self.lbl_app = tk.Label(
+            app_row, text="checking...",
+            font=self.f_small, bg=BG_MAIN, fg=COL_MUTED,
+        )
+        self.lbl_app.pack(side=tk.LEFT, padx=6)
+
+        # Divider
+        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
+
+        # Blocked DL list header
+        tk.Label(self.root, text="Blocked DLs today",
+                 font=self.f_small, bg=BG_MAIN, fg=COL_MUTED).pack(
+                 anchor="w", padx=10)
+
+        # Scrollable-ish list frame
+        self.list_frame = tk.Frame(self.root, bg=BG_MAIN)
+        self.list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+
+        # Divider
+        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X)
+
+        # Footer
+        ft = tk.Frame(self.root, bg=BG_MAIN, pady=6)
+        ft.pack(fill=tk.X)
+
+        self.lbl_time = tk.Label(
+            ft, text="", font=self.f_small, bg=BG_MAIN, fg=COL_MUTED,
+        )
+        self.lbl_time.pack()
+
+        tk.Button(
+            ft, text="Clear list",
+            command=self._clear_blocked,
+            bg=BG_HEADER, fg=COL_TEXT,
+            font=self.f_small, relief=tk.FLAT,
+            padx=10, pady=3, cursor="hand2",
+            activebackground=COL_BORDER, activeforeground=COL_WHITE,
+        ).pack(pady=(2, 0))
+
+    # ── Refresh dynamic content ───────────────────────────
+    def _refresh(self) -> None:
+        # Update blocked DL list
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+
+        with _state_lock:
+            blocked = dict(_blocked_dls)
+
+        if not blocked:
+            tk.Label(
+                self.list_frame, text="None blocked",
+                font=self.f_small, bg=BG_MAIN, fg=COL_MUTED,
+            ).pack(pady=8)
+        else:
+            for dl, ts in sorted(blocked.items()):
+                row = tk.Frame(
+                    self.list_frame, bg=BG_CARD,
+                    pady=3, padx=8,
+                    highlightbackground=COL_BORDER,
+                    highlightthickness=1,
+                )
+                row.pack(fill=tk.X, pady=2)
+                tk.Label(
+                    row, text=dl, font=self.f_body,
+                    bg=BG_CARD, fg=COL_BLOCK, width=6, anchor="w",
+                ).pack(side=tk.LEFT)
+                tk.Label(
+                    row, text=f"stopped {ts}",
+                    font=self.f_small, bg=BG_CARD, fg=COL_MUTED,
+                ).pack(side=tk.LEFT)
+
+        # Update queue depth
+        qsize = _task_queue.qsize()
+        self.lbl_queue.config(
+            text=f"{qsize} pending",
+            fg=COL_WARN if qsize > 0 else COL_TEXT,
+        )
+
+        # Update InLine_Pro running status
+        self._check_app_status()
+
+        # Update timestamp
+        self.lbl_time.config(
+            text=f"Updated: {datetime.now().strftime('%H:%M:%S')}"
+        )
+
+        self.root.after(5000, self._refresh)
+
+    def _check_app_status(self) -> None:
+        """Check if InLine_Pro process is running."""
+        import subprocess
+        exe = _exe_name()
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {exe}"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if exe.lower() in out.stdout.lower():
+                self.lbl_app.config(text="● running", fg=COL_OK)
+            else:
+                self.lbl_app.config(text="● not found", fg=COL_BLOCK)
+        except Exception:
+            self.lbl_app.config(text="● unknown", fg=COL_MUTED)
+
+    # ── Poll popup queue every 500ms ──────────────────────
+    def _poll_popup_queue(self) -> None:
+        with _queue_lock:
+            while _popup_queue:
+                dl = _popup_queue.pop(0)
+                show_toast(self.root, dl)
+        self.root.after(500, self._poll_popup_queue)
+
+    def _clear_blocked(self) -> None:
+        with _state_lock:
+            _blocked_dls.clear()
+        logger.info("[tray] Blocked DL list cleared by operator")
+        self._refresh()
+
+
+# =========================================================
+# Spy helper — prints all button/control names in InLine_Pro
+# Usage:  python main_pc_popup.py spy
+# Useful for verifying exact button titles (Stop, SetUp etc.)
+# =========================================================
+def _spy_controls() -> None:
+    from pywinauto import Application
+    title = _window_title()
+    print(f"\nConnecting to: '{title}' ...")
+    try:
+        app = Application(backend="uia").connect(title=title, timeout=10)
+        win = app.window(title=title)
+        print("\n=== Main Window Controls ===")
+        win.print_control_identifiers()
+        print("\nOpen any dialog in the app then press Enter ...")
+        input()
+        dlg = app.top_window()
+        print("\n=== Top Dialog Controls ===")
+        dlg.print_control_identifiers()
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+# =========================================================
+# Entry point
+# =========================================================
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "spy":
+        _spy_controls()
+        sys.exit(0)
+
+    # Start queue worker — processes automation tasks one at a time
+    threading.Thread(target=_queue_worker, daemon=True).start()
+
+    # Start TCP listener in background thread
+    threading.Thread(target=_start_tcp_listener, daemon=True).start()
+
+    logger.info("[main] Main PC popup started")
+
+    # Run Tkinter tray window on main thread
+    root = tk.Tk()
+    TrayWindow(root)
+    root.mainloop()
+
+    # Shutdown — stop queue worker cleanly
+    _task_queue.put(None)
