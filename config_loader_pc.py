@@ -1,13 +1,24 @@
 """
 config_loader.py  —  Main PC (SHARED)
 Single source of truth for config.json.
-All other files import get_config() instead of hardcoding values.
+
+EXE-safe: uses sys.executable when frozen so config.json is always
+read/written from beside the EXE, not the temp _MEIPASS folder.
+Changes persist across restarts.
 """
 
 import os
+import sys
 import json
 
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def _config_path() -> str:
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "config.json")
+
 
 _DEFAULTS = {
     "paths": {
@@ -31,13 +42,10 @@ _DEFAULTS = {
 
 
 def get_config() -> dict:
-    """
-    Load config.json and return as dict.
-    Any missing key falls back to _DEFAULTS — never crashes.
-    """
+    path = _config_path()
     try:
-        if os.path.exists(_CONFIG_PATH):
-            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             for section, values in _DEFAULTS.items():
                 if section not in data:
@@ -47,5 +55,17 @@ def get_config() -> dict:
                         data[section].setdefault(k, v)
             return data
     except Exception as e:
-        print(f"[config_loader] Failed to load config.json: {e} — using defaults")
-    return _DEFAULTS
+        print(f"[config_loader] Failed to load {path}: {e} — using defaults")
+    return dict(_DEFAULTS)
+
+
+def save_config(cfg: dict) -> bool:
+    path = _config_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4)
+        print(f"[config_loader] Saved → {path}")
+        return True
+    except Exception as e:
+        print(f"[config_loader] Failed to save {path}: {e}")
+        return False
