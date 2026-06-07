@@ -5,6 +5,7 @@ Tracks the last stop timestamp per DL in stop_tracker.json.
 Key design:
   - get_all_stop_times() loads the file ONCE per call — callers
     iterate all 20 DLs in memory instead of hitting disk 20 times.
+  - get_last_stop_time() convenience wrapper for single DL lookup.
   - record_stop() writes only when a stop actually fires.
   - Path comes from config.json via config_loader — not hardcoded.
 """
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# Path helper
+# Path helper — reads from config.json, not hardcoded
 # =========================================================
 def _tracker_path() -> str:
     return os.path.join(
@@ -59,13 +60,13 @@ def _save(data: dict) -> None:
 # =========================================================
 def get_all_stop_times() -> dict:
     """
-    Load stop_tracker.json once and return the full dict.
+    Load stop_tracker.json ONCE and return the full dict.
 
     Returns:
-        { "DL01": {"last_stop": "2026-05-27T10:34:22"}, ... }
+        {"DL01": {"last_stop": "2026-05-27T10:34:22"}, ...}
 
-    Callers iterate all DLs in memory — no repeated disk reads.
-    Returns empty dict if file doesn't exist yet (first run).
+    Use this when iterating all 20 DLs — one disk read total
+    instead of 20 separate reads per scan tick.
 
     Usage in process_files.py / dl_dashboard.py:
         all_stops = get_all_stop_times()
@@ -76,7 +77,7 @@ def get_all_stop_times() -> dict:
 
 def get_last_stop_time(dl_name: str):
     """
-    Return the last stop datetime for a single DL, or None.
+    Return last stop datetime for a single DL, or None.
     Convenience wrapper — loads the full file each call.
     Use get_all_stop_times() when iterating multiple DLs.
     """
@@ -94,6 +95,7 @@ def record_stop(dl_name: str) -> None:
     """
     Stamp current time as last stop time for this DL.
     Called by register_logger.py after every confirmed stop.
+    Resets the fail counter in process_files.py for next cycle.
     """
     data    = _load()
     now_str = datetime.now().isoformat()
