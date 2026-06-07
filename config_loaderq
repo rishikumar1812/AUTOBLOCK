@@ -1,5 +1,5 @@
 """
-config_loader.py  —  Main PC (SHARED)
+config_loader.py  —  DL PC (SHARED)
 Single source of truth for config.json.
 
 EXE-safe: uses sys.executable when frozen so config.json is always
