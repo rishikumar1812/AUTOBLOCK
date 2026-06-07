@@ -2,12 +2,12 @@
 dl_dashboard.py  —  DL PC
 Live dashboard showing all 20 DLs.
 
-New in this version:
-  - Status shows only: RUNNING, WARNING, BLOCKED, STOPPED
-  - BLOCKED persists until at least 1 new PASS record arrives after stop
-  - STOPPED (grey) when no data received for 1 hour on any DL
-  - Message box in header — type anything, Send to Main PC, shows response
-  - Summary bar counts: RUNNING / WARNING / BLOCKED / STOPPED
+Connection bar:
+  - On startup sends HELLO to Main PC TCP port
+  - Main PC replies ACK → both show Connected
+  - Bar shows: Checking... → Connected / Disconnected
+  - Stays connected until a failed heartbeat detects drop
+  - Auto-retries every 30s when disconnected
 """
 
 import os
@@ -21,6 +21,7 @@ from tkinter import font as tkfont, messagebox
 from datetime import datetime, date, timedelta
 import pandas as pd
 import threading
+import time
 
 from process_files import read_latest_file, is_today
 from stop_tracker  import get_all_stop_times
@@ -29,8 +30,6 @@ from config_loader import get_config, save_config
 # =========================================================
 # Config accessors
 # =========================================================
-CFG = get_config()
-
 def _cfg():                   return get_config()
 def LOG_DIRECTORY()    -> str: return _cfg()["paths"]["log_directory"]
 def LOG_REGISTER_DIR() -> str: return _cfg()["paths"]["log_register_dir"]
@@ -43,6 +42,7 @@ def WARN_AT_FAILS()    -> int: return int(_cfg()["thresholds"]["warn_at_fails"])
 def BLOCK_AT_FAILS()   -> int: return int(_cfg()["thresholds"]["block_at_fails"])
 def REFRESH_MS()       -> int: return int(_cfg()["dashboard"]["refresh_interval_ms"])
 def NO_DATA_MINUTES()  -> int: return int(_cfg()["dashboard"].get("no_data_stop_minutes", 60))
+def HEARTBEAT_SEC()    -> int: return int(_cfg()["dashboard"].get("heartbeat_sec", 30))
 
 # =========================================================
 # Colors
@@ -51,62 +51,55 @@ BG_MAIN    = "#0d1117"
 BG_CARD    = "#161b22"
 BG_HEADER  = "#1c2128"
 BG_POPUP   = "#161b22"
-COL_RUN    = "#3fb950"   # RUNNING  — green
-COL_WARN   = "#d29922"   # WARNING  — yellow
-COL_BLOCK  = "#f85149"   # BLOCKED  — red
-COL_STOP   = "#6e7681"   # STOPPED  — grey
+BG_CONNBAR = "#0d1117"
+COL_RUN    = "#3fb950"
+COL_WARN   = "#d29922"
+COL_BLOCK  = "#f85149"
+COL_STOP   = "#6e7681"
+COL_CHECK  = "#58a6ff"   # blue — Checking
+COL_CONN   = "#3fb950"   # green — Connected
+COL_DISC   = "#f85149"   # red — Disconnected
 COL_TEXT   = "#c9d1d9"
 COL_MUTED  = "#6e7681"
 COL_WHITE  = "#ffffff"
 COL_ACCT   = "#58a6ff"
 COL_BORDER = "#30363d"
 
-
 # =========================================================
-# Ping helper
+# Connection states
 # =========================================================
-def ping_host(ip: str, timeout: int = 1) -> bool:
-    try:
-        system = platform.system().lower()
-        cmd = (["ping", "-n", "1", "-w", str(timeout * 1000), ip]
-               if system == "windows"
-               else ["ping", "-c", "1", "-W", str(timeout), ip])
-        result = subprocess.run(cmd,
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL,
-                                timeout=timeout + 2)
-        return result.returncode == 0
-    except Exception:
-        return False
+CONN_CHECKING      = "checking"
+CONN_CONNECTED     = "connected"
+CONN_DISCONNECTED  = "disconnected"
 
 
 # =========================================================
-# Send test message to Main PC via TCP
-# Returns (success: bool, reply: str)
+# HELLO/ACK handshake — TCP
+# Sends {"command": "HELLO"} to Main PC listener.
+# Expects {"status": "ACK"} back.
+# Returns (state, detail_message)
 # =========================================================
-def send_test_message(message: str) -> tuple:
+def do_handshake() -> tuple:
     ip   = MAIN_PC_IP()
     port = MAIN_PC_PORT()
     try:
-        payload = json.dumps({
-            "command": "MESSAGE",
-            "text":    message,
-            "from":    "DL_PC",
-            "time":    datetime.now().strftime("%H:%M:%S"),
-        }).encode("utf-8")
+        payload = json.dumps({"command": "HELLO", "from": "DL_PC"}).encode("utf-8")
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(5)
             s.connect((ip, port))
             s.sendall(payload)
             raw  = s.recv(1024)
             resp = json.loads(raw.decode("utf-8"))
-            return True, resp.get("message", "ACK")
+            if resp.get("status") == "ACK":
+                return CONN_CONNECTED, f"Connected to {ip}:{port}"
+            else:
+                return CONN_DISCONNECTED, f"Bad response: {resp}"
     except socket.timeout:
-        return False, f"Timeout — {ip}:{port} did not respond"
+        return CONN_DISCONNECTED, f"Timeout — {ip}:{port} not responding"
     except ConnectionRefusedError:
-        return False, f"Connection refused — is Main PC listener running?"
+        return CONN_DISCONNECTED, f"Refused — Main PC listener not running"
     except Exception as e:
-        return False, str(e)
+        return CONN_DISCONNECTED, str(e)
 
 
 # =========================================================
@@ -134,13 +127,19 @@ def _last_stop_str(ts) -> str:
 
 
 # =========================================================
-# Compute stats for all DLs
-#
-# Status logic:
-#   STOPPED  — no data for >= NO_DATA_MINUTES (default 60)
-#   BLOCKED  — fail_count >= block threshold AND no PASS yet after stop
-#   WARNING  — fail_count >= warn threshold
-#   RUNNING  — everything else (was OK, renamed RUNNING)
+# Status color helper
+# =========================================================
+def _status_color(status: str) -> str:
+    return {
+        "RUNNING": COL_RUN,
+        "WARNING": COL_WARN,
+        "BLOCKED": COL_BLOCK,
+        "STOPPED": COL_STOP,
+    }.get(status, COL_STOP)
+
+
+# =========================================================
+# Compute DL stats
 # =========================================================
 def compute_dl_stats() -> list:
     stats    = []
@@ -162,7 +161,6 @@ def compute_dl_stats() -> list:
             if 0 <= idx < DL_COUNT():
                 dl_files[idx].append(fpath)
 
-    # Load stop times once for all DLs
     all_stops = get_all_stop_times()
 
     for i, files in enumerate(dl_files):
@@ -182,7 +180,6 @@ def compute_dl_stats() -> list:
                                      stops_today, _last_stop_str(last_stop_ts)))
             continue
 
-        # Combine all files
         combined = pd.DataFrame()
         for fpath in files:
             df = read_latest_file(fpath)
@@ -194,16 +191,14 @@ def compute_dl_stats() -> list:
                                      stops_today, _last_stop_str(last_stop_ts)))
             continue
 
-        combined = combined.sort_values("Time_stamp").reset_index(drop=True)
-
-        # ── Check STOPPED: no data for >= NO_DATA_MINUTES ────
+        combined  = combined.sort_values("Time_stamp").reset_index(drop=True)
         latest_ts = combined["Time_stamp"].max()
         minutes_since = (now - latest_ts.to_pydatetime()).total_seconds() / 60
+
         if minutes_since >= NO_DATA_MINUTES():
             stats.append({
                 "name": dl_name, "total": len(combined),
-                "fails": 0, "rate": 0.0,
-                "status": "STOPPED",
+                "fails": 0, "rate": 0.0, "status": "STOPPED",
                 "stops_today": stops_today,
                 "last_stop": _last_stop_str(last_stop_ts),
                 "last_data": latest_ts.strftime("%H:%M:%S"),
@@ -211,7 +206,6 @@ def compute_dl_stats() -> list:
             })
             continue
 
-        # ── Active window: records after last stop ────────────
         if last_stop_ts is not None:
             active = combined[combined["Time_stamp"] > pd.Timestamp(last_stop_ts)]
         else:
@@ -222,7 +216,6 @@ def compute_dl_stats() -> list:
 
         total = len(active)
         if total == 0:
-            # stopped but no new data yet — keep BLOCKED if previously blocked
             stats.append({
                 "name": dl_name, "total": 0,
                 "fails": 0, "rate": 0.0,
@@ -238,10 +231,7 @@ def compute_dl_stats() -> list:
         pass_count = int(active[active["RESULT"].str.upper() == "PASS"].shape[0])
         rate       = (fails / total * 100) if total > 0 else 0.0
 
-        # ── Status determination ──────────────────────────────
-        # BLOCKED persists until at least 1 PASS arrives after stop
         if last_stop_ts is not None and pass_count == 0:
-            # Stop happened but no PASS record yet → still BLOCKED
             status = "BLOCKED"
         elif fails >= BLOCK_AT_FAILS():
             status = "BLOCKED"
@@ -252,8 +242,7 @@ def compute_dl_stats() -> list:
 
         stats.append({
             "name": dl_name, "total": total,
-            "fails": fails, "rate": rate,
-            "status": status,
+            "fails": fails, "rate": rate, "status": status,
             "stops_today": stops_today,
             "last_stop": _last_stop_str(last_stop_ts),
             "last_data": latest_ts.strftime("%H:%M:%S"),
@@ -273,7 +262,7 @@ def _empty_stat(dl_name, status="STOPPED", stops_today=0, last_stop="—"):
 
 
 # =========================================================
-# Detail Popup
+# Popups
 # =========================================================
 class DetailPopup(tk.Toplevel):
     def __init__(self, parent, stat: dict):
@@ -302,15 +291,15 @@ class DetailPopup(tk.Toplevel):
         body.pack(fill=tk.BOTH, expand=True)
 
         rows = [
-            ("Status",         status,                          color),
-            ("Fail Count",     str(stat["fails"]),              color),
-            ("Fail Rate",      f"{stat['rate']:.2f}%",          COL_TEXT),
-            ("Total Records",  str(stat["total"]),              COL_TEXT),
-            ("Last Stop",      stat["last_stop"],               COL_WARN),
-            ("Stops Today",    str(stat["stops_today"]),        COL_TEXT),
-            ("Last Data",      stat.get("last_data", "—"),      COL_TEXT),
-            ("Warn Threshold", f"≥ {WARN_AT_FAILS()} fails",   COL_WARN),
-            ("Block Threshold",f"≥ {BLOCK_AT_FAILS()} fails",  COL_BLOCK),
+            ("Status",          status,                         color),
+            ("Fail Count",      str(stat["fails"]),             color),
+            ("Fail Rate",       f"{stat['rate']:.2f}%",         COL_TEXT),
+            ("Total Records",   str(stat["total"]),             COL_TEXT),
+            ("Last Stop",       stat["last_stop"],              COL_WARN),
+            ("Stops Today",     str(stat["stops_today"]),       COL_TEXT),
+            ("Last Data",       stat.get("last_data", "—"),     COL_TEXT),
+            ("Warn Threshold",  f"≥ {WARN_AT_FAILS()} fails",  COL_WARN),
+            ("Block Threshold", f"≥ {BLOCK_AT_FAILS()} fails", COL_BLOCK),
         ]
 
         for r, (label, value, val_color) in enumerate(rows):
@@ -338,9 +327,6 @@ class DetailPopup(tk.Toplevel):
         self.geometry(f"+{px}+{py}")
 
 
-# =========================================================
-# Threshold Editor
-# =========================================================
 class ThresholdEditor(tk.Toplevel):
     def __init__(self, parent, on_save):
         super().__init__(parent)
@@ -415,9 +401,6 @@ class ThresholdEditor(tk.Toplevel):
         self.destroy()
 
 
-# =========================================================
-# IP Editor
-# =========================================================
 class IPEditor(tk.Toplevel):
     def __init__(self, parent, on_save):
         super().__init__(parent)
@@ -435,7 +418,6 @@ class IPEditor(tk.Toplevel):
 
         form = tk.Frame(self, bg=BG_POPUP, padx=24, pady=8)
         form.pack()
-
         tk.Label(form, text="IP Address", font=f_label,
                  bg=BG_POPUP, fg=COL_TEXT, anchor="w", width=12
                  ).grid(row=0, column=0, sticky="w", pady=6)
@@ -464,7 +446,7 @@ class IPEditor(tk.Toplevel):
     def _save(self):
         ip = self.ip_var.get().strip()
         if not ip:
-            messagebox.showerror("Invalid Input", "IP cannot be empty.", parent=self)
+            messagebox.showerror("Invalid", "IP cannot be empty.", parent=self)
             return
         cfg = get_config()
         cfg["network"]["main_pc_ip"] = ip
@@ -474,28 +456,19 @@ class IPEditor(tk.Toplevel):
 
 
 # =========================================================
-# Helpers
-# =========================================================
-def _status_color(status: str) -> str:
-    return {
-        "RUNNING":  COL_RUN,
-        "WARNING":  COL_WARN,
-        "BLOCKED":  COL_BLOCK,
-        "STOPPED":  COL_STOP,
-    }.get(status, COL_STOP)
-
-
-# =========================================================
 # Main Dashboard
 # =========================================================
 class DLDashboard:
     def __init__(self, root: tk.Tk):
-        self.root        = root
+        self.root          = root
         self.root.title("DL Monitor Dashboard")
         self.root.configure(bg=BG_MAIN)
         self.root.resizable(True, True)
-        self._after_id   = None
-        self._last_stats = []
+        self._after_id     = None
+        self._last_stats   = []
+        self._conn_state   = CONN_CHECKING
+        self._conn_detail  = ""
+        self._hb_after_id  = None   # heartbeat timer id
 
         self.f_title  = tkfont.Font(family="Consolas", size=15, weight="bold")
         self.f_name   = tkfont.Font(family="Consolas", size=11, weight="bold")
@@ -503,12 +476,16 @@ class DLDashboard:
         self.f_status = tkfont.Font(family="Consolas", size=8,  weight="bold")
         self.f_sub    = tkfont.Font(family="Consolas", size=8)
         self.f_time   = tkfont.Font(family="Consolas", size=8)
+        self.f_conn   = tkfont.Font(family="Consolas", size=9,  weight="bold")
 
         self._build_header()
-        self._build_message_bar()
+        self._build_conn_bar()
         self._build_summary_bar()
         self._build_grid()
         self._build_footer()
+
+        # Start handshake immediately in background
+        self._start_handshake()
         self.refresh()
 
     # ── Header ────────────────────────────────────────────
@@ -517,10 +494,9 @@ class DLDashboard:
         hdr.pack(fill=tk.X)
 
         tk.Label(hdr, text="DL Monitor Dashboard",
-                 font=self.f_title, bg=BG_HEADER, fg=COL_WHITE
-                 ).pack(side=tk.LEFT, padx=20)
+                 font=self.f_title, bg=BG_HEADER,
+                 fg=COL_WHITE).pack(side=tk.LEFT, padx=20)
 
-        # Right: IP block
         ip_block = tk.Frame(hdr, bg=BG_HEADER)
         ip_block.pack(side=tk.RIGHT, padx=16)
 
@@ -529,10 +505,6 @@ class DLDashboard:
 
         ip_row = tk.Frame(ip_block, bg=BG_HEADER)
         ip_row.pack(anchor="e")
-
-        self.lbl_dot = tk.Label(ip_row, text="●", font=self.f_val,
-                                 bg=BG_HEADER, fg=COL_MUTED)
-        self.lbl_dot.pack(side=tk.LEFT, padx=(0, 4))
 
         self.lbl_ip = tk.Label(ip_row, text=MAIN_PC_IP(),
                                 font=self.f_name, bg=BG_HEADER,
@@ -547,63 +519,145 @@ class DLDashboard:
                                   bg=BG_HEADER, fg=COL_MUTED)
         self.lbl_time.pack(side=tk.RIGHT, padx=20)
 
-    # ── Message bar — send text to Main PC ────────────────
-    def _build_message_bar(self):
-        bar = tk.Frame(self.root, bg=BG_HEADER, pady=6)
-        bar.pack(fill=tk.X)
+    # ── Connection status bar ─────────────────────────────
+    def _build_conn_bar(self):
+        """
+        Full-width bar below header showing connection state.
+        Checking... → animated dots
+        Connected   → green bar
+        Disconnected → red bar with retry button
+        """
+        self.conn_bar = tk.Frame(self.root, bg=BG_CONNBAR, pady=5)
+        self.conn_bar.pack(fill=tk.X)
 
-        tk.Label(bar, text="Message to Main PC:",
-                 font=self.f_sub, bg=BG_HEADER, fg=COL_MUTED
-                 ).pack(side=tk.LEFT, padx=(16, 6))
+        # Left: animated status indicator
+        left = tk.Frame(self.conn_bar, bg=BG_CONNBAR)
+        left.pack(side=tk.LEFT, padx=16)
 
-        self.msg_var = tk.StringVar()
-        self.msg_entry = tk.Entry(
-            bar, textvariable=self.msg_var,
-            width=40, font=self.f_sub,
-            bg=BG_MAIN, fg=COL_WHITE,
-            insertbackground=COL_WHITE,
-            relief=tk.FLAT,
+        self.lbl_conn_dot = tk.Label(
+            left, text="●", font=self.f_conn,
+            bg=BG_CONNBAR, fg=COL_CHECK,
         )
-        self.msg_entry.pack(side=tk.LEFT, padx=4, ipady=4)
-        # Press Enter to send
-        self.msg_entry.bind("<Return>", lambda e: self._send_message())
+        self.lbl_conn_dot.pack(side=tk.LEFT, padx=(0, 6))
 
-        tk.Button(
-            bar, text="Send",
-            command=self._send_message,
-            bg=COL_ACCT, fg=BG_MAIN,
+        self.lbl_conn_status = tk.Label(
+            left, text="Checking connection...",
+            font=self.f_conn, bg=BG_CONNBAR, fg=COL_CHECK,
+        )
+        self.lbl_conn_status.pack(side=tk.LEFT)
+
+        # Right: detail text + retry button
+        right = tk.Frame(self.conn_bar, bg=BG_CONNBAR)
+        right.pack(side=tk.RIGHT, padx=16)
+
+        self.lbl_conn_detail = tk.Label(
+            right, text="", font=self.f_sub,
+            bg=BG_CONNBAR, fg=COL_MUTED,
+        )
+        self.lbl_conn_detail.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.btn_retry = tk.Button(
+            right, text="Retry",
+            command=self._start_handshake,
+            bg=BG_HEADER, fg=COL_TEXT,
             font=self.f_sub, relief=tk.FLAT,
-            padx=12, pady=4, cursor="hand2",
-            activebackground=COL_BORDER,
-        ).pack(side=tk.LEFT, padx=4)
-
-        # Response label
-        self.lbl_msg_resp = tk.Label(
-            bar, text="", font=self.f_sub,
-            bg=BG_HEADER, fg=COL_MUTED,
+            padx=10, pady=2, cursor="hand2",
         )
-        self.lbl_msg_resp.pack(side=tk.LEFT, padx=10)
+        # Only shown when disconnected
+        self.btn_retry.pack(side=tk.LEFT)
+        self.btn_retry.pack_forget()
 
-    def _send_message(self):
-        msg = self.msg_var.get().strip()
-        if not msg:
-            return
-        self.lbl_msg_resp.config(text="Sending...", fg=COL_MUTED)
-        self.msg_entry.config(state=tk.DISABLED)
+        # Animated dots for Checking state
+        self._dot_count  = 0
+        self._dot_anim_id = None
 
-        def _do_send():
-            ok, reply = send_test_message(msg)
-            def _update():
-                self.lbl_msg_resp.config(
-                    text=f"{'✓' if ok else '✗'}  {reply}",
-                    fg=COL_RUN if ok else COL_BLOCK,
-                )
-                self.msg_entry.config(state=tk.NORMAL)
-                if ok:
-                    self.msg_var.set("")
-            self.root.after(0, _update)
+    def _start_dot_animation(self):
+        """Animate '...' on the Checking label."""
+        self._stop_dot_animation()
+        self._animate_dots()
 
-        threading.Thread(target=_do_send, daemon=True).start()
+    def _animate_dots(self):
+        dots = "." * (self._dot_count % 4)
+        self.lbl_conn_status.config(text=f"Checking connection{dots}")
+        self._dot_count += 1
+        self._dot_anim_id = self.root.after(500, self._animate_dots)
+
+    def _stop_dot_animation(self):
+        if self._dot_anim_id:
+            self.root.after_cancel(self._dot_anim_id)
+            self._dot_anim_id = None
+
+    def _update_conn_bar(self, state: str, detail: str = ""):
+        """Update connection bar UI — always called on main thread."""
+        self._conn_state  = state
+        self._conn_detail = detail
+
+        if state == CONN_CHECKING:
+            self._start_dot_animation()
+            self.lbl_conn_dot.config(fg=COL_CHECK)
+            self.conn_bar.config(bg=BG_CONNBAR)
+            self.lbl_conn_detail.config(text="", fg=COL_MUTED)
+            self.btn_retry.pack_forget()
+
+        elif state == CONN_CONNECTED:
+            self._stop_dot_animation()
+            self.lbl_conn_dot.config(fg=COL_CONN)
+            self.lbl_conn_status.config(
+                text=f"Connected  •  Main PC {MAIN_PC_IP()}",
+                fg=COL_CONN,
+            )
+            self.conn_bar.config(bg=BG_CONNBAR)
+            self.lbl_conn_detail.config(
+                text=f"since {datetime.now().strftime('%H:%M:%S')}",
+                fg=COL_MUTED,
+            )
+            self.btn_retry.pack_forget()
+            # Start heartbeat to detect future drops
+            self._schedule_heartbeat()
+
+        elif state == CONN_DISCONNECTED:
+            self._stop_dot_animation()
+            self.lbl_conn_dot.config(fg=COL_DISC)
+            self.lbl_conn_status.config(
+                text="Disconnected  •  Main PC unreachable",
+                fg=COL_DISC,
+            )
+            self.conn_bar.config(bg=BG_CONNBAR)
+            self.lbl_conn_detail.config(text=detail, fg=COL_MUTED)
+            self.btn_retry.pack(side=tk.LEFT)
+            # Auto-retry every HEARTBEAT_SEC
+            self._schedule_heartbeat()
+
+    # ── Handshake ─────────────────────────────────────────
+    def _start_handshake(self):
+        """Kick off HELLO handshake in background thread."""
+        self._update_conn_bar(CONN_CHECKING)
+        threading.Thread(target=self._run_handshake, daemon=True).start()
+
+    def _run_handshake(self):
+        state, detail = do_handshake()
+        self.root.after(0, lambda: self._update_conn_bar(state, detail))
+
+    # ── Heartbeat — detects drops after initial connect ───
+    def _schedule_heartbeat(self):
+        if self._hb_after_id:
+            self.root.after_cancel(self._hb_after_id)
+        interval = HEARTBEAT_SEC() * 1000
+        self._hb_after_id = self.root.after(interval, self._heartbeat_tick)
+
+    def _heartbeat_tick(self):
+        threading.Thread(target=self._run_heartbeat, daemon=True).start()
+
+    def _run_heartbeat(self):
+        state, detail = do_handshake()
+        def _update():
+            if state != self._conn_state:
+                # State changed — update bar
+                self._update_conn_bar(state, detail)
+            else:
+                # Same state — just reschedule
+                self._schedule_heartbeat()
+        self.root.after(0, _update)
 
     # ── Summary bar ───────────────────────────────────────
     def _build_summary_bar(self):
@@ -616,13 +670,14 @@ class DLDashboard:
             f.pack(side=tk.LEFT, padx=6)
             n = tk.Label(f, text="0", font=self.f_name, bg=BG_CARD, fg=color)
             n.pack()
-            tk.Label(f, text=label, font=self.f_sub, bg=BG_CARD, fg=COL_MUTED).pack()
+            tk.Label(f, text=label, font=self.f_sub,
+                     bg=BG_CARD, fg=COL_MUTED).pack()
             return n
 
-        self.sum_run   = summary_card("RUNNING", COL_RUN)
-        self.sum_warn  = summary_card("WARNING", COL_WARN)
-        self.sum_block = summary_card("BLOCKED", COL_BLOCK)
-        self.sum_stop  = summary_card("STOPPED", COL_STOP)
+        self.sum_run   = summary_card("RUNNING",  COL_RUN)
+        self.sum_warn  = summary_card("WARNING",  COL_WARN)
+        self.sum_block = summary_card("BLOCKED",  COL_BLOCK)
+        self.sum_stop  = summary_card("STOPPED",  COL_STOP)
 
         btn_frame = tk.Frame(bar, bg=BG_MAIN)
         btn_frame.pack(side=tk.RIGHT, padx=6)
@@ -641,17 +696,14 @@ class DLDashboard:
                   activebackground=COL_BORDER
                   ).pack(side=tk.LEFT, padx=4)
 
-    # ── 4-column card grid ────────────────────────────────
+    # ── Card grid ─────────────────────────────────────────
     def _build_grid(self):
         outer = tk.Frame(self.root, bg=BG_MAIN)
         outer.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
-
         self.grid_frame = tk.Frame(outer, bg=BG_MAIN)
         self.grid_frame.pack(fill=tk.BOTH, expand=True)
-
         for c in range(4):
             self.grid_frame.columnconfigure(c, weight=1)
-
         self.cards = []
         for i in range(DL_COUNT()):
             card = self._make_card(self.grid_frame,
@@ -671,7 +723,8 @@ class DLDashboard:
         top.bind("<Button-1>", lambda e, idx=index: self._open_detail(idx))
 
         tk.Label(top, text=dl_name, font=self.f_name,
-                 bg=BG_CARD, fg=COL_WHITE, cursor="hand2").pack(side=tk.LEFT)
+                 bg=BG_CARD, fg=COL_WHITE,
+                 cursor="hand2").pack(side=tk.LEFT)
 
         lbl_status = tk.Label(top, text="RUNNING", font=self.f_status,
                                bg=COL_RUN, fg=BG_MAIN, padx=6, pady=1)
@@ -696,7 +749,8 @@ class DLDashboard:
         lbl_last.pack(pady=(4, 0))
 
         for w in [lbl_fail, lbl_rate, lbl_last]:
-            w.bind("<Button-1>", lambda e, idx=index: self._open_detail(idx))
+            w.bind("<Button-1>",
+                   lambda e, idx=index: self._open_detail(idx))
 
         return {"frame": frame, "status": lbl_status,
                 "fail": lbl_fail, "rate": lbl_rate, "last": lbl_last}
@@ -728,14 +782,19 @@ class DLDashboard:
         ThresholdEditor(self.root, on_save=self._on_config_changed)
 
     def _open_ip_editor(self):
-        IPEditor(self.root, on_save=self._on_config_changed)
+        IPEditor(self.root, on_save=self._on_ip_changed)
 
     def _on_config_changed(self):
-        self.lbl_ip.config(text=MAIN_PC_IP())
         self.footer_lbl.config(text=self._footer_text())
         self.refresh()
 
-    # ── Refresh ───────────────────────────────────────────
+    def _on_ip_changed(self):
+        self.lbl_ip.config(text=MAIN_PC_IP())
+        self.footer_lbl.config(text=self._footer_text())
+        # Re-run handshake with new IP immediately
+        self._start_handshake()
+
+    # ── Dashboard refresh ─────────────────────────────────
     def refresh(self):
         if self._after_id:
             self.root.after_cancel(self._after_id)
@@ -744,14 +803,13 @@ class DLDashboard:
 
     def _fetch_and_update(self):
         try:
-            stats   = compute_dl_stats()
-            ping_ok = ping_host(MAIN_PC_IP(), PING_TIMEOUT())
-            self.root.after(0, lambda: self._update_ui(stats, ping_ok))
+            stats = compute_dl_stats()
+            self.root.after(0, lambda: self._update_ui(stats))
         except Exception as e:
             print(f"[dashboard] Refresh error: {e}")
             self._after_id = self.root.after(REFRESH_MS(), self.refresh)
 
-    def _update_ui(self, stats: list, ping_ok: bool):
+    def _update_ui(self, stats: list):
         self._last_stats = stats
         run_c = warn_c = block_c = stop_c = 0
 
@@ -774,7 +832,6 @@ class DLDashboard:
             card["fail"].config(text=str(s["fails"]), fg=color)
             card["rate"].config(text=f"{s['rate']:.2f}%")
 
-            # Show "no data Xmin" on last line when STOPPED
             if status == "STOPPED" and s.get("minutes_since", 0) > 0:
                 card["last"].config(
                     text=f"no data {s['minutes_since']}min ago",
@@ -796,8 +853,6 @@ class DLDashboard:
         self.sum_block.config(text=str(block_c))
         self.sum_stop.config(text=str(stop_c))
 
-        self.lbl_dot.config(fg=COL_RUN if ping_ok else COL_BLOCK)
-        self.lbl_ip.config(text=MAIN_PC_IP())
         self.lbl_time.config(
             text=f"Last updated: {datetime.now().strftime('%Y-%m-%d  %H:%M:%S')}"
         )
@@ -808,7 +863,7 @@ class DLDashboard:
 # Entry point
 # =========================================================
 if __name__ == "__main__":
-    cfg = get_config()
+    cfg  = get_config()
     root = tk.Tk()
     root.geometry(
         f"{cfg['dashboard']['window_width']}x{cfg['dashboard']['window_height']}"
