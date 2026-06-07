@@ -1,55 +1,59 @@
 """
-config_loader.py  —  DL PC  (SHARED)
+config_loader.py  —  Main PC (SHARED)
 Single source of truth for config.json.
-All other files import get_config() instead of hardcoding values.
 
-Place this file in the SAME folder as all other DL_PC files.
+EXE-safe: uses sys.executable when frozen so config.json is always
+read/written from beside the EXE, not the temp _MEIPASS folder.
+Changes persist across restarts.
 """
 
 import os
+import sys
 import json
 
-_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def _config_path() -> str:
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "config.json")
+
 
 _DEFAULTS = {
     "paths": {
-        "log_directory":    r"C:\logs",
-        "log_register_dir": r"C:\DL_PC\log_register",
+        "log_directory": "/Users/rishi/Desktop/DL_PC/logs",
+        "log_register_dir": "/Users/rishi/Desktop/DL_PC/log_register",
     },
     "network": {
-        "main_pc_ip":       "192.168.1.100",
-        "main_pc_port":     9999,
+        "main_pc_ip": "192.168.29.82",
+        "main_pc_port": 9999,
         "ping_timeout_sec": 1,
     },
     "monitor": {
-        "poll_interval_sec":  30,
+        "poll_interval_sec": 30,
         "max_records_window": 60,
-        "dl_count":           20,
+        "dl_count": 20,
     },
     "thresholds": {
-        "warn_at_fails":  2,
+        "warn_at_fails": 2,
         "block_at_fails": 3,
     },
     "dashboard": {
         "refresh_interval_ms": 10000,
-        "window_width":        1100,
-        "window_height":       680,
+        "window_width": 1100,
+        "window_height": 680,
     },
+
 }
 
 
 def get_config() -> dict:
-    """
-    Load config.json and return as a dict.
-    Any missing key falls back to _DEFAULTS — never crashes.
-    Called fresh each time so runtime edits (via dashboard)
-    are picked up on the next call without restarting any process.
-    """
+    path = _config_path()
     try:
-        if os.path.exists(_CONFIG_PATH):
-            with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # Deep-merge: fill in any missing sections/keys from defaults
             for section, values in _DEFAULTS.items():
                 if section not in data:
                     data[section] = values
@@ -58,20 +62,17 @@ def get_config() -> dict:
                         data[section].setdefault(k, v)
             return data
     except Exception as e:
-        print(f"[config_loader] Failed to load config.json: {e} — using defaults")
-    return _DEFAULTS
+        print(f"[config_loader] Failed to load {path}: {e} — using defaults")
+    return dict(_DEFAULTS)
 
 
 def save_config(cfg: dict) -> bool:
-    """
-    Write updated config back to config.json.
-    Returns True on success, False on failure.
-    Used by dl_dashboard.py when operator edits IP or thresholds.
-    """
+    path = _config_path()
     try:
-        with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=4)
+        print(f"[config_loader] Saved → {path}")
         return True
     except Exception as e:
-        print(f"[config_loader] Failed to save config.json: {e}")
+        print(f"[config_loader] Failed to save {path}: {e}")
         return False
