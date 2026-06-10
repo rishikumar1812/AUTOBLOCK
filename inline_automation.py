@@ -131,22 +131,40 @@ def _click_button(window, button_name: str) -> None:
     )
     time.sleep(wait)
 
+    # Try exact title first, then title_re as fallback
+    # Handles slight title variations across app versions
+    ctrl = None
+    last_err = None
+
+    for kwargs in [
+        {"title": button_name, "control_type": "Button"},
+        {"title_re": f".*{re.escape(button_name)}.*", "control_type": "Button"},
+        {"title": button_name},   # no control_type — catches Custom/Pane
+    ]:
+        try:
+            candidate = window.child_window(**kwargs)
+            candidate.wait("visible enabled", timeout=3)
+            ctrl = candidate
+            logger.info(
+                f"[automation] Found '{button_name}' with kwargs={kwargs}"
+            )
+            break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if ctrl is None:
+        raise RuntimeError(
+            f"[automation] Button '{button_name}' not found "
+            f"by any method. Last error: {last_err}"
+        )
+
     try:
-        btn = window.child_window(
-            title=button_name,
-            control_type="Button",
-        )
-        btn.wait("visible enabled", timeout=_max_wait())
-        btn.click_input()
+        ctrl.click_input()
         logger.info(f"[automation] Clicked '{button_name}'")
-    except PWTimeoutError:
+    except Exception as e:
         raise RuntimeError(
-            f"[automation] Button '{button_name}' not ready "
-            f"after {_max_wait()}s"
-        )
-    except ElementNotFoundError:
-        raise RuntimeError(
-            f"[automation] Button '{button_name}' not found in window"
+            f"[automation] Click failed on '{button_name}': {e}"
         )
 
 
@@ -163,24 +181,40 @@ def _click_dialog_button(app: Application, button_name: str) -> None:
     )
     time.sleep(wait)
 
+    # top_window() targets only InLine_Pro dialogs — other apps ignored
+    dialog   = app.top_window()
+    ctrl     = None
+    last_err = None
+
+    for kwargs in [
+        {"title": button_name, "control_type": "Button"},
+        {"title_re": f".*{re.escape(button_name)}.*", "control_type": "Button"},
+        {"title": button_name},
+    ]:
+        try:
+            candidate = dialog.child_window(**kwargs)
+            candidate.wait("visible enabled", timeout=3)
+            ctrl = candidate
+            logger.info(
+                f"[automation] Found dialog '{button_name}' with kwargs={kwargs}"
+            )
+            break
+        except Exception as e:
+            last_err = e
+            continue
+
+    if ctrl is None:
+        raise RuntimeError(
+            f"[automation] Dialog button '{button_name}' not found "
+            f"by any method. Last error: {last_err}"
+        )
+
     try:
-        # top_window() returns the foremost window of THIS process only
-        dialog = app.top_window()
-        btn    = dialog.child_window(
-            title=button_name,
-            control_type="Button",
-        )
-        btn.wait("visible enabled", timeout=_max_wait())
-        btn.click_input()
+        ctrl.click_input()
         logger.info(f"[automation] Clicked dialog '{button_name}'")
-    except PWTimeoutError:
+    except Exception as e:
         raise RuntimeError(
-            f"[automation] Dialog button '{button_name}' not ready "
-            f"after {_max_wait()}s"
-        )
-    except ElementNotFoundError:
-        raise RuntimeError(
-            f"[automation] Dialog button '{button_name}' not found"
+            f"[automation] Click failed on dialog '{button_name}': {e}"
         )
 
 
@@ -223,19 +257,19 @@ def run_stop_sequence(dl_name: str) -> bool:
             window = _get_main_window(app)
 
             # ── Step 4: Stop ──────────────────────────────
-            _click_button(window, "Stop")
+            _click_button(window, "STOP")
 
             # ── Step 5: SetUp ─────────────────────────────
-            _click_button(window, "SetUp")
+            _click_button(window, "SETUP")
 
             # ── Step 6: OK (SetUp confirmation dialog) ────
             _click_dialog_button(app, "OK")
 
             # ── Step 7: Start ─────────────────────────────
-            _click_button(window, "Start")
+            _click_button(window, "START")
 
             # ── Step 8: Yes (Start confirmation dialog) ───
-            _click_dialog_button(app, "Yes")
+            _click_dialog_button(app, "YES")
 
             # ── Step 9: OK (final dialog) ─────────────────
             _click_dialog_button(app, "OK")
