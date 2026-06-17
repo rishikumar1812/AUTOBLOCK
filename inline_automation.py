@@ -251,27 +251,35 @@ def run_stop_sequence(dl_name: str) -> bool:
                 )
 
             # ── Step 2: Connect by EXE process name ───────
+            logger.info(f"[{dl_name}] STEP 2 : Connect To Process")
             app = _connect_to_app()
 
             # ── Step 3: Find main window by partial title ──
+            logger.info(f"[{dl_name}] STEP 3 : Find Main Window")
             window = _get_main_window(app)
 
             # ── Step 4: Stop ──────────────────────────────
+            logger.info(f"[{dl_name}] STEP 4 : Click STOP")
             _click_button(window, "STOP")
 
             # ── Step 5: SetUp ─────────────────────────────
+            logger.info(f"[{dl_name}] STEP 5 : Click SETUP")
             _click_button(window, "SETUP")
 
             # ── Step 6: OK (SetUp confirmation dialog) ────
+            logger.info(f"[{dl_name}] STEP 6 : Click OK")
             _click_dialog_button(app, "OK")
 
             # ── Step 7: Start ─────────────────────────────
+            logger.info(f"[{dl_name}] STEP 7 : Click START")
             _click_button(window, "START")
 
             # ── Step 8: Yes (Start confirmation dialog) ───
+            logger.info(f"[{dl_name}] STEP 8 : Click YES")
             _click_dialog_button(app, "YES")
 
             # ── Step 9: OK (final dialog) ─────────────────
+            logger.info(f"[{dl_name}] STEP 9 : Click FINAL OK")
             _click_dialog_button(app, "OK")
 
             logger.info(
