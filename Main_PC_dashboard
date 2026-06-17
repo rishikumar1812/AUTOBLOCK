@@ -39,13 +39,34 @@ def _exe_name()         -> str: return get_config()["app"]["exe_name"]
 def _hello_toast_min()  -> int: return int(get_config()["dashboard"].get("hello_toast_minutes", 30))
 
 
+def cleanup_old_logs(log_dir: str, keep_days: int = 7):
+    cutoff = datetime.now() - timedelta(days=keep_days)
+
+    for fname in os.listdir(log_dir):
+        if not fname.endswith(".log"):
+            continue
+
+        path = os.path.join(log_dir, fname)
+
+        try:
+            modified = datetime.fromtimestamp(os.path.getmtime(path))
+
+            if modified < cutoff:
+                os.remove(path)
+                print(f"Deleted old log: {fname}")
+
+        except Exception as e:
+            print(f"Cleanup error: {e}")
+
 # =========================================================
 # Logging — every step written to main_pc_popup.log
 # =========================================================
 def _setup_logger() -> logging.Logger:
     log_dir = _log_dir()
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "main_pc_popup.log")
+    cleanup_old_logs(log_dir, keep_days=7)
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = os.path.join(log_dir, f"main_pc_popup_{today}.log")
     logger = logging.getLogger("main_pc_popup")
     if not logger.handlers:
         logger.setLevel(logging.INFO)
