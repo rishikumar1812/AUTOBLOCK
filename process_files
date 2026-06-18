@@ -23,6 +23,7 @@ from datetime import datetime, date
 import pandas as pd
 
 from config_loader import get_config
+from log_manager import get_daily_logger, cleanup_old_logs
 from register_logger import register_stop_event
 from stop_tracker import get_all_stop_times
 
@@ -40,29 +41,12 @@ def POLL_INTERVAL()  -> int: return int(_cfg()["monitor"]["poll_interval_sec"])
 
 
 # =========================================================
-# Logging setup — writes to log_register_dir/process_files.log
+# Logging — day-wise file, auto-cleanup on startup
+# process_files_2026-06-01.log  (switches at midnight)
+# Files older than 7 days auto-deleted on startup
 # =========================================================
-def _setup_logger() -> logging.Logger:
-    log_dir = get_config()["paths"]["log_register_dir"]
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "process_files.log")
-
-    logger = logging.getLogger("process_files")
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-
-        fh = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setFormatter(fmt)
-
-        sh = logging.StreamHandler()
-        sh.setFormatter(fmt)
-
-        logger.addHandler(fh)
-        logger.addHandler(sh)
-    return logger
-
-logger = _setup_logger()
+cleanup_old_logs()
+logger = get_daily_logger("process_files")
 
 
 # =========================================================
