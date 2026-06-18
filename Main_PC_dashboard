@@ -25,6 +25,7 @@ from tkinter import font as tkfont
 from datetime import datetime, timedelta
 
 from config_loader import get_config
+from log_manager import get_daily_logger, cleanup_old_logs
 from ini_editor import uncheck_dl
 from inline_automation import run_stop_sequence
 
@@ -39,47 +40,13 @@ def _exe_name()         -> str: return get_config()["app"]["exe_name"]
 def _hello_toast_min()  -> int: return int(get_config()["dashboard"].get("hello_toast_minutes", 30))
 
 
-def cleanup_old_logs(log_dir: str, keep_days: int = 7):
-    cutoff = datetime.now() - timedelta(days=keep_days)
-
-    for fname in os.listdir(log_dir):
-        if not fname.endswith(".log"):
-            continue
-
-        path = os.path.join(log_dir, fname)
-
-        try:
-            modified = datetime.fromtimestamp(os.path.getmtime(path))
-
-            if modified < cutoff:
-                os.remove(path)
-                print(f"Deleted old log: {fname}")
-
-        except Exception as e:
-            print(f"Cleanup error: {e}")
-
 # =========================================================
-# Logging — every step written to main_pc_popup.log
+# Logging — day-wise file, auto-cleanup on startup
+# main_pc_popup_2026-06-01.log  (switches at midnight)
+# Files older than 7 days auto-deleted on startup
 # =========================================================
-def _setup_logger() -> logging.Logger:
-    log_dir = _log_dir()
-    os.makedirs(log_dir, exist_ok=True)
-    cleanup_old_logs(log_dir, keep_days=7)
-    today = datetime.now().strftime("%Y-%m-%d")
-    log_path = os.path.join(log_dir, f"main_pc_popup_{today}.log")
-    logger = logging.getLogger("main_pc_popup")
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        fh  = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setFormatter(fmt)
-        sh  = logging.StreamHandler()
-        sh.setFormatter(fmt)
-        logger.addHandler(fh)
-        logger.addHandler(sh)
-    return logger
-
-logger = _setup_logger()
+cleanup_old_logs()
+logger = get_daily_logger("main_pc_popup")
 
 
 # =========================================================
@@ -684,7 +651,7 @@ if __name__ == "__main__":
     logger.info("[main] ================================================")
     logger.info("[main] Main PC popup started")
     logger.info(f"[main] Listening on port {_listen_port()}")
-    logger.info(f"[main] Log file: {os.path.join(_log_dir(), 'main_pc_popup.log')}")
+    logger.info(f"[main] Log dir: {_log_dir()} (day-wise files, 7-day retention)")
     logger.info("[main] ================================================")
 
     threading.Thread(target=_queue_worker, daemon=True).start()
