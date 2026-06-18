@@ -3,12 +3,15 @@ process_files.py  —  DL PC  (MAIN ENTRY POINT)
 Reads all DL log files, counts FAILs since last stop,
 and triggers stop at every 3 fails per cycle (configurable).
 
-Every scan tick:
-  1. Groups today's DL log files by DL number
-  2. Parses and combines records for each DL
-  3. Loads stop_tracker.json ONCE — iterates all DLs in memory
-  4. Applies post-stop filter per DL (only FAILs after last stop)
-  5. Triggers stop pipeline at fail_count >= block_at_fails threshold
+Efficiency improvements:
+  - Config read ONCE per tick (not 4x per accessor call)
+  - os.scandir() replaces os.listdir() — faster, no extra stat call
+  - pd.concat called once per DL with a list (not per-file loop)
+  - str.upper() result cached — not called twice per row
+  - RESULT column uppercased once on the whole DataFrame
+  - Regex compiled once at module level
+  - is_today() uses cached today date within each tick
+  - time.sleep uses fixed interval — not re-read from config each tick
 
 Run via Task Scheduler every 30 seconds (configurable in config.json).
 """
@@ -16,7 +19,6 @@ Run via Task Scheduler every 30 seconds (configurable in config.json).
 import os
 import re
 import json
-import logging
 import time
 from datetime import datetime, date
 
@@ -29,32 +31,34 @@ from stop_tracker import get_all_stop_times
 
 
 # =========================================================
-# Config accessors — live from config.json each call
-# =========================================================
-def _cfg():                return get_config()
-def LOG_DIRECTORY()  -> str: return _cfg()["paths"]["log_directory"]
-def LOG_REG_DIR()    -> str: return _cfg()["paths"]["log_register_dir"]
-def MAX_RECORDS()    -> int: return int(_cfg()["monitor"]["max_records_window"])
-def DL_COUNT()       -> int: return int(_cfg()["monitor"]["dl_count"])
-def BLOCK_AT_FAILS() -> int: return int(_cfg()["thresholds"]["block_at_fails"])
-def POLL_INTERVAL()  -> int: return int(_cfg()["monitor"]["poll_interval_sec"])
-
-
-# =========================================================
-# Logging — day-wise file, auto-cleanup on startup
-# process_files_2026-06-01.log  (switches at midnight)
-# Files older than 7 days auto-deleted on startup
+# Logging — day-wise, auto-cleanup on startup
 # =========================================================
 cleanup_old_logs()
 logger = get_daily_logger("process_files")
 
 
 # =========================================================
-# Check if a file was modified today
+# Compiled regex — done once at module level not per tick
 # =========================================================
-def is_today(file_path: str) -> bool:
-    mod_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-    return mod_time.date() == date.today()
+_DL_PATTERN = re.compile(r"DL(\d{2})", re.IGNORECASE)
+
+
+# =========================================================
+# Config — read once per tick into a local dict
+# All accessors take cfg as argument — no repeated disk reads
+# =========================================================
+def _read_cfg() -> dict:
+    """Read config.json once per tick. Pass result to all helpers."""
+    return get_config()
+
+
+# =========================================================
+# Check if a file was modified today
+# today_date passed in so date.today() called once per tick
+# not once per file
+# =========================================================
+def is_today(file_path: str, today_date: date) -> bool:
+    return datetime.fromtimestamp(os.path.getmtime(file_path)).date() == today_date
 
 
 # =========================================================
@@ -67,38 +71,40 @@ def read_latest_file(file_path: str):
     JIG, ARRAY, DATE fields.
     Returns DataFrame or None if file has no valid blocks.
     """
-    rows    = []
-    current = {}
-    required = ["RESULT", "Update_Time", "JIG", "ARRAY", "DATE"]
+    rows     = []
+    current  = {}
+    required = {"RESULT", "Update_Time", "JIG", "ARRAY", "DATE"}  # set for O(1) lookup
 
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 line = line.strip()
+                if not line:
+                    continue
 
                 if line.startswith("#INIT"):
-                    if all(k in current for k in required):
-                        rows.append(current.copy())
+                    if required.issubset(current):
+                        rows.append(current)    # no .copy() — fresh dict each block
                     current = {}
 
                 elif line.startswith("RESULT :"):
-                    current["RESULT"] = line.split("RESULT :", 1)[1].strip()
+                    current["RESULT"] = line[9:].strip()
 
                 elif line.startswith("TIME :"):
-                    current["Update_Time"] = line.split("TIME :", 1)[1].strip()
+                    current["Update_Time"] = line[7:].strip()
 
                 elif line.startswith("JIG :"):
-                    current["JIG"] = line.split("JIG :", 1)[1].strip()
+                    current["JIG"] = line[6:].strip()
 
                 elif line.startswith("ARRAY :"):
-                    current["ARRAY"] = line.split("ARRAY :", 1)[1].strip()
+                    current["ARRAY"] = line[8:].strip()
 
                 elif line.startswith("DATE :"):
-                    current["DATE"] = line.split("DATE :", 1)[1].strip()
+                    current["DATE"] = line[7:].strip()
 
         # Flush last block
-        if all(k in current for k in required):
-            rows.append(current.copy())
+        if required.issubset(current):
+            rows.append(current)
 
     except Exception as e:
         logger.error(f"[process_files] Could not read {file_path}: {e}")
@@ -115,6 +121,10 @@ def read_latest_file(file_path: str):
     )
     df = df.dropna(subset=["Time_stamp"])
     df = df.sort_values("Time_stamp").reset_index(drop=True)
+
+    # Uppercase RESULT once here — never call .str.upper() again per row
+    df["RESULT"] = df["RESULT"].str.upper()
+
     return df
 
 
@@ -127,80 +137,105 @@ def process_files() -> list:
     Returns list of result message strings for logging.
     """
     result_messages = []
-    directory       = LOG_DIRECTORY()
-    dl_count        = DL_COUNT()
-    block_threshold = BLOCK_AT_FAILS()
 
-    logger.info(f"[process_files] Scan started — dir: {directory} | "
-                f"DLs: {dl_count} | block at: {block_threshold} fails")
+    # ── Read config ONCE per tick ─────────────────────────
+    cfg             = _read_cfg()
+    directory       = cfg["paths"]["log_directory"]
+    dl_count        = int(cfg["monitor"]["dl_count"])
+    block_threshold = int(cfg["thresholds"]["block_at_fails"])
+    max_records     = int(cfg["monitor"]["max_records_window"])
+    log_reg_dir     = cfg["paths"]["log_register_dir"]
 
-    # Guard: log directory must exist
+    logger.info(
+        f"[process_files] Scan started — "
+        f"DLs: {dl_count} | block at: {block_threshold} fails"
+    )
+
     if not os.path.isdir(directory):
         logger.error(f"[process_files] Log directory not found: {directory}")
         return result_messages
 
-    # ── Group today's files by DL number ─────────────────
+    # ── Cache today's date — used for every file check ────
+    today_date = date.today()
+
+    # ── Group today's files by DL number ──────────────────
+    # os.scandir() is faster than os.listdir() — gives DirEntry
+    # objects with cached stat info, no extra os.stat() call needed
     dl_files = [[] for _ in range(dl_count)]
 
-    for fname in os.listdir(directory):
-        fpath = os.path.join(directory, fname)
-        if not os.path.isfile(fpath):
-            continue
-        match = re.search(r"DL(\d{2})", fname, re.IGNORECASE)
-        if match and is_today(fpath):
+    with os.scandir(directory) as it:
+        for entry in it:
+            if not entry.is_file():
+                continue
+            match = _DL_PATTERN.search(entry.name)
+            if not match:
+                continue
+            # entry.stat() uses cached result — no extra syscall
+            mod_date = datetime.fromtimestamp(
+                entry.stat().st_mtime
+            ).date()
+            if mod_date != today_date:
+                continue
             idx = int(match.group(1)) - 1
             if 0 <= idx < dl_count:
-                dl_files[idx].append(fpath)
+                dl_files[idx].append(entry.path)
 
     # ── Load stop_tracker.json ONCE for all DLs ──────────
-    # Avoids 20 separate disk reads (one per DL) every tick.
     all_stops = get_all_stop_times()
 
-    # ── Evaluate each DL ─────────────────────────────────
+    # ── Evaluate each DL ──────────────────────────────────
     for i, files in enumerate(dl_files):
         dl_name = f"DL{i + 1:02d}"
 
         if not files:
-            logger.debug(f"[process_files] {dl_name} — no files today, skipping")
             continue
 
-        # Combine all files for this DL
-        combined = pd.DataFrame()
+        # ── Combine all files — collect then concat once ──
+        # pd.concat inside a loop creates N intermediate DataFrames.
+        # Collecting into a list and calling concat once is faster.
+        frames = []
         for fpath in files:
             df = read_latest_file(fpath)
             if df is not None:
-                combined = pd.concat([combined, df], ignore_index=True)
+                frames.append(df)
 
-        if combined.empty:
-            logger.warning(f"[process_files] {dl_name} — files found but no valid records")
+        if not frames:
+            logger.warning(f"[process_files] {dl_name} — no valid records in files")
             continue
 
-        combined = combined.sort_values("Time_stamp").reset_index(drop=True)
+        combined = (
+            frames[0] if len(frames) == 1
+            else pd.concat(frames, ignore_index=True)
+                   .sort_values("Time_stamp")
+                   .reset_index(drop=True)
+        )
 
-        # ── Apply post-stop filter FIRST, then tail ───────
-        # Filter first so tail() never cuts off recent post-stop records.
+        # ── Post-stop filter FIRST, then tail ─────────────
         last_stop_str = all_stops.get(dl_name, {}).get("last_stop")
         if last_stop_str:
             try:
-                last_stop_ts = datetime.fromisoformat(last_stop_str)
-                active_df    = combined[combined["Time_stamp"] > pd.Timestamp(last_stop_ts)]
+                last_stop_ts = pd.Timestamp(
+                    datetime.fromisoformat(last_stop_str)
+                )
+                active_df = combined[combined["Time_stamp"] > last_stop_ts]
             except Exception as e:
-                logger.error(f"[process_files] {dl_name} — bad last_stop value: {e}")
+                logger.error(f"[process_files] {dl_name} — bad last_stop: {e}")
                 active_df = combined
         else:
-            active_df = combined   # Never stopped before — count everything
+            active_df = combined
 
-        if len(active_df) > MAX_RECORDS():
-            active_df = active_df.tail(MAX_RECORDS()).reset_index(drop=True)
+        if len(active_df) > max_records:
+            active_df = active_df.iloc[-max_records:]   # iloc faster than tail()
 
         if active_df.empty:
             logger.info(f"[process_files] {dl_name} — no new records since last stop")
             continue
 
         # ── Count FAILs ───────────────────────────────────
+        # RESULT already uppercased in read_latest_file() — no .str.upper() here
         total      = len(active_df)
-        fail_df    = active_df[active_df["RESULT"].str.upper() == "FAIL"]
-        fail_count = len(fail_df)
+        fail_mask  = active_df["RESULT"] == "FAIL"
+        fail_count = int(fail_mask.sum())
         fail_rate  = (fail_count / total) * 100
 
         logger.info(
@@ -209,9 +244,8 @@ def process_files() -> list:
         )
 
         # ── Trigger stop at threshold ──────────────────────
-        # >= handles burst case where 2 fails land in same tick
         if fail_count >= block_threshold:
-            latest_fail = fail_df.iloc[-1]
+            latest_fail = active_df[fail_mask].iloc[-1]
             registered  = register_stop_event(dl_name, latest_fail)
 
             if registered:
@@ -224,13 +258,13 @@ def process_files() -> list:
                 result_messages.append(msg)
             elif registered is None:
                 logger.error(
-                    f"[process_files] {dl_name} — register_stop_event returned None, "
-                    f"check register_logger.py"
+                    f"[process_files] {dl_name} — "
+                    f"register_stop_event returned None"
                 )
 
     logger.info(
         f"[process_files] Scan complete — "
-        f"{len(result_messages)} stop(s) triggered this tick"
+        f"{len(result_messages)} stop(s) triggered"
     )
     return result_messages
 
@@ -239,7 +273,9 @@ def process_files() -> list:
 # Entry point
 # =========================================================
 if __name__ == "__main__":
-    interval = POLL_INTERVAL()
+    cfg      = _read_cfg()
+    interval = int(cfg["monitor"]["poll_interval_sec"])
+
     logger.info(
         f"[process_files] DL Monitor started — "
         f"scanning every {interval}s. Press Ctrl+C to stop."
@@ -249,5 +285,7 @@ if __name__ == "__main__":
         try:
             process_files()
         except Exception as e:
-            logger.error(f"[process_files] Unhandled error during scan: {e}")
-        time.sleep(POLL_INTERVAL())
+            logger.error(f"[process_files] Unhandled error: {e}")
+
+        # Fixed sleep — interval read once, not re-read every tick
+        time.sleep(interval)
