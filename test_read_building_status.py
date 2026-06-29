@@ -1,26 +1,38 @@
 """
-test_read_building_status.py  —  Main PC diagnostic ONLY
-Standalone script — does NOT touch inline_automation.py, Data.ini,
-or click anything. Read-only check.
+test_read_building_status_v2.py  —  Main PC diagnostic ONLY
+Standalone, READ-ONLY. Does not click, does not touch Data.ini.
 
-Goal: confirm pywinauto can read the live "Wait" / "Down" / "Not Use"
-/ "Pass" text out of the Front Rack status controls.
+v2 — fixes v1's wrong assumptions:
+  - v1 assumed "Front Rack" container's control_type is literally "Pane".
+    It is NOT (confirmed by your last test — lookup timed out).
+  - v1 assumed status text (Wait/Down/Pass) lives in "Edit" controls.
+    Your last run found 0 Edit controls near the Building labels at all.
 
-Run while InLine_Pro is open, while you can also see the screen,
-so you can compare the printed text against what you see live:
+v2 makes NO assumptions about control_type. Instead it:
+  1. Finds every control with title "Front Rack" or "Rear Rack" and
+     prints its REAL control_type + class_name (whatever it actually is).
+  2. Finds every control with title "Building 6" (there will be 2 — one
+     Front, one Rear) and prints their rect + real control_type/class.
+  3. For EACH "Building 6" instance, scans ALL descendants of the window
+     and lists every control (any type) sitting in the same row (top
+     within +/-5px) ordered left-to-right, printing type/class/text for
+     each. The status word should be one of these neighbors.
+  4. Same again for "Building 1" as a second data point (different
+     row, helps confirm the pattern is consistent).
 
-    python test_read_building_status.py
+Run while InLine_Pro is open AND while you can see the live screen:
+    python test_read_building_status_v2.py
 
-Output goes to console AND test_read_output.txt in the same folder.
+Output -> test_read_output_v2.txt (and console)
 """
 
 import os
 import sys
-import time
 import traceback
+from datetime import datetime
 
 OUTPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "test_read_output.txt")
+                            "test_read_output_v2.txt")
 
 try:
     from pywinauto import Application
@@ -29,192 +41,167 @@ except ImportError:
     sys.exit(1)
 
 
-def log(msg: str, f):
+def log(msg, f):
     print(msg)
     f.write(msg + "\n")
 
 
-def separator(f, char="=", width=80):
-    log(char * width, f)
+def sep(f, c="=", w=90):
+    log(c * w, f)
 
 
-def get_text_safely(ctrl) -> str:
-    """
-    Try every method pywinauto exposes for reading text.
-    Edit controls usually answer to window_text(), but some legacy
-    Win32 edits only answer correctly to get_value() (uia) or
-    .texts() (win32) — try all three, report all three.
-    """
-    results = {}
+def describe(ctrl):
+    """Return a dict of everything we can safely read about a control."""
+    out = {}
     try:
-        results["window_text()"] = ctrl.window_text()
+        out["control_type"] = ctrl.element_info.control_type
     except Exception as e:
-        results["window_text()"] = f"ERROR: {e}"
-
+        out["control_type"] = f"<err: {e}>"
     try:
-        results["get_value()"] = ctrl.get_value()
+        out["class_name"] = ctrl.class_name()
     except Exception as e:
-        results["get_value()"] = f"<not available: {e}>"
-
+        out["class_name"] = f"<err: {e}>"
     try:
-        texts = ctrl.texts()
-        results["texts()"] = texts
+        out["window_text"] = ctrl.window_text()
     except Exception as e:
-        results["texts()"] = f"<not available: {e}>"
-
-    return results
+        out["window_text"] = f"<err: {e}>"
+    try:
+        out["rect"] = ctrl.rectangle()
+    except Exception as e:
+        out["rect"] = f"<err: {e}>"
+    try:
+        out["auto_id"] = ctrl.element_info.automation_id
+    except Exception:
+        out["auto_id"] = ""
+    try:
+        out["get_value"] = ctrl.get_value()
+    except Exception:
+        out["get_value"] = "<n/a>"
+    return out
 
 
 def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        log(f"Building Status Read Test — {__import__('datetime').datetime.now()}", f)
+        log(f"Building Status Read Test v2 — {datetime.now()}", f)
         log("", f)
 
-        # ---------------------------------------------------------
-        # Step 1 — connect + find main window
-        # ---------------------------------------------------------
-        separator(f)
-        log("STEP 1 — Connect to InLine_Pro", f)
-        separator(f)
+        # ---------------------------------------------------
+        sep(f)
+        log("STEP 1 — Connect", f)
+        sep(f)
         try:
             app = Application(backend="uia").connect(title_re=".*InLine.*", timeout=10)
             win = app.window(title_re=".*InLine.*")
             log(f"  Connected: '{win.window_text()}'", f)
         except Exception as e:
-            log(f"  ERROR: could not connect — {e}", f)
+            log(f"  ERROR connecting: {e}", f)
             log(traceback.format_exc(), f)
             return
 
-        # ---------------------------------------------------------
-        # Step 2 — find the Front Rack pane
-        # ---------------------------------------------------------
-        separator(f)
-        log("STEP 2 — Find 'Front Rack' pane", f)
-        separator(f)
-        try:
-            front_rack_pane = win.child_window(title="Front Rack", control_type="Pane")
-            front_rack_pane.wait("exists", timeout=5)
-            rect = front_rack_pane.rectangle()
-            log(f"  Found 'Front Rack' pane — rect: {rect}", f)
-        except Exception as e:
-            log(f"  ERROR: could not find 'Front Rack' pane — {e}", f)
-            log("  Falling back to whole-window search instead.", f)
-            front_rack_pane = win
+        # Cache descendants once — this can be a few hundred controls,
+        # walking it repeatedly is slow and InLine_Pro is a live app
+        # (positions could shift slightly between calls otherwise).
+        log("  Caching window.descendants() once for this run...", f)
+        all_ctrls = win.descendants()
+        log(f"  Total descendants found: {len(all_ctrls)}", f)
 
-        # ---------------------------------------------------------
-        # Step 3 — list ALL Edit controls + nearby Text labels,
-        # sorted top-to-bottom, so label and value can be visually
-        # paired by matching vertical position (top coordinate)
-        # ---------------------------------------------------------
-        separator(f)
-        log("STEP 3 — All Text labels + Edit values inside Front Rack area", f)
-        log("(Reading from the FULL window, then filtering by the Front", f)
-        log(" Rack pane's x-range, since label/value may not be nested", f)
-        log(" under the pane in the accessibility tree even though they", f)
-        log(" are visually inside it.)", f)
-        separator(f)
-
-        try:
-            fr_rect = front_rack_pane.rectangle()
-            x_min, x_max = fr_rect.left, fr_rect.right
-        except Exception:
-            x_min, x_max = 0, 100000  # no filtering if pane lookup failed
-
-        log(f"  Filtering controls with left-x between {x_min} and {x_max}", f)
+        # ---------------------------------------------------
+        sep(f)
+        log("STEP 2 — Real control_type/class_name for 'Front Rack' / 'Rear Rack'", f)
+        sep(f)
+        for wanted in ("Front Rack", "Rear Rack"):
+            matches = [c for c in all_ctrls if (c.window_text() or "").strip() == wanted]
+            log(f"  '{wanted}': {len(matches)} match(es)", f)
+            for m in matches:
+                d = describe(m)
+                log(f"    control_type={d['control_type']}  class_name={d['class_name']}  "
+                    f"rect={d['rect']}  auto_id={d['auto_id']!r}", f)
         log("", f)
 
-        labels = []   # (top, left, text)
-        values = []   # (top, left, control, text_dict)
+        # ---------------------------------------------------
+        sep(f)
+        log("STEP 3 — All 'Building 6' instances + their row neighbors", f)
+        sep(f)
+        b6_matches = [c for c in all_ctrls if (c.window_text() or "").strip() == "Building 6"]
+        log(f"  Found {len(b6_matches)} controls titled 'Building 6'", f)
 
-        for child in win.descendants():
+        for idx, b6 in enumerate(b6_matches):
+            d = describe(b6)
+            log("", f)
+            log(f"  --- 'Building 6' instance #{idx+1} ---", f)
+            log(f"    control_type={d['control_type']}  class_name={d['class_name']}  rect={d['rect']}", f)
+
             try:
-                rect = child.rectangle()
-                if not (x_min - 5 <= rect.left <= x_max + 5):
-                    continue  # not in Front Rack's x-band
-
-                ctrl_type = child.element_info.control_type or "?"
-                title = (child.window_text() or "").strip()
-
-                if ctrl_type == "Text" and title:
-                    labels.append((rect.top, rect.left, title))
-                elif ctrl_type == "Edit":
-                    text_info = get_text_safely(child)
-                    values.append((rect.top, rect.left, child, text_info))
-            except Exception:
+                b6_rect = b6.rectangle()
+            except Exception as e:
+                log(f"    could not get rectangle: {e}", f)
                 continue
 
-        labels.sort(key=lambda t: -t[0])   # sort by top descending (matches screen top->bottom since B-T axis can vary)
-        values.sort(key=lambda t: -t[0])
-
-        log(f"  Found {len(labels)} Text labels, {len(values)} Edit controls in this x-band", f)
-        log("", f)
-
-        log(f"  {'Top':<6} {'Label (Text ctrl)':<20} {'Top':<6} {'Edit window_text()':<25} {'Edit get_value()':<25}", f)
-        log(f"  {'-'*6} {'-'*20} {'-'*6} {'-'*25} {'-'*25}", f)
-
-        # naive pairing by matching 'top' coordinate within a tolerance
-        used_values = set()
-        for ltop, lleft, ltext in labels:
-            match = None
-            for i, (vtop, vleft, vctrl, vtext) in enumerate(values):
-                if i in used_values:
+            log(f"    Scanning ALL descendants for same row (top within +/-5px of {b6_rect.top})...", f)
+            row_ctrls = []
+            for c in all_ctrls:
+                try:
+                    r = c.rectangle()
+                    if abs(r.top - b6_rect.top) <= 5:
+                        row_ctrls.append(c)
+                except Exception:
                     continue
-                if abs(vtop - ltop) <= 3:  # same row, small tolerance
-                    match = (vtop, vleft, vctrl, vtext)
-                    used_values.add(i)
-                    break
 
-            if match:
-                vtop, vleft, vctrl, vtext = match
-                wt = vtext.get("window_text()", "")
-                gv = vtext.get("get_value()", "")
-                log(f"  {ltop:<6} {ltext:<20} {vtop:<6} {str(wt):<25} {str(gv):<25}", f)
-            else:
-                log(f"  {ltop:<6} {ltext:<20} {'--':<6} {'<no matching Edit found>':<25}", f)
+            # sort left -> right so output reads in visual order
+            row_ctrls_sorted = sorted(row_ctrls, key=lambda c: c.rectangle().left)
+            log(f"    {len(row_ctrls_sorted)} control(s) found in this row:", f)
+            log(f"    {'Left':<6} {'Type':<12} {'Class':<14} {'Text':<20} {'GetValue':<20}", f)
+            log(f"    {'-'*6} {'-'*12} {'-'*14} {'-'*20} {'-'*20}", f)
+            for c in row_ctrls_sorted:
+                cd = describe(c)
+                log(f"    {cd['rect'].left if hasattr(cd['rect'],'left') else '?':<6} "
+                    f"{str(cd['control_type']):<12} {str(cd['class_name']):<14} "
+                    f"{str(cd['window_text'])[:18]:<20} {str(cd['get_value'])[:18]:<20}", f)
 
-        # Show any leftover Edit controls that weren't matched to a label
-        leftover = [v for i, v in enumerate(values) if i not in used_values]
-        if leftover:
+        # ---------------------------------------------------
+        sep(f)
+        log("STEP 4 — Same check for 'Building 1' (second data point)", f)
+        sep(f)
+        b1_matches = [c for c in all_ctrls if (c.window_text() or "").strip() == "Building 1"]
+        log(f"  Found {len(b1_matches)} controls titled 'Building 1'", f)
+
+        for idx, b1 in enumerate(b1_matches):
+            d = describe(b1)
             log("", f)
-            log(f"  {len(leftover)} Edit control(s) with NO matching label nearby:", f)
-            for vtop, vleft, vctrl, vtext in leftover:
-                log(f"    top={vtop} left={vleft}  window_text()={vtext.get('window_text()')!r}  get_value()={vtext.get('get_value()')!r}", f)
+            log(f"  --- 'Building 1' instance #{idx+1} ---", f)
+            log(f"    control_type={d['control_type']}  class_name={d['class_name']}  rect={d['rect']}", f)
+            try:
+                b1_rect = b1.rectangle()
+            except Exception as e:
+                log(f"    could not get rectangle: {e}", f)
+                continue
 
-        # ---------------------------------------------------------
-        # Step 4 — direct targeted check: try to specifically grab
-        # whatever Edit sits at the same row as the "Building 6" label
-        # ---------------------------------------------------------
-        separator(f)
-        log("STEP 4 — Targeted check: value next to 'Building 6' label", f)
-        separator(f)
-        try:
-            b6_label = win.child_window(title="Building 6", control_type="Text")
-            b6_rect = b6_label.rectangle()
-            log(f"  'Building 6' label rect: {b6_rect}", f)
+            row_ctrls = []
+            for c in all_ctrls:
+                try:
+                    r = c.rectangle()
+                    if abs(r.top - b1_rect.top) <= 5:
+                        row_ctrls.append(c)
+                except Exception:
+                    continue
+            row_ctrls_sorted = sorted(row_ctrls, key=lambda c: c.rectangle().left)
+            log(f"    {len(row_ctrls_sorted)} control(s) found in this row:", f)
+            log(f"    {'Left':<6} {'Type':<12} {'Class':<14} {'Text':<20} {'GetValue':<20}", f)
+            log(f"    {'-'*6} {'-'*12} {'-'*14} {'-'*20} {'-'*20}", f)
+            for c in row_ctrls_sorted:
+                cd = describe(c)
+                log(f"    {cd['rect'].left if hasattr(cd['rect'],'left') else '?':<6} "
+                    f"{str(cd['control_type']):<12} {str(cd['class_name']):<14} "
+                    f"{str(cd['window_text'])[:18]:<20} {str(cd['get_value'])[:18]:<20}", f)
 
-            found = False
-            for child in win.descendants(control_type="Edit"):
-                rect = child.rectangle()
-                if abs(rect.top - b6_rect.top) <= 3 and rect.left > b6_rect.right:
-                    text_info = get_text_safely(child)
-                    log(f"  MATCH — Edit at {rect}", f)
-                    log(f"    window_text() = {text_info.get('window_text()')!r}", f)
-                    log(f"    get_value()   = {text_info.get('get_value()')!r}", f)
-                    log(f"    texts()       = {text_info.get('texts()')!r}", f)
-                    found = True
-            if not found:
-                log("  No Edit control found at matching row to the right of 'Building 6'.", f)
-        except Exception as e:
-            log(f"  ERROR: {e}", f)
-            log(traceback.format_exc(), f)
-
-        separator(f)
+        sep(f)
         log("TEST COMPLETE", f)
-        separator(f)
+        sep(f)
 
-    print(f"\nDone. Open {OUTPUT_FILE} for full results.")
-    print("Compare the printed Edit text against what you see on screen RIGHT NOW")
-    print("for Building 6 (Front Rack) — does it say 'Wait', 'Down', etc.?")
+    print(f"\nDone. Open {OUTPUT_FILE}")
+    print("Look at STEP 3 / STEP 4 row tables — find the control whose")
+    print("Text or GetValue column shows 'Wait' / 'Down' / 'Not Use' / 'PASS'")
+    print("right now, matching what you see live on screen for that Building.")
 
 
 if __name__ == "__main__":
