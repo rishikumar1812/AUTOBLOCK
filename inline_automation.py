@@ -1,116 +1,126 @@
-"""
-inline_automation.py  —  Main PC
-Automates InLine_Pro GUI after a DL stop signal is received.
-
-Window finding strategy:
-  - Connects by EXE process name (InLine_Pro.exe) — immune to
-    version string changes in title (InLine_Pro_Version3.2xyz etc.)
-  - Then finds the main window using title_re partial regex match
-    against the configured window_title keyword
-  - set_focus() called only on InLine_Pro window — all other open
-    apps are completely ignored
-
-Sequence per stop:
-  1. Edit Data.ini  — uncheck the stopped DL building
-  2. Connect to InLine_Pro.exe process
-  3. Find main window by partial title regex
-  4. Stop → SetUp → OK → Start → Yes → OK
-     (3 second wait between each step)
-
-Install: pip install pywinauto pyautogui Pillow
-"""
-
 import re
 import time
 import logging
-
-from pywinauto import Application, Desktop
-from pywinauto.exceptions import (
+from pywinauto import Application,Desktop
+from pywinauto.findwindows import(
     ElementNotFoundError,
-    ElementAmbiguousError,
+    ElementAmbiguousError,  
 )
-from pywinauto.timings import TimeoutError as PWTimeoutError
+from pywinauto.timings import  TimeoutError as PWTimeoutError
 
 from config_loader import get_config
 from ini_editor import uncheck_dl
 
-logger = logging.getLogger("inline_automation")
+# =========================================================
+# Use the SAME logger name as main_pc_popup.py so every
+# pywinauto step lands in the same main_pc_popup_YYYY-MM-DD.log
+# file the engineer already checks — no separate log file
+# to dig through when something fails.
+# =========================================================
+logger=logging.getLogger("main_pc_popup")
+
+# config access
+def _exe_name()->str:
+    return get_config()['app']['exe_name']
+def _window_keyword()->str:
+    return get_config()['app']['window_title']
+
+def _step_wait()->int:
+    return int(get_config()['automation']['step_wait_sec'])
+def _max_wait()->int:
+    return int(get_config()["automation"]['max_wait_sec'])
+def _retry_attempts()->int:
+    return int(get_config()['automation']['retry_attempts'])
 
 
 # =========================================================
-# Config accessors
+# Building occupancy check — config access
 # =========================================================
-def _exe_name()       -> str: return get_config()["app"]["exe_name"]
-def _window_keyword() -> str: return get_config()["app"]["window_title"]
-def _step_wait()      -> int: return int(get_config()["automation"]["step_wait_sec"])
-def _max_wait()       -> int: return int(get_config()["automation"]["max_wait_sec"])
-def _retry_attempts() -> int: return int(get_config()["automation"]["retry_attempts"])
+def _bc_cfg() -> dict:
+    return get_config()['building_check']
+
+def _bc_enabled() -> bool:
+    return bool(_bc_cfg().get('enabled', True))
 
 
 # =========================================================
-# Connect to InLine_Pro by EXE process name
+# DL name -> (rack, building_num)
 #
-# Why process name instead of title:
-#   Title can be "InLine_Pro_Version3.2xyz" or any version —
-#   it changes with updates.
-#   EXE name (InLine_Pro.exe) never changes.
-#
-# Returns the Application object connected to InLine_Pro.exe
-# Raises RuntimeError if process not found.
+# Mirrors ini_editor.dl_to_ini_key() so the rack-split logic
+# lives in one place conceptually, even though it's duplicated
+# here because ini_editor maps to Data.ini section names
+# (RACK1/RACK2) while this maps to screen side (front/rear).
+# Both follow the same DL01-10 -> rack1(front), DL11-20 -> rack2(rear)
+# split — keep these in sync if that split ever changes.
 # =========================================================
-def _connect_to_app() -> Application:
-    exe = _exe_name()
+def dl_to_rack_building(dl_name: str) -> tuple:
+    """
+    'DL06' -> ('front', 6)
+    'DL16' -> ('rear', 6)
+    Raises ValueError on bad input, same as ini_editor.dl_to_ini_key.
+    """
     try:
-        app = Application(backend="uia").connect(
-            path=exe,
-            timeout=10,
-        )
-        logger.info(f"[automation] Connected to process: {exe}")
+        dl_num = int(dl_name[2:])
+    except (ValueError, IndexError):
+        raise ValueError(f"Invalid DL name format: {dl_name}")
+
+    if not (1 <= dl_num <= 20):
+        raise ValueError(f"DL number out of range (1-20): {dl_name}")
+
+    if dl_num <= 10:
+        return "front", dl_num
+    else:
+        return "rear", dl_num - 10
+
+
+def _connect_to_app()->Application:
+    exe=_exe_name()
+    logger.info(f"[automation] STEP: Connect to process '{exe}' — attempting...")
+    try:
+        app=Application(backend='uia').connect(path=exe,timeout=10,)
+        logger.info(f"[automation] STEP: Connect to process '{exe}' — OK")
         return app
-    except Exception:
-        # Fallback: find by iterating running processes
+    except Exception as e1:
+        logger.warning(f"[automation] STEP: Connect by process name FAILED — {e1}")
+        logger.info(f"[automation] STEP: Connect by title_re fallback — attempting...")
         try:
-            app = Application(backend="uia").connect(
-                title_re=f".*{re.escape(_window_keyword())}.*",
-                timeout=10,
-            )
-            logger.info(
-                f"[automation] Connected via title_re fallback: "
-                f"*{_window_keyword()}*"
-            )
+            app=Application(backend='uia').connect(title_re=f".*{re.escape(_window_keyword())}.*",timeout=10,)
+            logger.info(f"[automation] STEP: Connect by title_re fallback — OK "
+                        f"(*{_window_keyword()}*)")
             return app
-        except Exception as e:
+        except Exception as e2:
+            logger.error(f"[automation] STEP: Connect by title_re fallback — FAILED: {e2}")
             raise RuntimeError(
                 f"[automation] Cannot find InLine_Pro — "
-                f"process '{exe}' not running. Error: {e}"
+                f"process '{exe}' is not running. Error: {e2}"
             )
 
 
-# =========================================================
-# Get the main InLine_Pro window from the app
-#
-# Uses title_re partial match so version string in title
-# (InLine_Pro_Version3.2xyz) is handled automatically.
-# Other open apps are never touched — we target only the
-# process we connected to above.
-# =========================================================
-def _get_main_window(app: Application):
-    keyword = _window_keyword()
+def _get_main_window(app:Application):
+    keyword=_window_keyword()
+    logger.info(f"[automation] STEP: Find main window matching '*{keyword}*' — attempting...")
     try:
-        # Partial title regex — matches any version suffix
-        window = app.window(title_re=f".*{re.escape(keyword)}.*")
-        window.wait("visible", timeout=_max_wait())
+        window=app.window(title_re=f".*{re.escape(_window_keyword())}.*")
+        window.wait("visible",timeout=_max_wait())
         logger.info(
-            f"[automation] Main window found: "
-            f"'{window.window_text()}'"
+            f"[automation] STEP: Find main window — OK "
+            f"(title='{window.window_text()}')"
         )
         return window
     except PWTimeoutError:
+        logger.error(
+            f"[automation] STEP: Find main window — FAILED "
+            f"(not visible after {_max_wait()}s)"
+        )
         raise RuntimeError(
             f"[automation] Main window matching '*{keyword}*' "
             f"not visible after {_max_wait()}s"
         )
     except ElementNotFoundError:
+        logger.error(
+            f"[automation] STEP: Find main window — FAILED "
+            f"(no window matching '*{keyword}*')"
+        )
         raise RuntimeError(
             f"[automation] No window matching '*{keyword}*' found "
             f"in InLine_Pro process"
@@ -118,42 +128,195 @@ def _get_main_window(app: Application):
 
 
 # =========================================================
-# Click a named button in a specific window
+# Building occupancy check — core read logic
 #
-# Does NOT call set_focus() on the whole screen —
-# operates directly on the InLine_Pro window element.
-# Other apps stay untouched.
+# Confirmed via live diagnostic (test_read_building_status_v2.py)
+# against InLine_Pro_Ver 3.1.8.01:
+#   - Building label = Text control, window_text() == "Building {N}"
+#     Front Rack label sits at left ≈ 143, Rear Rack at left ≈ 436.
+#   - Status value = Edit control in the SAME ROW (same .top, within
+#     a few px tolerance), readable ONLY via .get_value() —
+#     window_text() on these Edit controls returns blank.
+#   - Front Rack value Edit sits at left ≈ 200, Rear Rack at left ≈ 496.
+#   - Live values come back letter-spaced, e.g. "W a i t" — must
+#     strip internal whitespace before comparing.
 # =========================================================
-def _click_button(window, button_name: str) -> None:
-    wait = _step_wait()
-    logger.info(
-        f"[automation] Waiting {wait}s → clicking '{button_name}'"
+def _find_building_label(window, rack: str, building_num: int):
+    """
+    Find the Text control for 'Building {N}' on the correct side.
+    There are always 2 matches window-wide (front+rear) for the same
+    title, so we disambiguate by the label's known left x-position
+    rather than relying on child_window()'s title match alone
+    (which raises ElementAmbiguousError with 2+ matches).
+    """
+    cfg = _bc_cfg()
+    target_left = cfg['front_label_left'] if rack == "front" else cfg['rear_label_left']
+    tol = cfg['row_top_tolerance_px']
+    title = f"Building {building_num}"
+
+    candidates = [
+        c for c in window.descendants()
+        if (c.window_text() or "").strip() == title
+    ]
+    for c in candidates:
+        try:
+            left = c.rectangle().left
+            if abs(left - target_left) <= max(tol, 10):
+                return c
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        f"[automation] Could not find '{title}' label on {rack} side "
+        f"(expected near left={target_left}, found {len(candidates)} "
+        f"candidate(s) total)"
     )
+
+
+def _read_building_status(window, rack: str, building_num: int) -> str:
+    """
+    Returns the live status text for the given rack/building,
+    e.g. 'Wait', 'Down', 'Not Use', whitespace-stripped.
+    Raises RuntimeError if the label or its paired value can't be found.
+    """
+    cfg = _bc_cfg()
+    tol = cfg['row_top_tolerance_px']
+    value_left = cfg['front_value_left'] if rack == "front" else cfg['rear_value_left']
+
+    label = _find_building_label(window, rack, building_num)
+    label_top = label.rectangle().top
+
+    for c in window.descendants(control_type="Edit"):
+        try:
+            r = c.rectangle()
+            if abs(r.top - label_top) <= tol and abs(r.left - value_left) <= max(tol, 10):
+                raw = c.get_value() or ""
+                return raw.replace(" ", "").strip()
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        f"[automation] Found 'Building {building_num}' label on {rack} side "
+        f"(top={label_top}) but no matching value Edit control at "
+        f"left≈{value_left}"
+    )
+
+
+def wait_for_building_clear(dl_name: str, app: Application, window) -> bool:
+    """
+    Polls the live HMI screen until the target Building shows the
+    'ready' status (default 'Wait', meaning no board currently
+    occupies that position), or until max_wait_sec is exceeded.
+
+    This MUST run before Data.ini is edited / before the click
+    sequence starts. Proceeding while the building still shows
+    'Down' (board present) would uncheck/stop a position with a
+    physical PCB still sitting in it — that board would never be
+    carried forward and would stay stuck, causing a production loss
+    at full line capacity.
+
+    Returns:
+        True  — building reached ready state, safe to proceed
+        False — timed out, building never cleared; caller must NOT
+                proceed with the Data.ini edit or click sequence
+    """
+    cfg = _bc_cfg()
+    if not cfg.get('enabled', True):
+        logger.warning(
+            f"[automation] {dl_name} — building_check.enabled=false in "
+            f"config.json, SKIPPING occupancy check (old behavior)"
+        )
+        return True
+
+    try:
+        rack, building_num = dl_to_rack_building(dl_name)
+    except ValueError as e:
+        logger.error(f"[automation] {dl_name} — {e}")
+        raise RuntimeError(str(e))
+
+    ready_text = cfg['ready_text'].replace(" ", "").strip()
+    poll_interval = int(cfg['poll_interval_sec'])
+    max_wait = int(cfg['max_wait_sec'])
+
+    logger.info(
+        f"[automation] {dl_name} — STEP 0/9: Wait for Building {building_num} "
+        f"({rack} rack) to show '{ready_text}' before proceeding "
+        f"(max wait {max_wait}s, poll every {poll_interval}s)"
+    )
+
+    start = time.time()
+    last_seen = None
+    while True:
+        try:
+            status = _read_building_status(window, rack, building_num)
+        except RuntimeError as e:
+            # Couldn't read the control at all this poll — log and retry
+            # rather than aborting immediately, in case it's a transient
+            # UIA hiccup (window briefly redrawing, etc).
+            logger.warning(f"[automation] {dl_name} — STEP 0/9: read failed this poll: {e}")
+            status = None
+
+        if status is not None and status != last_seen:
+            logger.info(
+                f"[automation] {dl_name} — STEP 0/9: Building {building_num} "
+                f"({rack}) currently shows '{status}'"
+            )
+            last_seen = status
+
+        if status == ready_text:
+            logger.info(
+                f"[automation] {dl_name} — STEP 0/9: Building {building_num} "
+                f"({rack}) is '{ready_text}' — OK, proceeding"
+            )
+            return True
+
+        elapsed = time.time() - start
+        if elapsed >= max_wait:
+            logger.error(
+                f"[automation] {dl_name} — STEP 0/9: TIMED OUT after {max_wait}s "
+                f"waiting for Building {building_num} ({rack}) to clear "
+                f"(last seen status: '{last_seen}'). NOT proceeding — "
+                f"board may still be physically present. Manual check needed."
+            )
+            return False
+
+        time.sleep(poll_interval)
+
+
+def _click_button(window,button_name:str)->None:
+    wait=_step_wait()
+    logger.info(f"[automation] STEP: Click '{button_name}' — waiting {wait}s before click")
     time.sleep(wait)
 
-    # Try exact title first, then title_re as fallback
-    # Handles slight title variations across app versions
-    ctrl = None
-    last_err = None
-
-    for kwargs in [
-        {"title": button_name, "control_type": "Button"},
-        {"title_re": f".*{re.escape(button_name)}.*", "control_type": "Button"},
-        {"title": button_name},   # no control_type — catches Custom/Pane
-    ]:
+    ctrl=None
+    last_err=None
+    attempts = [
+        {"title":button_name,"control_type":"Button"},
+        {"title_re":f".*{re.escape(button_name)}.*","control_type":"Button"},
+        {"title":button_name},
+    ]
+    for n, kwargs in enumerate(attempts, start=1):
+        logger.info(f"[automation] STEP: Click '{button_name}' — trying method {n}/3: {kwargs}")
         try:
-            candidate = window.child_window(**kwargs)
-            candidate.wait("visible enabled", timeout=3)
-            ctrl = candidate
+            candidate=window.child_window(**kwargs)
+            candidate.wait("visible enabled",timeout=3)
+            ctrl=candidate
             logger.info(
-                f"[automation] Found '{button_name}' with kwargs={kwargs}"
+                f"[automation] STEP: Click '{button_name}' — found via method {n} ({kwargs})"
             )
             break
         except Exception as e:
-            last_err = e
+            last_err=e
+            logger.warning(
+                f"[automation] STEP: Click '{button_name}' — method {n} failed: {e}"
+            )
             continue
 
     if ctrl is None:
+        logger.error(
+            f"[automation] STEP: Click '{button_name}' — FAILED, button not found by any method. "
+            f"Last error: {last_err}"
+        )
         raise RuntimeError(
             f"[automation] Button '{button_name}' not found "
             f"by any method. Last error: {last_err}"
@@ -161,49 +324,49 @@ def _click_button(window, button_name: str) -> None:
 
     try:
         ctrl.click_input()
-        logger.info(f"[automation] Clicked '{button_name}'")
+        logger.info(f"[automation] STEP: Click '{button_name}' — OK, click executed")
     except Exception as e:
+        logger.error(f"[automation] STEP: Click '{button_name}' — FAILED on click_input(): {e}")
         raise RuntimeError(
             f"[automation] Click failed on '{button_name}': {e}"
         )
 
 
-# =========================================================
-# Click a button in the topmost dialog of InLine_Pro
-#
-# app.top_window() targets only the InLine_Pro process —
-# dialogs from other apps are never matched.
-# =========================================================
-def _click_dialog_button(app: Application, button_name: str) -> None:
-    wait = _step_wait()
-    logger.info(
-        f"[automation] Waiting {wait}s → clicking dialog '{button_name}'"
-    )
+def _click_dialog_button(app:Application,button_name:str)->None:
+    wait=_step_wait()
+    logger.info(f"[automation] STEP: Click dialog '{button_name}' — waiting {wait}s before click")
     time.sleep(wait)
 
-    # top_window() targets only InLine_Pro dialogs — other apps ignored
-    dialog   = app.top_window()
-    ctrl     = None
-    last_err = None
-
-    for kwargs in [
-        {"title": button_name, "control_type": "Button"},
-        {"title_re": f".*{re.escape(button_name)}.*", "control_type": "Button"},
-        {"title": button_name},
-    ]:
+    dialog=app.top_window()
+    ctrl=None
+    last_err=None
+    attempts = [
+        {"title":button_name,"control_type":"Button"},
+        {"title_re":f".*{re.escape(button_name)}.*","control_type":"Button"},
+        {"title":button_name},
+    ]
+    for n, kwargs in enumerate(attempts, start=1):
+        logger.info(f"[automation] STEP: Click dialog '{button_name}' — trying method {n}/3: {kwargs}")
         try:
-            candidate = dialog.child_window(**kwargs)
-            candidate.wait("visible enabled", timeout=3)
-            ctrl = candidate
+            candidate=dialog.child_window(**kwargs)
+            candidate.wait("visible enabled",timeout=3)
+            ctrl=candidate
             logger.info(
-                f"[automation] Found dialog '{button_name}' with kwargs={kwargs}"
+                f"[automation] STEP: Click dialog '{button_name}' — found via method {n} ({kwargs})"
             )
             break
         except Exception as e:
-            last_err = e
+            last_err=e
+            logger.warning(
+                f"[automation] STEP: Click dialog '{button_name}' — method {n} failed: {e}"
+            )
             continue
 
     if ctrl is None:
+        logger.error(
+            f"[automation] STEP: Click dialog '{button_name}' — FAILED, button not found by any method. "
+            f"Last error: {last_err}"
+        )
         raise RuntimeError(
             f"[automation] Dialog button '{button_name}' not found "
             f"by any method. Last error: {last_err}"
@@ -211,103 +374,113 @@ def _click_dialog_button(app: Application, button_name: str) -> None:
 
     try:
         ctrl.click_input()
-        logger.info(f"[automation] Clicked dialog '{button_name}'")
+        logger.info(f"[automation] STEP: Click dialog '{button_name}' — OK, click executed")
     except Exception as e:
+        logger.error(f"[automation] STEP: Click dialog '{button_name}' — FAILED on click_input(): {e}")
         raise RuntimeError(
             f"[automation] Click failed on dialog '{button_name}': {e}"
         )
 
 
-# =========================================================
-# Full automation sequence for one DL stop
-#
-# Steps:
-#   1. Uncheck building in Data.ini
-#   2. Connect to InLine_Pro.exe (by process name)
-#   3. Find main window (by partial title regex)
-#   4. Stop → SetUp → OK (dialog) → Start → Yes (dialog) → OK (dialog)
-#
-# Retries up to retry_attempts on any step failure.
-# Returns True on success, False after all retries exhausted.
-# =========================================================
-def run_stop_sequence(dl_name: str) -> bool:
-    retries = _retry_attempts()
+def run_stop_sequence(dl_name:str)->bool:
+    """
+    Full stop sequence for a DL:
+    0. Wait for the target Building to show 'Wait' (no board present)
+       — NEW. Prevents stranding a physically-present PCB by
+       unchecking/stopping a building that's still occupied.
+    1. Uncheck building in Data.ini
+    2. Attach to InLine_Pro window
+    3. STOP → SETUP → OK → START → Yes → OK
+    Retries up to retry_attempts times on failure.
+    Every step is logged to main_pc_popup_YYYY-MM-DD.log so an
+    engineer can find the EXACT step that failed.
+    Returns:
+        True  — sequence completed successfully
+        False — all retries failed, OR Step 0 timed out waiting
+                for the building to clear (no retries are spent
+                on a Step-0 timeout — that's not a transient error,
+                retrying immediately won't change a board still
+                being physically present)
+    """
+    retries=_retry_attempts()
 
-    for attempt in range(1, retries + 1):
+    for attempt in range(1,retries+1):
+        logger.info(f"[automation] {'='*60}")
         logger.info(
-            f"[automation] {dl_name} — attempt {attempt}/{retries}"
+            f"[automation] {dl_name} — STARTING stop sequence "
+            f"(attempt {attempt}/{retries})"
         )
+        logger.info(f"[automation] {'='*60}")
         try:
-            # ── Step 1: Edit Data.ini ─────────────────────
-            updated = uncheck_dl(dl_name)
+            logger.info(f"[automation] STEP 0/9: Connect to InLine_Pro (needed early for building check)")
+            app=_connect_to_app()
+            window=_get_main_window(app)
+
+            logger.info(f"[automation] STEP 0/9: Wait for Building to clear before any action")
+            cleared = wait_for_building_clear(dl_name, app, window)
+            if not cleared:
+                logger.error(
+                    f"[automation] {dl_name} — STEP 0/9: building never cleared. "
+                    f"ABORTING — no Data.ini edit, no clicks. Manual intervention required."
+                )
+                return False
+
+            logger.info(f"[automation] STEP 1/9: Edit Data.ini — uncheck {dl_name}")
+            updated=uncheck_dl(dl_name)
             if updated:
                 logger.info(
-                    f"[automation] {dl_name} — Data.ini updated"
+                    f"[automation] STEP 1/9: Edit Data.ini — OK, {dl_name} updated successfully"
                 )
             else:
                 logger.warning(
-                    f"[automation] {dl_name} — Data.ini not updated "
-                    f"(already unchecked or file error)"
+                    f"[automation] STEP 1/9: Edit Data.ini — SKIPPED "
+                    f"({dl_name} already unchecked or error, see ini_editor log above)"
                 )
 
-            # ── Step 2: Connect by EXE process name ───────
-            logger.info(f"[{dl_name}] STEP 2 : Connect To Process")
-            app = _connect_to_app()
+            logger.info(f"[automation] STEP 4/9: Click STOP")
+            _click_button(window,"STOP")
 
-            # ── Step 3: Find main window by partial title ──
-            logger.info(f"[{dl_name}] STEP 3 : Find Main Window")
-            window = _get_main_window(app)
+            logger.info(f"[automation] STEP 5/9: Click SETUP")
+            _click_button(window,'SETUP')
 
-            # ── Step 4: Stop ──────────────────────────────
-            logger.info(f"[{dl_name}] STEP 4 : Click STOP")
-            _click_button(window, "STOP")
+            logger.info(f"[automation] STEP 6/9: Click OK (setup dialog)")
+            _click_dialog_button(app,"OK")
 
-            # ── Step 5: SetUp ─────────────────────────────
-            logger.info(f"[{dl_name}] STEP 5 : Click SETUP")
-            _click_button(window, "SETUP")
+            logger.info(f"[automation] STEP 7/9: Click START")
+            _click_button(window,"START")
 
-            # ── Step 6: OK (SetUp confirmation dialog) ────
-            logger.info(f"[{dl_name}] STEP 6 : Click OK")
-            _click_dialog_button(app, "OK")
+            logger.info(f"[automation] STEP 8/9: Click Yes (start confirmation)")
+            _click_dialog_button(app,'Yes')
 
-            # ── Step 7: Start ─────────────────────────────
-            logger.info(f"[{dl_name}] STEP 7 : Click START")
-            _click_button(window, "START")
-
-            # ── Step 8: Yes (Start confirmation dialog) ───
-            logger.info(f"[{dl_name}] STEP 8 : Click YES")
-            _click_dialog_button(app, "YES")
-
-            # ── Step 9: OK (final dialog) ─────────────────
-            logger.info(f"[{dl_name}] STEP 9 : Click FINAL OK")
-            _click_dialog_button(app, "OK")
+            logger.info(f"[automation] STEP 9/9: Click OK (final dialog)")
+            _click_dialog_button(app,"OK")
 
             logger.info(
-                f"[automation] {dl_name} — sequence completed OK"
+                f"[automation] {dl_name} — ALL STEPS COMPLETED SUCCESSFULLY "
+                f"(attempt {attempt}/{retries})"
             )
+            logger.info(f"[automation] {'='*60}")
             return True
 
         except RuntimeError as e:
             logger.error(
-                f"[automation] {dl_name} — attempt {attempt} failed: {e}"
+                f"[automation] {dl_name} — attempt {attempt} FAILED at the step above: {e}"
             )
-            if attempt < retries:
+            if attempt<retries:
                 logger.info(
-                    f"[automation] {dl_name} — "
-                    f"retrying in {_step_wait()}s..."
+                    f"[automation] {dl_name} — retrying in {_step_wait()}s..."
                 )
                 time.sleep(_step_wait())
-
         except Exception as e:
             logger.error(
-                f"[automation] {dl_name} — "
-                f"unexpected error attempt {attempt}: {e}"
+                f"[automation] {dl_name} — unexpected error on attempt {attempt}: {e}"
             )
-            if attempt < retries:
+            if attempt<retries:
                 time.sleep(_step_wait())
 
     logger.error(
-        f"[automation] {dl_name} — all {retries} attempts failed. "
-        f"Manual intervention required."
+        f"[automation] {dl_name} — ALL {retries} ATTEMPTS FAILED. "
+        f"Manual intervention required. Check STEP lines above for exact failure point."
     )
+    logger.error(f"[automation] {'='*60}")
     return False
