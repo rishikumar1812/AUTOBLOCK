@@ -1,0 +1,213 @@
+Let me look at the screenshots you've shared throughout this conversation to use as the actual project photos.
+
+Here's the content structured for a PPT — copy/paste each slide:
+
+---
+
+**SLIDE 1 — TITLE**
+```
+InLine Pro Automation Upgrade
+Main PC — Automated Stop Sequence with Building Occupancy Check
+[Your Name / Team]
+[Date]
+```
+
+---
+
+**SLIDE 2 — PROJECT OVERVIEW**
+```
+Problem
+• DL PC detects fails → sends STOP signal to Main PC
+• Main PC was unchecking buildings & clicking STOP immediately
+• No check if a PCB was physically present in that building slot
+• Board would get stranded — production loss at full capacity
+
+Solution
+• Added live screen-read gate before any automation action
+• Main PC now waits until Building shows "Wait" before proceeding
+• Fully automated — no operator intervention needed
+```
+
+---
+
+**SLIDE 3 — AS WAS (photo slide)**
+```
+Title: Before — Blind Stop Automation
+
+[INSERT PHOTO: original HMI screenshot — first image you sent,
+showing Building 6 "Not Use", other buildings "Wait"/"Down"]
+
+Caption:
+• DL signal received → immediately uncheck Data.ini → click STOP
+• No awareness of live building status
+• PCB stranded if board was mid-process in that slot
+```
+
+---
+
+**SLIDE 4 — AS WAS FLOW**
+```
+Title: Before — What Could Go Wrong
+
+DL PC detects fails
+        ↓
+Sends STOP signal for DL06
+        ↓
+Main PC immediately unchecks Building 6 in Data.ini
+        ↓
+Clicks: STOP → SETUP → OK → START → Yes → OK
+        ↓
+❌ PCB still physically inside Building 6
+❌ Board never carried forward — stuck permanently
+❌ Manual intervention required — line stops
+```
+
+---
+
+**SLIDE 5 — TO BE (photo slide)**
+
+```
+Title: After — Smart Stop with Occupancy Check
+
+[INSERT PHOTO: test_snap.JPG — the screenshot showing
+buildings with mix of "Down", "Wait", "Testing" states]
+
+Caption:
+• Main PC reads live building status via pywinauto get_value()
+• Waits until target Building shows "Wait" before any action
+• Only then proceeds with Data.ini edit + click sequence
+```
+
+---
+
+**SLIDE 6 — TO BE FLOW**
+```
+Title: After — New Safe Sequence
+
+DL PC detects fails
+        ↓
+Sends STOP signal for DL06
+        ↓
+Main PC reads Building 6 (Front Rack) live status from screen
+        ↓
+"Down" / "Testing" → wait 5s → read again (loop)
+        ↓
+"W a i t" → normalized "Wait" → safe to proceed ✅
+        ↓
+Step 1: Uncheck Building 6 in Data.ini
+        ↓
+STOP → SETUP → OK → START → Yes → OK ✅
+        ↓
+Board safely cleared — zero production loss
+```
+
+---
+
+**SLIDE 7 — HOW IT WORKS (photo slide)**
+```
+Title: Live Screen Reading — pywinauto get_value()
+
+[INSERT PHOTO: test_snap2.JPG — showing full running line
+with multiple "Down" buildings and "Testing" states]
+
+Technical Detail:
+• Front Rack status → Edit control at screen position left=200
+• Rear Rack status → Edit control at screen position left=496
+• DL01–DL10 → Front Rack Buildings 1–10
+• DL11–DL20 → Rear Rack Buildings 1–10
+• Poll every 5 seconds, timeout after 10 minutes → operator alert
+```
+
+---
+
+**SLIDE 8 — SAFEGUARDS**
+```
+Title: Built-in Safety Features
+
+⏱ Timeout protection
+   Gives up after 10 min → logs error → alerts operator
+   Does NOT proceed if building never clears
+
+🔧 Kill switch
+   building_check.enabled = false in config.json
+   Reverts to old behavior instantly, no code redeploy
+
+📋 Full audit log
+   Every step logged to main_pc_popup_YYYY-MM-DD.log
+   Exact failure point visible if anything goes wrong
+
+🔄 Retry logic
+   3 attempts on click sequence failure
+   Step 0 timeout is NOT retried — board still present
+```
+
+---
+
+**SLIDE 9 — DL MAPPING**
+```
+Title: DL → Building Mapping
+
+[INSERT PHOTO: any of the HMI screenshots showing both
+Front Rack and Rear Rack columns side by side]
+
+Front Rack          Rear Rack
+DL01 → Building 1   DL11 → Building 1
+DL02 → Building 2   DL12 → Building 2
+  ...                  ...
+DL06 → Building 6   DL16 → Building 6
+  ...                  ...
+DL10 → Building 10  DL20 → Building 10
+```
+
+---
+
+**SLIDE 10 — RESULTS**
+```
+Title: Outcome
+
+Before                          After
+❌ Boards stranded at           ✅ Zero boards stranded
+   full capacity
+❌ Manual intervention          ✅ Fully automated
+   required
+❌ Silent failure —             ✅ Every step logged
+   no audit trail
+❌ No timeout protection        ✅ Operator alerted
+                                   after 10 min
+❌ Immediate uncheck            ✅ Gate check before
+   regardless of board             any destructive action
+   presence
+```
+
+---
+
+**SLIDE 11 — FILES CHANGED**
+```
+Title: What Was Updated
+
+inline_automation.py    Core change — new wait_for_building_clear()
+                        gate added as Step 0 before all existing steps
+
+config_loader.py        Added building_check section to defaults
+                        (geometry coords, poll interval, timeout)
+
+config.json             New building_check section — all settings
+                        editable without touching code
+
+No changes needed to:
+• main_pc_popup.py  (TCP listener unchanged)
+• network_sender.py (DL PC side unchanged)
+• process_file.py   (fail detection unchanged)
+• ini_editor.py     (Data.ini edit unchanged)
+```
+
+---
+
+**Photo placement guide for each slide:**
+
+| Slide | Photo to use |
+|---|---|
+| 3 | First HMI screenshot (conversation start) |
+| 5 | `test_snap.JPG` |
+| 7 | `test_snap2.JPG` |
+| 9 | `test_snap3.JPG` or first HMI screenshot |
