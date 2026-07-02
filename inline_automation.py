@@ -36,8 +36,35 @@ def _retry_attempts()->int:
 # =========================================================
 # Building occupancy check — config access
 # =========================================================
+
+# Hardcoded fallback used when config.json has no building_check
+# section yet (e.g. old config.json not updated after code deploy).
+# Geometry values confirmed via live diagnostic run on
+# InLine_Pro_Ver 3.1.8.01 — update config.json to override.
+_BC_DEFAULTS = {
+    "enabled": True,
+    "front_label_left": 143,
+    "front_value_left": 200,
+    "rear_label_left": 436,
+    "rear_value_left": 496,
+    "row_top_tolerance_px": 5,
+    "ready_text": "Wait",
+    "poll_interval_sec": 5,
+    "max_wait_sec": 600,
+}
+
 def _bc_cfg() -> dict:
-    return get_config()['building_check']
+    cfg = get_config()
+    if "building_check" not in cfg:
+        logger.warning(
+            "[automation] 'building_check' section missing from config.json "
+            "— using hardcoded defaults. Add it to config.json to customise."
+        )
+        return dict(_BC_DEFAULTS)
+    # Merge: any key missing from config.json falls back to the default
+    result = dict(_BC_DEFAULTS)
+    result.update(cfg["building_check"])
+    return result
 
 def _bc_enabled() -> bool:
     return bool(_bc_cfg().get('enabled', True))
@@ -55,22 +82,50 @@ def _bc_enabled() -> bool:
 # =========================================================
 def dl_to_rack_building(dl_name: str) -> tuple:
     """
-    'DL06' -> ('front', 6)
-    'DL16' -> ('rear', 6)
-    Raises ValueError on bad input, same as ini_editor.dl_to_ini_key.
+    Maps a DL name to (rack, building_num) for screen lookup.
+
+    Handles all real-world formats sent by the DL PC:
+      'DL6'  / 'DL06'  / 'DL 6'  -> ('front', 6)
+      'DL13' / 'DL013' / 'DL 13' -> ('rear',  3)
+
+    building_num is always 1-9 (matches Building 1-9 on screen).
+    Raises ValueError on bad input.
     """
+    name = dl_name.strip()
+    if not name.upper().startswith("DL"):
+        raise ValueError(
+            f"Invalid DL name (must start with 'DL'): {dl_name!r}"
+        )
     try:
-        dl_num = int(dl_name[2:])
+        dl_num = int(name[2:].strip())
     except (ValueError, IndexError):
-        raise ValueError(f"Invalid DL name format: {dl_name}")
+        raise ValueError(
+            f"Invalid DL name (non-numeric suffix): {dl_name!r}"
+        )
 
     if not (1 <= dl_num <= 20):
-        raise ValueError(f"DL number out of range (1-20): {dl_name}")
+        raise ValueError(
+            f"DL number out of range 1-20: {dl_name!r} (parsed as {dl_num})"
+        )
 
     if dl_num <= 10:
-        return "front", dl_num
+        rack = "front"
+        building_num = dl_num
     else:
-        return "rear", dl_num - 10
+        rack = "rear"
+        building_num = dl_num - 10
+
+    # Screen only has Building 1-9. DL10->front-10 and DL20->rear-10
+    # don't exist on screen — catch this early with a clear message
+    # rather than silently searching for "Building 10" and failing.
+    if building_num > 9:
+        raise ValueError(
+            f"{dl_name!r} maps to Building {building_num} on {rack} rack "
+            f"but screen only has Buildings 1-9 "
+            f"(DL10/DL20 are not valid building positions)."
+        )
+
+    return rack, building_num
 
 
 def _connect_to_app()->Application:
@@ -128,36 +183,61 @@ def _get_main_window(app:Application):
 
 
 # =========================================================
-# Building occupancy check — core read logic
-#
-# Confirmed via live diagnostic (test_read_building_status_v2.py)
-# against InLine_Pro_Ver 3.1.8.01:
-#   - Building label = Text control, window_text() == "Building {N}"
-#     Front Rack label sits at left ≈ 143, Rear Rack at left ≈ 436.
-#   - Status value = Edit control in the SAME ROW (same .top, within
-#     a few px tolerance), readable ONLY via .get_value() —
-#     window_text() on these Edit controls returns blank.
-#   - Front Rack value Edit sits at left ≈ 200, Rear Rack at left ≈ 496.
-#   - Live values come back letter-spaced, e.g. "W a i t" — must
-#     strip internal whitespace before comparing.
 # =========================================================
+# Building occupancy check — core read logic
+# =========================================================
+
+def _safe_text(ctrl) -> str:
+    """
+    Safely read window_text() from a pywinauto control.
+    On UIA backend, window_text() can return a bound method
+    instead of a string when the UIA element goes stale mid-walk
+    (window redraws during descendants() iteration).
+    str() cast defends against this — returns empty string on error.
+    """
+    try:
+        val = ctrl.window_text()
+        return str(val).strip() if val is not None else ""
+    except Exception:
+        return ""
+
+
+def _safe_value(ctrl) -> str:
+    """
+    Safely read get_value() from a pywinauto Edit control.
+    Same stale-element guard as _safe_text.
+    Strips internal letter-spacing (e.g. 'W a i t' -> 'Wait').
+    Returns empty string on any failure.
+    """
+    try:
+        val = ctrl.get_value()
+        if val is None:
+            return ""
+        return str(val).replace(" ", "").strip()
+    except Exception:
+        return ""
+
+
 def _find_building_label(window, rack: str, building_num: int):
     """
     Find the Text control for 'Building {N}' on the correct side.
-    There are always 2 matches window-wide (front+rear) for the same
-    title, so we disambiguate by the label's known left x-position
-    rather than relying on child_window()'s title match alone
-    (which raises ElementAmbiguousError with 2+ matches).
+    Two matches exist window-wide (front+rear) for the same title —
+    disambiguate by the label's known left x-position.
+    Uses _safe_text() so stale UIA elements don't crash the walk.
     """
     cfg = _bc_cfg()
     target_left = cfg['front_label_left'] if rack == "front" else cfg['rear_label_left']
     tol = cfg['row_top_tolerance_px']
     title = f"Building {building_num}"
 
-    candidates = [
-        c for c in window.descendants()
-        if (c.window_text() or "").strip() == title
-    ]
+    candidates = []
+    for c in window.descendants():
+        try:
+            if _safe_text(c) == title:
+                candidates.append(c)
+        except Exception:
+            continue
+
     for c in candidates:
         try:
             left = c.rectangle().left
@@ -176,8 +256,9 @@ def _find_building_label(window, rack: str, building_num: int):
 def _read_building_status(window, rack: str, building_num: int) -> str:
     """
     Returns the live status text for the given rack/building,
-    e.g. 'Wait', 'Down', 'Not Use', whitespace-stripped.
-    Raises RuntimeError if the label or its paired value can't be found.
+    e.g. 'Wait', 'Down', 'NotUse', whitespace-stripped.
+    Raises RuntimeError if the label or paired value can't be found.
+    Uses _safe_value() so stale UIA elements don't crash the read.
     """
     cfg = _bc_cfg()
     tol = cfg['row_top_tolerance_px']
@@ -190,16 +271,16 @@ def _read_building_status(window, rack: str, building_num: int) -> str:
         try:
             r = c.rectangle()
             if abs(r.top - label_top) <= tol and abs(r.left - value_left) <= max(tol, 10):
-                raw = c.get_value() or ""
-                return raw.replace(" ", "").strip()
+                return _safe_value(c)
         except Exception:
             continue
 
     raise RuntimeError(
         f"[automation] Found 'Building {building_num}' label on {rack} side "
         f"(top={label_top}) but no matching value Edit control at "
-        f"left≈{value_left}"
+        f"left~{value_left}"
     )
+
 
 
 def wait_for_building_clear(dl_name: str, app: Application, window) -> bool:
