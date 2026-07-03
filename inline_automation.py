@@ -238,18 +238,26 @@ def _find_building_label(window, rack: str, building_num: int):
         except Exception:
             continue
 
+    # Log actual left coords of every candidate so we can see
+    # exactly what value the app is reporting vs what we expect.
+    # This fires on EVERY failed poll — visible in the log.
+    candidate_lefts = []
     for c in candidates:
         try:
             left = c.rectangle().left
+            candidate_lefts.append(left)
             if abs(left - target_left) <= max(tol, 10):
                 return c
         except Exception:
+            candidate_lefts.append("err")
             continue
 
     raise RuntimeError(
         f"[automation] Could not find '{title}' label on {rack} side "
-        f"(expected near left={target_left}, found {len(candidates)} "
-        f"candidate(s) total)"
+        f"(expected near left={target_left}, tolerance={max(tol,10)}px, "
+        f"found {len(candidates)} candidate(s) with actual lefts={candidate_lefts}. "
+        f"If lefts are consistent, update config.json building_check."
+        f"{rack}_label_left to match."
     )
 
 
@@ -530,38 +538,4 @@ def run_stop_sequence(dl_name:str)->bool:
             logger.info(f"[automation] STEP 7/9: Click START")
             _click_button(window,"START")
 
-            logger.info(f"[automation] STEP 8/9: Click Yes (start confirmation)")
-            _click_dialog_button(app,'Yes')
-
-            logger.info(f"[automation] STEP 9/9: Click OK (final dialog)")
-            _click_dialog_button(app,"OK")
-
-            logger.info(
-                f"[automation] {dl_name} — ALL STEPS COMPLETED SUCCESSFULLY "
-                f"(attempt {attempt}/{retries})"
-            )
-            logger.info(f"[automation] {'='*60}")
-            return True
-
-        except RuntimeError as e:
-            logger.error(
-                f"[automation] {dl_name} — attempt {attempt} FAILED at the step above: {e}"
-            )
-            if attempt<retries:
-                logger.info(
-                    f"[automation] {dl_name} — retrying in {_step_wait()}s..."
-                )
-                time.sleep(_step_wait())
-        except Exception as e:
-            logger.error(
-                f"[automation] {dl_name} — unexpected error on attempt {attempt}: {e}"
-            )
-            if attempt<retries:
-                time.sleep(_step_wait())
-
-    logger.error(
-        f"[automation] {dl_name} — ALL {retries} ATTEMPTS FAILED. "
-        f"Manual intervention required. Check STEP lines above for exact failure point."
-    )
-    logger.error(f"[automation] {'='*60}")
-    return False
+            logger.info(f"[automation] STEP 8/9: Click Yes (start confirma
