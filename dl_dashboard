@@ -23,7 +23,7 @@ import pandas as pd
 import threading
 import time
 
-from process_files import read_latest_file, is_today
+from process_file import read_latest_file, is_today
 from stop_tracker  import get_all_stop_times
 from config_loader import get_config, save_config
 
@@ -31,14 +31,14 @@ from config_loader import get_config, save_config
 # Config accessors
 # =========================================================
 def _cfg():                   return get_config()
-def LOG_DIRECTORY()    -> str: return _cfg()["paths"]["log_directory"]
-def LOG_REGISTER_DIR() -> str: return _cfg()["paths"]["log_register_dir"]
-def MAIN_PC_IP()       -> str: return _cfg()["network"]["main_pc_ip"]
+def LOG_DIRECTORY()    -> str: return _cfg()["paths"]["log_dir"]
+def LOG_REGISTER_DIR() -> str: return _cfg()["paths"]["LOG_REG_DIR"]
+def MAIN_PC_IP()       -> str: return _cfg()["network"]["MAIN_PC_IP"]
 def MAIN_PC_PORT()     -> int: return int(_cfg()["network"]["main_pc_port"])
 def PING_TIMEOUT()     -> int: return int(_cfg()["network"]["ping_timeout_sec"])
-def MAX_RECORDS()      -> int: return int(_cfg()["monitor"]["max_records_window"])
+def MAX_RECORDS()      -> int: return int(_cfg()["monitor"]["max_record_window"])
 def DL_COUNT()         -> int: return int(_cfg()["monitor"]["dl_count"])
-def WARN_AT_FAILS()    -> int: return int(_cfg()["thresholds"]["warn_at_fails"])
+def WARN_AT_FAILS()    -> int: return int(_cfg()["thresholds"]["warn_at_fail"])
 def BLOCK_AT_FAILS()   -> int: return int(_cfg()["thresholds"]["block_at_fails"])
 def REFRESH_MS()       -> int: return int(_cfg()["dashboard"]["refresh_interval_ms"])
 def NO_DATA_MINUTES()  -> int: return int(_cfg()["dashboard"].get("no_data_stop_minutes", 60))
@@ -142,26 +142,34 @@ def _status_color(status: str) -> str:
 # Compute DL stats
 # =========================================================
 def compute_dl_stats() -> list:
-    stats    = []
-    dl_files = [[] for _ in range(DL_COUNT())]
-    now      = datetime.now()
-
-    if not os.path.isdir(LOG_DIRECTORY()):
+    directory=LOG_DIRECTORY()
+    now=datetime.now()
+    print("now",type(now))
+    stats=[]
+    files=[os.path.join(directory,f) for f in os.listdir(directory) if f.endswith(".csv")]
+    dl_files=[[] for _ in range(DL_COUNT())]
+    block_threshold=BLOCK_AT_FAILS()
+    print("initalization done")
+    # guard: log directory must exist
+    if not os.path.isdir(directory):
         for i in range(DL_COUNT()):
-            stats.append(_empty_stat(f"DL{i+1:02d}", "STOPPED"))
+            stats.append({
+                "name": f"DL{i+1:02d}", "total": 0, "fails": 0,
+                "rate": 0.0, "status": "NO DIR",
+                "stops_today": 0, "last_stop": "—",
+            })
         return stats
-
-    for fname in os.listdir(LOG_DIRECTORY()):
-        fpath = os.path.join(LOG_DIRECTORY(), fname)
-        if not os.path.isfile(fpath):
-            continue
-        match = re.search(r"DL(\d{2})", fname, re.IGNORECASE)
-        if match and is_today(fpath):
-            idx = int(match.group(1)) - 1
-            if 0 <= idx < DL_COUNT():
-                dl_files[idx].append(fpath)
-
+    print("stats",stats)
+    # print(csv_files)
+    for file in files:
+        key=os.path.basename(file)[-7:-5 ]
+        if is_today(file):
+            index=int(key)-int('01')
+            if 0<=index<len(dl_files):
+                dl_files[index].append(file)
+    print('all_stop_time')
     all_stops = get_all_stop_times()
+    print("all_stop",all_stops)
 
     for i, files in enumerate(dl_files):
         dl_name     = f"DL{i+1:02d}"
@@ -172,6 +180,7 @@ def compute_dl_stats() -> list:
         if raw_stop:
             try:
                 last_stop_ts = datetime.fromisoformat(raw_stop)
+                print("last_stop",last_stop_ts)
             except Exception:
                 pass
 
@@ -193,7 +202,10 @@ def compute_dl_stats() -> list:
 
         combined  = combined.sort_values("Time_stamp").reset_index(drop=True)
         latest_ts = combined["Time_stamp"].max()
+        print("latest_ts\n",type(latest_ts.to_pydatetime()))
+        print("now",type(now))
         minutes_since = (now - latest_ts.to_pydatetime()).total_seconds() / 60
+        print("minutes_since",minutes_since)
 
         if minutes_since >= NO_DATA_MINUTES():
             stats.append({
@@ -240,6 +252,18 @@ def compute_dl_stats() -> list:
         else:
             status = "RUNNING"
 
+        # Last-60 stats — always computed from tail(60) of combined
+        # regardless of active window, so BLOCKED cards can show
+        # the most recent 60 records even when active window is empty.
+        last60      = combined.tail(60)
+        fails_60    = int(last60[last60["RESULT"].str.upper() == "FAIL"].shape[0])
+        rate_60     = (fails_60 / len(last60) * 100) if len(last60) > 0 else 0.0
+
+        # How long has this DL been in BLOCKED state?
+        blocked_since_min = 0
+        if status == "BLOCKED" and last_stop_ts is not None:
+            blocked_since_min = int((now - last_stop_ts).total_seconds() / 60)
+
         stats.append({
             "name": dl_name, "total": total,
             "fails": fails, "rate": rate, "status": status,
@@ -247,6 +271,9 @@ def compute_dl_stats() -> list:
             "last_stop": _last_stop_str(last_stop_ts),
             "last_data": latest_ts.strftime("%H:%M:%S"),
             "minutes_since": int(minutes_since),
+            "fails_60": fails_60,
+            "rate_60": rate_60,
+            "blocked_since_min": blocked_since_min,
         })
 
     return stats
@@ -258,6 +285,7 @@ def _empty_stat(dl_name, status="STOPPED", stops_today=0, last_stop="—"):
         "rate": 0.0, "status": status,
         "stops_today": stops_today, "last_stop": last_stop,
         "last_data": "—", "minutes_since": 0,
+        "fails_60": 0, "rate_60": 0.0, "blocked_since_min": 0,
     }
 
 
@@ -290,16 +318,28 @@ class DetailPopup(tk.Toplevel):
         body = tk.Frame(self, bg=BG_POPUP, padx=24, pady=20)
         body.pack(fill=tk.BOTH, expand=True)
 
+        bmin = stat.get("blocked_since_min", 0)
+        if bmin >= 60:
+            blocked_dur = f"{bmin//60}h {bmin%60:02d}m"
+        else:
+            blocked_dur = f"{bmin}min" if status == "BLOCKED" else "—"
+
+        f60 = stat.get("fails_60", 0)
+        r60 = stat.get("rate_60", 0.0)
+
         rows = [
-            ("Status",          status,                         color),
-            ("Fail Count",      str(stat["fails"]),             color),
-            ("Fail Rate",       f"{stat['rate']:.2f}%",         COL_TEXT),
-            ("Total Records",   str(stat["total"]),             COL_TEXT),
-            ("Last Stop",       stat["last_stop"],              COL_WARN),
-            ("Stops Today",     str(stat["stops_today"]),       COL_TEXT),
-            ("Last Data",       stat.get("last_data", "—"),     COL_TEXT),
-            ("Warn Threshold",  f"≥ {WARN_AT_FAILS()} fails",  COL_WARN),
-            ("Block Threshold", f"≥ {BLOCK_AT_FAILS()} fails", COL_BLOCK),
+            ("Status",          status,                              color),
+            ("Fail Count",      str(stat["fails"]),                  color),
+            ("Fail Rate",       f"{stat['rate']:.2f}%",              COL_TEXT),
+            ("Total Records",   str(stat["total"]),                  COL_TEXT),
+            ("Last Stop",       stat["last_stop"],                   COL_WARN),
+            ("Stops Today",     str(stat["stops_today"]),            COL_TEXT),
+            ("Last Data",       stat.get("last_data", "—"),          COL_TEXT),
+            ("Warn Threshold",  f"≥ {WARN_AT_FAILS()} fails",       COL_WARN),
+            ("Block Threshold", f"≥ {BLOCK_AT_FAILS()} fails",      COL_BLOCK),
+            ("Blocked Duration",blocked_dur,                         COL_BLOCK),
+            ("Last 60 Fails",   str(f60),                           COL_WARN),
+            ("Last 60 Rate",    f"{r60:.2f}%",                      COL_WARN),
         ]
 
         for r, (label, value, val_color) in enumerate(rows):
@@ -394,7 +434,7 @@ class ThresholdEditor(tk.Toplevel):
             messagebox.showerror("Invalid Input", str(e), parent=self)
             return
         cfg = get_config()
-        cfg["thresholds"]["warn_at_fails"]  = warn
+        cfg["thresholds"]["warn_at_fail"]  = warn
         cfg["thresholds"]["block_at_fails"] = block
         save_config(cfg)
         self.on_save()
@@ -449,7 +489,7 @@ class IPEditor(tk.Toplevel):
             messagebox.showerror("Invalid", "IP cannot be empty.", parent=self)
             return
         cfg = get_config()
-        cfg["network"]["main_pc_ip"] = ip
+        cfg["network"]["MAIN_PC_IP"] = ip
         save_config(cfg)
         self.on_save()
         self.destroy()
@@ -702,13 +742,27 @@ class DLDashboard:
         outer.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
         self.grid_frame = tk.Frame(outer, bg=BG_MAIN)
         self.grid_frame.pack(fill=tk.BOTH, expand=True)
-        for c in range(4):
+        for c in range(5):
             self.grid_frame.columnconfigure(c, weight=1)
+
+        # Only these DL numbers get real cards — all others are
+        # empty placeholder frames so positions stay fixed.
+        ACTIVE_DLS = {15, 18, 20}
+
         self.cards = []
-        for i in range(DL_COUNT()):
-            card = self._make_card(self.grid_frame,
-                                   i // 4, i % 4,
-                                   f"DL{i+1:02d}", i)
+        for i in range(20):          # always 20 fixed positions
+            dl_num  = i + 1
+            row     = i // 5
+            col     = i % 5
+            if dl_num in ACTIVE_DLS:
+                card = self._make_card(self.grid_frame, row, col,
+                                       f"DL{dl_num:02d}", i)
+            else:
+                # Empty placeholder — same size as a card, invisible
+                ph = tk.Frame(self.grid_frame, bg=BG_MAIN,
+                              highlightthickness=0)
+                ph.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+                card = None
             self.cards.append(card)
 
     def _make_card(self, parent, row, col, dl_name, index):
@@ -748,12 +802,23 @@ class DLDashboard:
                              bg=BG_CARD, fg=COL_MUTED)
         lbl_last.pack(pady=(4, 0))
 
-        for w in [lbl_fail, lbl_rate, lbl_last]:
+        # BLOCKED-only row — hidden by default, shown when BLOCKED
+        lbl_blocked = tk.Label(frame, text="", font=self.f_sub,
+                               bg=BG_CARD, fg=COL_BLOCK)
+        lbl_blocked.pack(pady=(2, 0))
+
+        # Last-60 stats row — shown when BLOCKED
+        lbl_last60 = tk.Label(frame, text="", font=self.f_sub,
+                               bg=BG_CARD, fg=COL_WARN)
+        lbl_last60.pack(pady=(1, 0))
+
+        for w in [lbl_fail, lbl_rate, lbl_last, lbl_blocked, lbl_last60]:
             w.bind("<Button-1>",
                    lambda e, idx=index: self._open_detail(idx))
 
         return {"frame": frame, "status": lbl_status,
-                "fail": lbl_fail, "rate": lbl_rate, "last": lbl_last}
+                "fail": lbl_fail, "rate": lbl_rate, "last": lbl_last,
+                "blocked": lbl_blocked, "last60": lbl_last60}
 
     # ── Footer ────────────────────────────────────────────
     def _build_footer(self):
@@ -776,6 +841,8 @@ class DLDashboard:
     def _open_detail(self, index: int):
         if not self._last_stats or index >= len(self._last_stats):
             return
+        if index < len(self.cards) and self.cards[index] is None:
+            return   # placeholder slot — no detail to show
         DetailPopup(self.root, self._last_stats[index])
 
     def _open_threshold_editor(self):
@@ -816,7 +883,9 @@ class DLDashboard:
         for i, s in enumerate(stats):
             if i >= len(self.cards):
                 break
-            card   = self.cards[i]
+            card = self.cards[i]
+            if card is None:          # empty placeholder slot — skip
+                continue
             status = s["status"]
             color  = _status_color(status)
 
@@ -842,6 +911,29 @@ class DLDashboard:
                     text=f"last stop: {s['last_stop']}",
                     fg=COL_MUTED,
                 )
+
+            # BLOCKED — show how long blocked + last-60 fail stats
+            if status == "BLOCKED":
+                bmin = s.get("blocked_since_min", 0)
+                if bmin >= 60:
+                    hours = bmin // 60
+                    mins  = bmin % 60
+                    dur   = f"{hours}h {mins:02d}m"
+                else:
+                    dur = f"{bmin}min"
+                card["blocked"].config(
+                    text=f"⛔ BLOCKED {dur}",
+                    fg=COL_BLOCK,
+                )
+                f60   = s.get("fails_60", 0)
+                r60   = s.get("rate_60", 0.0)
+                card["last60"].config(
+                    text=f"last 60: {f60} fails  {r60:.1f}%",
+                    fg=COL_WARN,
+                )
+            else:
+                card["blocked"].config(text="")
+                card["last60"].config(text="")
 
             card["frame"].config(
                 highlightbackground=color if status != "RUNNING" else COL_BORDER,
