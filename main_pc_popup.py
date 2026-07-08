@@ -26,15 +26,18 @@ from datetime import datetime
 from config_loader import get_config
 from ini_editor import uncheck_dl
 from inline_automation import run_stop_sequence
+from log_cleanup import cleanup_old_logs, DailyFileHandler
 
 
 # =========================================================
 # Config accessors
 # =========================================================
-def _listen_host()  -> str: return get_config()["listener"]["host"]
-def _listen_port()  -> int: return int(get_config()["listener"]["port"])
-def _log_dir()      -> str: return get_config()["paths"]["log_dir"]
-def _exe_name()     -> str: return get_config()["app"]["exe_name"]
+def _listen_host()    -> str: return get_config()["listener"]["host"]
+def _listen_port()    -> int: return int(get_config()["listener"]["port"])
+def _ft_listen_port() -> int: return int(get_config()["ft_listener"]["port"])
+def _ft_setup_type()  -> int: return int(get_config()["ft_listener"].get("setup_type", 8))
+def _log_dir()        -> str: return get_config()["paths"]["log_dir"]
+def _exe_name()       -> str: return get_config()["app"]["exe_name"]
 
 
 # =========================================================
@@ -43,16 +46,23 @@ def _exe_name()     -> str: return get_config()["app"]["exe_name"]
 def _setup_logger() -> logging.Logger:
     log_dir = _log_dir()
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "main_pc_popup.log")
+
+    # Delete log files older than 7 days — runs once at startup
+    cleanup_old_logs(log_dir, retention_days=7)
+
     logger = logging.getLogger("main_pc_popup")
     if not logger.handlers:
         logger.setLevel(logging.INFO)
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        fh  = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setFormatter(fmt)
-        sh  = logging.StreamHandler()
-        sh.setFormatter(fmt)
+
+        # DailyFileHandler rolls to a new file at midnight automatically.
+        # This tray app runs 24/7 in the background (root.mainloop()),
+        # so the old fixed-date filename never updated itself — this
+        # handler checks the date on every emit() call instead.
+        fh = DailyFileHandler("main_pc_popup", log_dir, retention_days=7)
         logger.addHandler(fh)
+
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         logger.addHandler(sh)
     return logger
 
@@ -82,6 +92,11 @@ _conn_state = {
     "dl_pc_addr":   None,   # IP of DL PC
 }
 _conn_lock = threading.Lock()
+
+# FT connection state — tracks each FT PC (1-8) separately
+# {ft_number: {"connected": bool, "last_hello": datetime, "addr": str}}
+_ft_conn_states : dict = {}
+_ft_conn_lock = threading.Lock()
 
 
 # =========================================================
@@ -253,6 +268,108 @@ def _start_tcp_listener() -> None:
 
 
 # =========================================================
+# FT map: ft_number + ft_side + setup_type → function label
+# Matches InLine_Pro HMI screen labels exactly.
+# =========================================================
+def _ft_to_function(ft_number: int, ft_side: str, setup_type: int) -> str:
+    """
+    Returns the HMI function label for this FT signal.
+    e.g. FT1 front 8-setup -> 'Function 1'
+         FT5 rear  8-setup -> 'Function 1' (rear rack)
+    """
+    side = ft_side.lower()
+    if setup_type == 8:
+        fn = ft_number if side == "front" else ft_number - 4
+    else:
+        # 6-setup: front=FT1-3, rear=FT4-6
+        fn = ft_number if side == "front" else ft_number - 3
+    return f"Function {fn}"
+
+
+def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
+    """Handle a connection from an FT PC on port 8998."""
+    try:
+        raw     = conn.recv(1024)
+        data    = json.loads(raw.decode("utf-8"))
+        command = data.get("command", "").upper()
+        ft_num  = int(data.get("ft_number", 0))
+        ft_side = data.get("ft_side", "front").lower()
+        stype   = int(data.get("setup_type", 8))
+
+        logger.info(f"[ft_listener] {addr[0]}:{addr[1]} → {command} "
+                    f"FT{ft_num} {ft_side}")
+
+        # ── HELLO handshake ───────────────────────────────
+        if command == "HELLO":
+            _send_response(conn, "ACK", "Connected")
+            with _ft_conn_lock:
+                _ft_conn_states[ft_num] = {
+                    "connected":  True,
+                    "last_hello": datetime.now(),
+                    "addr":       addr[0],
+                    "ft_side":    ft_side,
+                }
+            logger.info(f"[ft_listener] HELLO from FT{ft_num} "
+                        f"({ft_side}) at {addr[0]} — ACK sent")
+
+        # ── STOP command ──────────────────────────────────
+        elif command == "STOP":
+            function_label = data.get("function") or                              _ft_to_function(ft_num, ft_side, stype)
+
+            if not ft_num:
+                _send_response(conn, "ERROR", "Missing ft_number")
+                return
+
+            # Build a unique task key: e.g. "FT1_FRONT_Function 1"
+            task_key = f"FT{ft_num}_{ft_side.upper()}_{function_label}"
+
+            _send_response(conn, "OK",
+                           f"FT stop queued: {task_key}")
+
+            ts = datetime.now().strftime("%H:%M:%S")
+            with _state_lock:
+                _dl_states[task_key] = {"state": "processing", "ts": ts}
+
+            # Queue automation — pass function label as the target
+            # run_stop_sequence handles both DL and FT targets
+            _task_queue.put(task_key)
+            logger.info(f"[ft_listener] {task_key} queued for automation")
+
+        else:
+            _send_response(conn, "ERROR", f"Unknown command: {command}")
+
+    except json.JSONDecodeError as e:
+        logger.error(f"[ft_listener] Bad JSON from {addr}: {e}")
+        _send_response(conn, "ERROR", "Invalid JSON")
+    except Exception as e:
+        logger.error(f"[ft_listener] Error from {addr}: {e}")
+    finally:
+        conn.close()
+
+
+def _start_ft_tcp_listener() -> None:
+    """Second TCP listener on port 8998 — dedicated to FT PCs."""
+    host = _listen_host()
+    port = _ft_listen_port()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((host, port))
+        server.listen(20)
+        logger.info(f"[ft_listener] FT listener on {host}:{port}")
+        while True:
+            try:
+                conn, addr = server.accept()
+                threading.Thread(
+                    target=_handle_ft_connection,
+                    args=(conn, addr),
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                logger.error(f"[ft_listener] Accept error: {e}")
+                time.sleep(1)
+
+
+# =========================================================
 # Toast popup
 # =========================================================
 def show_toast(root: tk.Tk, item: dict) -> None:
@@ -391,6 +508,24 @@ class TrayWindow:
 
         tk.Frame(self.root, bg="#30363d", height=1).pack(fill=tk.X, pady=4)
 
+        # ── FT connection dots ────────────────────────────
+        ft_section = tk.Frame(self.root, bg=BG_MAIN, padx=10, pady=4)
+        ft_section.pack(fill=tk.X)
+        tk.Label(ft_section, text="FT PCs",
+                 font=self.f_small, bg=BG_MAIN,
+                 fg=COL_MUTED).pack(anchor="w")
+        ft_dots_row = tk.Frame(ft_section, bg=BG_MAIN)
+        ft_dots_row.pack(anchor="w")
+        self.ft_dots = {}
+        for n in range(1, 9):   # always show 8 slots; dim unused ones
+            dot = tk.Label(ft_dots_row, text=f"FT{n}",
+                           font=self.f_small, bg=BG_MAIN,
+                           fg=COL_MUTED, padx=3)
+            dot.pack(side=tk.LEFT)
+            self.ft_dots[n] = dot
+
+        tk.Frame(self.root, bg="#30363d", height=1).pack(fill=tk.X, pady=4)
+
         # Listener + queue + app status
         for label_text, attr_name, default, default_color in [
             ("Listener",   "lbl_listener", f"● port {_listen_port()}", COL_OK),
@@ -449,6 +584,7 @@ class TrayWindow:
     # ── Refresh ───────────────────────────────────────────
     def _refresh(self) -> None:
         self._update_conn_status()
+        self._update_ft_dots()
         self._refresh_blocked()
 
         qsize = _task_queue.qsize()
@@ -461,6 +597,32 @@ class TrayWindow:
             text=f"Updated: {datetime.now().strftime('%H:%M:%S')}"
         )
         self.root.after(5000, self._refresh)
+
+    def _update_ft_dots(self) -> None:
+        """Update FT connection dots — green if connected, grey if not."""
+        setup = _ft_setup_type()
+        with _ft_conn_lock:
+            states = dict(_ft_conn_states)
+        for n, dot in self.ft_dots.items():
+            if n > setup:
+                # Beyond this setup's count — dim completely
+                dot.config(fg="#2d333b")
+                continue
+            info = states.get(n, {})
+            if info.get("connected"):
+                last = info.get("last_hello")
+                # Consider disconnected if no HELLO in last 2x heartbeat
+                from ft_config_loader import heartbeat_sec as _hb
+                import ft_config_loader as _ftcfg
+                try:
+                    secs = (datetime.now() - last).total_seconds()
+                    # Grace period: 2 heartbeat intervals
+                    alive = secs < (_ftcfg.heartbeat_sec() * 2 + 60)
+                except Exception:
+                    alive = False
+                dot.config(fg=COL_OK if alive else COL_DISC)
+            else:
+                dot.config(fg=COL_DISC)
 
     def _update_conn_status(self) -> None:
         with _conn_lock:
@@ -609,9 +771,11 @@ if __name__ == "__main__":
         sys.exit(0)
 
     threading.Thread(target=_queue_worker, daemon=True).start()
-    threading.Thread(target=_start_tcp_listener, daemon=True).start()
+    threading.Thread(target=_start_tcp_listener,    daemon=True).start()
+    threading.Thread(target=_start_ft_tcp_listener, daemon=True).start()
 
-    logger.info("[main] Main PC popup started")
+    logger.info("[main] Main PC popup started (DL port=%d, FT port=%d)",
+                _listen_port(), _ft_listen_port())
 
     root = tk.Tk()
     TrayWindow(root)
