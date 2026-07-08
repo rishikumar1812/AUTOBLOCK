@@ -1,0 +1,29 @@
+{
+    "_comment": "FT PC configuration - edit this file, not the python scripts. ft_number and ft_side are fixed once set.",
+    "ft": {
+        "ft_number": 1,
+        "ft_side": "front",
+        "setup_type": 8
+    },
+    "network": {
+        "main_pc_ip": "192.168.0.21",
+        "main_pc_port": 8998,
+        "ping_timeout_sec": 1
+    },
+    "paths": {
+        "log_dir": "C:\\FT\\logs",
+        "log_reg_dir": "C:\\FT\\log_register"
+    },
+    "monitor": {
+        "poll_interval_sec": 30,
+        "max_record_window": 60
+    },
+    "thresholds": {
+        "warn_at_fail": 2,
+        "block_at_fails": 4
+    },
+    "dashboard": {
+        "refresh_interval_ms": 10000,
+        "heartbeat_sec": 1800
+    }
+}
