@@ -471,13 +471,176 @@ def _click_dialog_button(app:Application,button_name:str)->None:
         )
 
 
+# =========================================================
+# FT task key parser
+# task_key format: "FT1_FRONT_Function 1"
+# =========================================================
+def _is_ft_task(task_key: str) -> bool:
+    return task_key.upper().startswith("FT")
+
+
+def _parse_ft_task(task_key: str) -> tuple:
+    """
+    Parse 'FT1_FRONT_Function 1' into (rack, function_num).
+    rack: 'front' or 'rear'
+    function_num: 1-4
+    """
+    parts = task_key.split("_", 2)   # ['FT1', 'FRONT', 'Function 1']
+    if len(parts) < 3:
+        raise ValueError(f"Invalid FT task key: {task_key!r}")
+    rack         = parts[1].lower()        # 'front' or 'rear'
+    function_str = parts[2]               # 'Function 1'
+    try:
+        fn_num = int(function_str.split()[-1])
+    except (ValueError, IndexError):
+        raise ValueError(
+            f"Cannot parse function number from {function_str!r} "
+            f"in task key {task_key!r}"
+        )
+    return rack, fn_num
+
+
+def _find_function_label(window, rack: str, fn_num: int):
+    """
+    Find the Text control for 'Function {N}' on the correct side.
+    Same approach as _find_building_label — disambiguate by x-position.
+    Front Rack function labels sit near left=143,
+    Rear Rack function labels near left=436.
+    """
+    cfg        = _bc_cfg()
+    target_left = (cfg['front_label_left'] if rack == "front"
+                   else cfg['rear_label_left'])
+    tol   = cfg['row_top_tolerance_px']
+    title = f"Function {fn_num}"
+
+    candidates = []
+    for c in window.descendants():
+        try:
+            if _safe_text(c) == title:
+                candidates.append(c)
+        except Exception:
+            continue
+
+    candidate_lefts = []
+    for c in candidates:
+        try:
+            left = c.rectangle().left
+            candidate_lefts.append(left)
+            if abs(left - target_left) <= max(tol, 10):
+                return c
+        except Exception:
+            candidate_lefts.append("err")
+            continue
+
+    raise RuntimeError(
+        f"[automation] Could not find '{title}' label on {rack} side "
+        f"(expected near left={target_left}, tolerance={max(tol,10)}px, "
+        f"found {len(candidates)} candidate(s) with "
+        f"actual lefts={candidate_lefts})"
+    )
+
+
+def _read_function_status(window, rack: str, fn_num: int) -> str:
+    """
+    Read live status text for Function N on the given rack.
+    Same Edit-control pattern as _read_building_status.
+    """
+    cfg        = _bc_cfg()
+    tol        = cfg['row_top_tolerance_px']
+    value_left = (cfg['front_value_left'] if rack == "front"
+                  else cfg['rear_value_left'])
+
+    label     = _find_function_label(window, rack, fn_num)
+    label_top = label.rectangle().top
+
+    for c in window.descendants(control_type="Edit"):
+        try:
+            r = c.rectangle()
+            if (abs(r.top - label_top) <= tol and
+                    abs(r.left - value_left) <= max(tol, 10)):
+                return _safe_value(c)
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        f"[automation] Found 'Function {fn_num}' label on {rack} side "
+        f"(top={label_top}) but no matching value Edit at left~{value_left}"
+    )
+
+
+def wait_for_function_clear(task_key: str, app, window) -> bool:
+    """
+    Polls the HMI screen until Function N on the correct rack
+    shows 'Wait' — same gate logic as wait_for_building_clear
+    but for FT PC signals targeting Function rows.
+    """
+    cfg = _bc_cfg()
+    if not cfg.get('enabled', True):
+        logger.warning(
+            f"[automation] {task_key} — building_check disabled, "
+            f"skipping function check")
+        return True
+
+    try:
+        rack, fn_num = _parse_ft_task(task_key)
+    except ValueError as e:
+        logger.error(f"[automation] {task_key} — {e}")
+        raise RuntimeError(str(e))
+
+    ready_text   = cfg['ready_text'].replace(" ", "").strip()
+    poll_interval = int(cfg['poll_interval_sec'])
+    max_wait     = int(cfg['max_wait_sec'])
+
+    logger.info(
+        f"[automation] {task_key} — STEP 0/9: Wait for Function {fn_num} "
+        f"({rack} rack) to show '{ready_text}' "
+        f"(max wait {max_wait}s, poll every {poll_interval}s)"
+    )
+
+    start    = time.time()
+    last_seen = None
+    while True:
+        try:
+            status = _read_function_status(window, rack, fn_num)
+        except RuntimeError as e:
+            logger.warning(
+                f"[automation] {task_key} — STEP 0/9: read failed: {e}")
+            status = None
+
+        if status is not None and status != last_seen:
+            logger.info(
+                f"[automation] {task_key} — STEP 0/9: "
+                f"Function {fn_num} ({rack}) currently shows '{status}'"
+            )
+            last_seen = status
+
+        if status == ready_text:
+            logger.info(
+                f"[automation] {task_key} — STEP 0/9: "
+                f"Function {fn_num} ({rack}) is '{ready_text}' — OK, proceeding"
+            )
+            return True
+
+        if time.time() - start >= max_wait:
+            logger.error(
+                f"[automation] {task_key} — STEP 0/9: TIMED OUT after "
+                f"{max_wait}s waiting for Function {fn_num} ({rack}) to clear "
+                f"(last seen: '{last_seen}'). NOT proceeding."
+            )
+            return False
+
+        time.sleep(poll_interval)
+
+
 def run_stop_sequence(dl_name:str)->bool:
     """
-    Full stop sequence for a DL:
-    0. Wait for the target Building to show 'Wait' (no board present)
-       — NEW. Prevents stranding a physically-present PCB by
-       unchecking/stopping a building that's still occupied.
-    1. Uncheck building in Data.ini
+    Full stop sequence for a DL or FT task.
+    Accepts either:
+      DL task:  dl_name = 'DL06'
+      FT task:  dl_name = 'FT1_FRONT_Function 1'
+
+    0. Wait for the target Building/Function to show 'Wait'
+    1. Uncheck building in Data.ini  (DL only — FT skips ini edit)
     2. Attach to InLine_Pro window
     3. STOP → SETUP → OK → START → Yes → OK
     Retries up to retry_attempts times on failure.
@@ -501,30 +664,46 @@ def run_stop_sequence(dl_name:str)->bool:
         )
         logger.info(f"[automation] {'='*60}")
         try:
-            logger.info(f"[automation] STEP 0/9: Connect to InLine_Pro (needed early for building check)")
-            app=_connect_to_app()
-            window=_get_main_window(app)
+            is_ft = _is_ft_task(dl_name)
 
-            logger.info(f"[automation] STEP 0/9: Wait for Building to clear before any action")
-            cleared = wait_for_building_clear(dl_name, app, window)
+            logger.info(
+                f"[automation] STEP 0/9: Connect to InLine_Pro "
+                f"({'FT' if is_ft else 'DL'} task: {dl_name})"
+            )
+            app    = _connect_to_app()
+            window = _get_main_window(app)
+
+            # Step 0 — wait for the target slot to clear
+            if is_ft:
+                logger.info(
+                    f"[automation] STEP 0/9: Wait for Function to clear (FT task)")
+                cleared = wait_for_function_clear(dl_name, app, window)
+            else:
+                logger.info(
+                    f"[automation] STEP 0/9: Wait for Building to clear (DL task)")
+                cleared = wait_for_building_clear(dl_name, app, window)
+
             if not cleared:
                 logger.error(
-                    f"[automation] {dl_name} — STEP 0/9: building never cleared. "
-                    f"ABORTING — no Data.ini edit, no clicks. Manual intervention required."
+                    f"[automation] {dl_name} — STEP 0/9: slot never cleared. "
+                    f"ABORTING — no Data.ini edit, no clicks."
                 )
                 return False
 
-            logger.info(f"[automation] STEP 1/9: Edit Data.ini — uncheck {dl_name}")
-            updated=uncheck_dl(dl_name)
-            if updated:
-                logger.info(
-                    f"[automation] STEP 1/9: Edit Data.ini — OK, {dl_name} updated successfully"
-                )
+            # Step 1 — ini edit (DL only)
+            if not is_ft:
+                logger.info(f"[automation] STEP 1/9: Edit Data.ini — uncheck {dl_name}")
+                updated = uncheck_dl(dl_name)
+                if updated:
+                    logger.info(
+                        f"[automation] STEP 1/9: Edit Data.ini — OK")
+                else:
+                    logger.warning(
+                        f"[automation] STEP 1/9: Edit Data.ini — SKIPPED "
+                        f"(already unchecked or error)")
             else:
-                logger.warning(
-                    f"[automation] STEP 1/9: Edit Data.ini — SKIPPED "
-                    f"({dl_name} already unchecked or error, see ini_editor log above)"
-                )
+                logger.info(
+                    f"[automation] STEP 1/9: FT task — skipping Data.ini edit")
 
             logger.info(f"[automation] STEP 4/9: Click STOP")
             _click_button(window,"STOP")
@@ -538,4 +717,38 @@ def run_stop_sequence(dl_name:str)->bool:
             logger.info(f"[automation] STEP 7/9: Click START")
             _click_button(window,"START")
 
-            logger.info(f"[automation] STEP 8/9: Click Yes (start confirma
+            logger.info(f"[automation] STEP 8/9: Click Yes (start confirmation)")
+            _click_dialog_button(app,'Yes')
+
+            logger.info(f"[automation] STEP 9/9: Click OK (final dialog)")
+            _click_dialog_button(app,"OK")
+
+            logger.info(
+                f"[automation] {dl_name} — ALL STEPS COMPLETED SUCCESSFULLY "
+                f"(attempt {attempt}/{retries})"
+            )
+            logger.info(f"[automation] {'='*60}")
+            return True
+
+        except RuntimeError as e:
+            logger.error(
+                f"[automation] {dl_name} — attempt {attempt} FAILED at the step above: {e}"
+            )
+            if attempt<retries:
+                logger.info(
+                    f"[automation] {dl_name} — retrying in {_step_wait()}s..."
+                )
+                time.sleep(_step_wait())
+        except Exception as e:
+            logger.error(
+                f"[automation] {dl_name} — unexpected error on attempt {attempt}: {e}"
+            )
+            if attempt<retries:
+                time.sleep(_step_wait())
+
+    logger.error(
+        f"[automation] {dl_name} — ALL {retries} ATTEMPTS FAILED. "
+        f"Manual intervention required. Check STEP lines above for exact failure point."
+    )
+    logger.error(f"[automation] {'='*60}")
+    return False
