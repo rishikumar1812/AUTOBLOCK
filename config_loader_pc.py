@@ -41,6 +41,12 @@ _DEFAULTS = {
     "dashboard": {
         "hello_toast_minutes": 30,
     },
+    "ft_listener": {
+        # Port Main PC listens on for FT PC signals (separate from DL port 8999)
+        "port":       8998,
+        # How many FT PCs are in this setup (6 or 8) — controls dot display
+        "setup_type": 8,
+    },
     "building_check": {
         # Whether the wait-for-"Wait" gate runs at all before STOP
         # automation. Set false to fall back to old behavior
