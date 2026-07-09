@@ -169,11 +169,43 @@ def _last_stop_str(ts) -> str:
 # =========================================================
 def _status_color(status: str) -> str:
     return {
-        "RUNNING": COL_RUN,
-        "WARNING": COL_WARN,
-        "BLOCKED": COL_BLOCK,
-        "STOPPED": COL_STOP,
+        "RUNNING":   COL_RUN,
+        "WARNING":   COL_WARN,
+        "BLOCKED":   COL_BLOCK,
+        "STOPPED":   COL_STOP,
+        "NOT EXIST": BG_MAIN,
     }.get(status, COL_STOP)
+
+
+# =========================================================
+# DL Existence Registry
+# Persists which DL indices (0-based) have EVER had a CSV.
+# Survives 7-day log cleanup — once seen, always remembered.
+# File: LOG_REG_DIR/dl_existence_registry.json
+# =========================================================
+def _registry_path() -> str:
+    return os.path.join(LOG_REGISTER_DIR(), "dl_existence_registry.json")
+
+
+def _load_registry() -> set:
+    """Return set of DL indices that have ever had a CSV file."""
+    try:
+        if os.path.exists(_registry_path()):
+            with open(_registry_path(), "r", encoding="utf-8") as f:
+                return set(json.load(f).get("exists", []))
+    except Exception:
+        pass
+    return set()
+
+
+def _save_registry(registry: set) -> None:
+    """Persist registry — only called when new DLs discovered."""
+    try:
+        os.makedirs(os.path.dirname(_registry_path()), exist_ok=True)
+        with open(_registry_path(), "w", encoding="utf-8") as f:
+            json.dump({"exists": sorted(registry)}, f)
+    except Exception as e:
+        print(f"[registry] Failed to save: {e}")
 
 
 # =========================================================
@@ -199,12 +231,28 @@ def compute_dl_stats() -> list:
         return stats
     print("stats",stats)
     # print(csv_files)
+    # ── Existence registry — persistent across 7-day log cleanup ──
+    registry   = _load_registry()
+    newly_seen = set()
     for file in files:
-        key=os.path.basename(file)[-7:-5 ]
-        if is_today(file):
-            index=int(key)-int('01')
-            if 0<=index<len(dl_files):
-                dl_files[index].append(file)
+        key = os.path.basename(file)[-7:-5]
+        try:
+            index = int(key) - 1
+            if 0 <= index < DL_COUNT():
+                newly_seen.add(index)
+            if is_today(file):
+                if 0 <= index < len(dl_files):
+                    dl_files[index].append(file)
+        except ValueError:
+            continue
+
+    # Persist any newly discovered DLs
+    if newly_seen - registry:
+        registry = registry | newly_seen
+        _save_registry(registry)
+    else:
+        registry = registry | newly_seen
+
     print('all_stop_time')
     all_stops = get_all_stop_times()
     print("all_stop",all_stops)
@@ -223,8 +271,14 @@ def compute_dl_stats() -> list:
                 pass
 
         if not files:
-            stats.append(_empty_stat(dl_name, "STOPPED",
-                                     stops_today, _last_stop_str(last_stop_ts)))
+            # DL does not exist if never seen in registry AND no stop record
+            dl_exists = (i in registry) or (stop_entry != {})
+            if not dl_exists:
+                stats.append(_empty_stat(dl_name, "NOT EXIST",
+                                         stops_today, _last_stop_str(last_stop_ts)))
+            else:
+                stats.append(_empty_stat(dl_name, "STOPPED",
+                                         stops_today, _last_stop_str(last_stop_ts)))
             continue
 
         combined = pd.DataFrame()
@@ -246,6 +300,9 @@ def compute_dl_stats() -> list:
         print("minutes_since",minutes_since)
 
         if minutes_since >= NO_DATA_MINUTES():
+            last60_s   = combined.tail(60)
+            fails_60_s = int(last60_s[last60_s["RESULT"].str.upper() == "FAIL"].shape[0])
+            rate_60_s  = (fails_60_s / len(last60_s) * 100) if len(last60_s) > 0 else 0.0
             stats.append({
                 "name": dl_name, "total": len(combined),
                 "fails": 0, "rate": 0.0, "status": "STOPPED",
@@ -253,6 +310,8 @@ def compute_dl_stats() -> list:
                 "last_stop": _last_stop_str(last_stop_ts),
                 "last_data": latest_ts.strftime("%H:%M:%S"),
                 "minutes_since": int(minutes_since),
+                "fails_60": fails_60_s, "rate_60": rate_60_s,
+                "blocked_since_min": 0,
             })
             continue
 
@@ -266,14 +325,23 @@ def compute_dl_stats() -> list:
 
         total = len(active)
         if total == 0:
+            last60_z   = combined.tail(60)
+            fails_60_z = int(last60_z[last60_z["RESULT"].str.upper() == "FAIL"].shape[0])
+            rate_60_z  = (fails_60_z / len(last60_z) * 100) if len(last60_z) > 0 else 0.0
+            bmin_z     = 0
+            z_status   = "BLOCKED" if last_stop_ts else "RUNNING"
+            if z_status == "BLOCKED" and last_stop_ts:
+                bmin_z = int((now - last_stop_ts).total_seconds() / 60)
             stats.append({
                 "name": dl_name, "total": 0,
                 "fails": 0, "rate": 0.0,
-                "status": "BLOCKED" if last_stop_ts else "RUNNING",
+                "status": z_status,
                 "stops_today": stops_today,
                 "last_stop": _last_stop_str(last_stop_ts),
                 "last_data": latest_ts.strftime("%H:%M:%S"),
                 "minutes_since": int(minutes_since),
+                "fails_60": fails_60_z, "rate_60": rate_60_z,
+                "blocked_since_min": bmin_z,
             })
             continue
 
@@ -924,6 +992,8 @@ class DLDashboard:
     def _open_detail(self, index: int):
         if not self._last_stats or index >= len(self._last_stats):
             return
+        if self._last_stats[index].get("status") == "NOT EXIST":
+            return   # hidden card — nothing to show
         DetailPopup(self.root, self._last_stats[index])
 
     def _open_threshold_editor(self):
@@ -966,7 +1036,16 @@ class DLDashboard:
                 break
             card   = self.cards[i]
             status = s["status"]
-            color  = _status_color(status)
+
+            # NOT EXIST — hide the card frame completely,
+            # exclude from all summary counts
+            if status == "NOT EXIST":
+                card["frame"].grid_remove()
+                continue
+
+            # Exists — ensure visible (may have been hidden before)
+            card["frame"].grid()
+            color = _status_color(status)
 
             if   status == "RUNNING": run_c   += 1
             elif status == "WARNING": warn_c  += 1
