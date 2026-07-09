@@ -27,6 +27,35 @@ from process_file import read_latest_file, is_today
 from stop_tracker  import get_all_stop_times
 from config_loader import get_config, save_config
 
+
+# =========================================================
+# Responsive scaling helpers
+# All sizes derived from screen height so the dashboard
+# looks correct on 1080p, 768p, 4K, etc without manual
+# config changes.
+# =========================================================
+def _screen_scale(root: tk.Tk) -> float:
+    """
+    Returns a scale factor relative to a 1080p baseline.
+    1080p  → 1.0
+    768p   → 0.71
+    1440p  → 1.33
+    4K     → 2.0
+    Clamped to 0.6–2.0 so tiny/huge screens stay usable.
+    """
+    sh = root.winfo_screenheight()
+    return max(0.6, min(2.0, sh / 1080))
+
+
+def _fs(base: int, scale: float) -> int:
+    """Scale a font size, minimum 7pt so text stays readable."""
+    return max(7, round(base * scale))
+
+
+def _pad(base: int, scale: float) -> int:
+    """Scale a padding value, minimum 1px."""
+    return max(1, round(base * scale))
+
 # =========================================================
 # Config accessors
 # =========================================================
@@ -43,41 +72,6 @@ def BLOCK_AT_FAILS()   -> int: return int(_cfg()["thresholds"]["block_at_fails"]
 def REFRESH_MS()       -> int: return int(_cfg()["dashboard"]["refresh_interval_ms"])
 def NO_DATA_MINUTES()  -> int: return int(_cfg()["dashboard"].get("no_data_stop_minutes", 60))
 def HEARTBEAT_SEC()    -> int: return int(_cfg()["dashboard"].get("heartbeat_sec", 30))
-
-# =========================================================
-# DL Existence Registry
-# Persists which DL numbers have EVER had a CSV file.
-# Survives log cleanup (7-day deletion) — once a DL is seen
-# it is permanently recorded as existing.
-# Stored in LOG_REG_DIR/dl_existence_registry.json
-# =========================================================
-def _registry_path() -> str:
-    return os.path.join(LOG_REGISTER_DIR(), "dl_existence_registry.json")
-
-
-def load_existence_registry() -> set:
-    """Return set of DL indices (0-based) that have ever had a CSV."""
-    path = _registry_path()
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return set(data.get("exists", []))
-    except Exception:
-        pass
-    return set()
-
-
-def save_existence_registry(registry: set) -> None:
-    """Persist the registry — only writes if new entries were added."""
-    path = _registry_path()
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"exists": sorted(registry)}, f)
-    except Exception as e:
-        print(f"[existence_registry] Failed to save: {e}")
-
 
 # =========================================================
 # Colors
@@ -153,10 +147,19 @@ def get_stop_count_today(dl_name: str) -> int:
 
 
 def _last_stop_str(ts) -> str:
+    """
+    Format last stop timestamp.
+    Same day  → "14:32:07"
+    Different day → "Jun 24  14:32:07"  (date shown so operator knows it was yesterday/older)
+    """
     if ts is None:
         return "—"
     try:
-        return pd.Timestamp(ts).strftime("%H:%M:%S")
+        t = pd.Timestamp(ts)
+        if t.date() == date.today():
+            return t.strftime("%H:%M:%S")
+        else:
+            return t.strftime("%b %d  %H:%M:%S")
     except Exception:
         return str(ts)
 
@@ -166,11 +169,10 @@ def _last_stop_str(ts) -> str:
 # =========================================================
 def _status_color(status: str) -> str:
     return {
-        "RUNNING":   COL_RUN,
-        "WARNING":   COL_WARN,
-        "BLOCKED":   COL_BLOCK,
-        "STOPPED":   COL_STOP,
-        "NOT EXIST": BG_MAIN,
+        "RUNNING": COL_RUN,
+        "WARNING": COL_WARN,
+        "BLOCKED": COL_BLOCK,
+        "STOPPED": COL_STOP,
     }.get(status, COL_STOP)
 
 
@@ -197,31 +199,12 @@ def compute_dl_stats() -> list:
         return stats
     print("stats",stats)
     # print(csv_files)
-    # Load persistent existence registry — survives 7-day log cleanup.
-    # Any DL that has EVER had a CSV file is recorded here permanently.
-    dl_ever_existed = load_existence_registry()
-    newly_seen      = set()
-
     for file in files:
-        key = os.path.basename(file)[-7:-5]
-        try:
-            index = int(key) - 1
-            if 0 <= index < DL_COUNT():
-                # Mark as seen this scan — will be merged into registry below
-                newly_seen.add(index)
-            if is_today(file):
-                if 0 <= index < len(dl_files):
-                    dl_files[index].append(file)
-        except ValueError:
-            continue
-
-    # Persist any newly discovered DLs into the registry
-    if newly_seen - dl_ever_existed:
-        dl_ever_existed = dl_ever_existed | newly_seen
-        save_existence_registry(dl_ever_existed)
-    else:
-        dl_ever_existed = dl_ever_existed | newly_seen
-
+        key=os.path.basename(file)[-7:-5 ]
+        if is_today(file):
+            index=int(key)-int('01')
+            if 0<=index<len(dl_files):
+                dl_files[index].append(file)
     print('all_stop_time')
     all_stops = get_all_stop_times()
     print("all_stop",all_stops)
@@ -240,16 +223,8 @@ def compute_dl_stats() -> list:
                 pass
 
         if not files:
-            # DL doesn't exist if it has no CSV file ever AND no stop record.
-            # An operator would never generate a stop record for a non-existent
-            # DL, so both being absent means this slot is genuinely empty.
-            dl_exists = (i in dl_ever_existed) or (stop_entry != {})
-            if not dl_exists:
-                stats.append(_empty_stat(dl_name, "NOT EXIST",
-                                         stops_today, _last_stop_str(last_stop_ts)))
-            else:
-                stats.append(_empty_stat(dl_name, "STOPPED",
-                                         stops_today, _last_stop_str(last_stop_ts)))
+            stats.append(_empty_stat(dl_name, "STOPPED",
+                                     stops_today, _last_stop_str(last_stop_ts)))
             continue
 
         combined = pd.DataFrame()
@@ -315,17 +290,16 @@ def compute_dl_stats() -> list:
         else:
             status = "RUNNING"
 
-        # Last-60 stats — always computed from tail(60) of combined
-        # regardless of active window, so BLOCKED cards can show
-        # the most recent 60 records even when active window is empty.
-        last60      = combined.tail(60)
-        fails_60    = int(last60[last60["RESULT"].str.upper() == "FAIL"].shape[0])
-        rate_60     = (fails_60 / len(last60) * 100) if len(last60) > 0 else 0.0
+        # Last-60 stats from full combined data
+        last60   = combined.tail(60)
+        fails_60 = int(last60[last60["RESULT"].str.upper() == "FAIL"].shape[0])
+        rate_60  = (fails_60 / len(last60) * 100) if len(last60) > 0 else 0.0
 
-        # How long has this DL been in BLOCKED state?
+        # How long has this DL been blocked
         blocked_since_min = 0
         if status == "BLOCKED" and last_stop_ts is not None:
-            blocked_since_min = int((now - last_stop_ts).total_seconds() / 60)
+            blocked_since_min = int(
+                (now - last_stop_ts).total_seconds() / 60)
 
         stats.append({
             "name": dl_name, "total": total,
@@ -381,28 +355,16 @@ class DetailPopup(tk.Toplevel):
         body = tk.Frame(self, bg=BG_POPUP, padx=24, pady=20)
         body.pack(fill=tk.BOTH, expand=True)
 
-        bmin = stat.get("blocked_since_min", 0)
-        if bmin >= 60:
-            blocked_dur = f"{bmin//60}h {bmin%60:02d}m"
-        else:
-            blocked_dur = f"{bmin}min" if status == "BLOCKED" else "—"
-
-        f60 = stat.get("fails_60", 0)
-        r60 = stat.get("rate_60", 0.0)
-
         rows = [
-            ("Status",          status,                              color),
-            ("Fail Count",      str(stat["fails"]),                  color),
-            ("Fail Rate",       f"{stat['rate']:.2f}%",              COL_TEXT),
-            ("Total Records",   str(stat["total"]),                  COL_TEXT),
-            ("Last Stop",       stat["last_stop"],                   COL_WARN),
-            ("Stops Today",     str(stat["stops_today"]),            COL_TEXT),
-            ("Last Data",       stat.get("last_data", "—"),          COL_TEXT),
-            ("Warn Threshold",  f"≥ {WARN_AT_FAILS()} fails",       COL_WARN),
-            ("Block Threshold", f"≥ {BLOCK_AT_FAILS()} fails",      COL_BLOCK),
-            ("Blocked Duration",blocked_dur,                         COL_BLOCK),
-            ("Last 60 Fails",   str(f60),                           COL_WARN),
-            ("Last 60 Rate",    f"{r60:.2f}%",                      COL_WARN),
+            ("Status",          status,                         color),
+            ("Fail Count",      str(stat["fails"]),             color),
+            ("Fail Rate",       f"{stat['rate']:.2f}%",         COL_TEXT),
+            ("Total Records",   str(stat["total"]),             COL_TEXT),
+            ("Last Stop",       stat["last_stop"],              COL_WARN),
+            ("Stops Today",     str(stat["stops_today"]),       COL_TEXT),
+            ("Last Data",       stat.get("last_data", "—"),     COL_TEXT),
+            ("Warn Threshold",  f"≥ {WARN_AT_FAILS()} fails",  COL_WARN),
+            ("Block Threshold", f"≥ {BLOCK_AT_FAILS()} fails", COL_BLOCK),
         ]
 
         for r, (label, value, val_color) in enumerate(rows):
@@ -571,15 +533,23 @@ class DLDashboard:
         self._last_stats   = []
         self._conn_state   = CONN_CHECKING
         self._conn_detail  = ""
-        self._hb_after_id  = None   # heartbeat timer id
+        self._hb_after_id  = None
 
-        self.f_title  = tkfont.Font(family="Consolas", size=15, weight="bold")
-        self.f_name   = tkfont.Font(family="Consolas", size=11, weight="bold")
-        self.f_val    = tkfont.Font(family="Consolas", size=10)
-        self.f_status = tkfont.Font(family="Consolas", size=8,  weight="bold")
-        self.f_sub    = tkfont.Font(family="Consolas", size=8)
-        self.f_time   = tkfont.Font(family="Consolas", size=8)
-        self.f_conn   = tkfont.Font(family="Consolas", size=9,  weight="bold")
+        # ── Responsive scaling ────────────────────────────
+        # Compute once at startup from screen resolution.
+        # Rebuild fonts/grid if window is resized significantly.
+        self._scale        = _screen_scale(root)
+        self._last_scale   = self._scale
+        self._rebuild_id   = None
+        self._init_fonts()
+
+        # Set initial window size as % of screen
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        w  = int(sw * 0.85)
+        h  = int(sh * 0.88)
+        root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+        root.minsize(int(sw * 0.5), int(sh * 0.5))
 
         self._build_header()
         self._build_conn_bar()
@@ -587,9 +557,52 @@ class DLDashboard:
         self._build_grid()
         self._build_footer()
 
-        # Start handshake immediately in background
+        # Bind resize — debounced rebuild
+        root.bind("<Configure>", self._on_resize)
+
         self._start_handshake()
         self.refresh()
+
+    def _init_fonts(self):
+        s = self._scale
+        self.f_title  = tkfont.Font(family="Consolas", size=_fs(15, s), weight="bold")
+        self.f_name   = tkfont.Font(family="Consolas", size=_fs(11, s), weight="bold")
+        self.f_val    = tkfont.Font(family="Consolas", size=_fs(10, s))
+        self.f_status = tkfont.Font(family="Consolas", size=_fs(8,  s), weight="bold")
+        self.f_sub    = tkfont.Font(family="Consolas", size=_fs(8,  s))
+        self.f_time   = tkfont.Font(family="Consolas", size=_fs(8,  s))
+        self.f_conn   = tkfont.Font(family="Consolas", size=_fs(9,  s), weight="bold")
+
+    def _on_resize(self, event):
+        """
+        Debounced resize handler — only triggers a full grid rebuild
+        when the window width changes enough to warrant it
+        (avoids rebuilding on every pixel drag).
+        Fonts are updated in-place; grid is rebuilt only if scale changed.
+        """
+        if event.widget is not self.root:
+            return
+        new_scale = max(0.6, min(2.0, event.height / 1080))
+        # Only rebuild if scale changed by more than 5%
+        if abs(new_scale - self._last_scale) < 0.05:
+            return
+        self._last_scale = new_scale
+        self._scale      = new_scale
+        if self._rebuild_id:
+            self.root.after_cancel(self._rebuild_id)
+        # Debounce — wait 300ms after last resize event before rebuilding
+        self._rebuild_id = self.root.after(300, self._rebuild_grid)
+
+    def _rebuild_grid(self):
+        """Destroy and recreate the card grid with updated fonts/padding."""
+        self._init_fonts()
+        # Destroy old grid
+        if hasattr(self, '_grid_outer'):
+            self._grid_outer.destroy()
+        self._build_grid()
+        # Re-apply last known stats so cards show data immediately
+        if self._last_stats:
+            self._update_ui(self._last_stats)
 
     # ── Header ────────────────────────────────────────────
     def _build_header(self):
@@ -801,33 +814,41 @@ class DLDashboard:
 
     # ── Card grid ─────────────────────────────────────────
     def _build_grid(self):
+        s = self._scale
+        px = _pad(16, s)
+        py = _pad(8,  s)
         outer = tk.Frame(self.root, bg=BG_MAIN)
-        outer.pack(fill=tk.BOTH, expand=True, padx=16, pady=8)
+        outer.pack(fill=tk.BOTH, expand=True, padx=px, pady=py)
+        self._grid_outer = outer   # saved so _rebuild_grid can destroy it
         self.grid_frame = tk.Frame(outer, bg=BG_MAIN)
         self.grid_frame.pack(fill=tk.BOTH, expand=True)
         for c in range(5):
             self.grid_frame.columnconfigure(c, weight=1)
-
-        # Cards are created for all DL_COUNT() positions upfront.
-        # Which ones render as real vs placeholder is decided at
-        # refresh time based on "NOT EXIST" status from compute_dl_stats().
-        # This way adding/removing DLs from the line just requires
-        # CSV files to appear/disappear — no code or config change needed.
+        n_rows = (DL_COUNT() + 4) // 5
+        for r in range(n_rows):
+            self.grid_frame.rowconfigure(r, weight=1)
         self.cards = []
         for i in range(DL_COUNT()):
-            row = i // 5
-            col = i % 5
-            card = self._make_card(self.grid_frame, row, col,
+            card = self._make_card(self.grid_frame,
+                                   i // 5, i % 5,
                                    f"DL{i+1:02d}", i)
             self.cards.append(card)
 
     def _make_card(self, parent, row, col, dl_name, index):
-        frame = tk.Frame(parent, bg=BG_CARD, padx=10, pady=8,
+        s    = self._scale
+        cpx  = _pad(6, s)   # card padx
+        cpy  = _pad(4, s)   # card pady
+        gpx  = _pad(4, s)   # grid padx
+        gpy  = _pad(4, s)   # grid pady
+        sep  = _pad(3, s)   # separator pady
+
+        frame = tk.Frame(parent, bg=BG_CARD, padx=cpx, pady=cpy,
                          highlightbackground=COL_BORDER,
                          highlightthickness=1, cursor="hand2")
-        frame.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
+        frame.grid(row=row, column=col, padx=gpx, pady=gpy, sticky="nsew")
         frame.bind("<Button-1>", lambda e, idx=index: self._open_detail(idx))
 
+        # Row 1: DL name + status badge
         top = tk.Frame(frame, bg=BG_CARD)
         top.pack(fill=tk.X)
         top.bind("<Button-1>", lambda e, idx=index: self._open_detail(idx))
@@ -837,44 +858,50 @@ class DLDashboard:
                  cursor="hand2").pack(side=tk.LEFT)
 
         lbl_status = tk.Label(top, text="RUNNING", font=self.f_status,
-                               bg=COL_RUN, fg=BG_MAIN, padx=6, pady=1)
+                               bg=COL_RUN, fg=BG_MAIN,
+                               padx=_pad(5, s), pady=1)
         lbl_status.pack(side=tk.RIGHT)
 
-        tk.Frame(frame, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
+        tk.Frame(frame, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=sep)
 
+        # Row 2: last-60 stats at top
+        row2 = tk.Frame(frame, bg=BG_CARD)
+        row2.pack(fill=tk.X)
+        lbl_60_label = tk.Label(row2, text="last 60:",
+                                 font=self.f_sub, bg=BG_CARD, fg=COL_MUTED)
+        lbl_60_label.pack(side=tk.LEFT)
+        lbl_fail60 = tk.Label(row2, text="0 fails  0.0%",
+                               font=self.f_sub, bg=BG_CARD, fg=COL_TEXT)
+        lbl_fail60.pack(side=tk.LEFT, padx=(_pad(4, s), 0))
+
+        tk.Frame(frame, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=sep)
+
+        # Row 3: current cycle fails + rate
         lbl_fail = tk.Label(frame, text="0", font=self.f_name,
                              bg=BG_CARD, fg=COL_RUN, cursor="hand2")
         lbl_fail.pack()
-        tk.Label(frame, text="fails this cycle", font=self.f_sub,
-                 bg=BG_CARD, fg=COL_MUTED).pack()
-
-        lbl_rate = tk.Label(frame, text="0.00%", font=self.f_val,
+        lbl_rate = tk.Label(frame, text="0.00%", font=self.f_sub,
                              bg=BG_CARD, fg=COL_TEXT)
         lbl_rate.pack()
-        tk.Label(frame, text="fail rate", font=self.f_sub,
-                 bg=BG_CARD, fg=COL_MUTED).pack()
 
-        lbl_last = tk.Label(frame, text="last stop: —", font=self.f_sub,
-                             bg=BG_CARD, fg=COL_MUTED)
-        lbl_last.pack(pady=(4, 0))
+        # Row 4: last stop with date
+        lbl_last = tk.Label(frame, text="stop: —",
+                             font=self.f_sub, bg=BG_CARD, fg=COL_MUTED)
+        lbl_last.pack(pady=(_pad(3, s), 0))
 
-        # BLOCKED-only row — hidden by default, shown when BLOCKED
-        lbl_blocked = tk.Label(frame, text="", font=self.f_sub,
-                               bg=BG_CARD, fg=COL_BLOCK)
-        lbl_blocked.pack(pady=(2, 0))
+        # Row 5: blocked duration
+        lbl_blocked = tk.Label(frame, text="",
+                                font=self.f_sub, bg=BG_CARD, fg=COL_BLOCK)
+        lbl_blocked.pack()
 
-        # Last-60 stats row — shown when BLOCKED
-        lbl_last60 = tk.Label(frame, text="", font=self.f_sub,
-                               bg=BG_CARD, fg=COL_WARN)
-        lbl_last60.pack(pady=(1, 0))
-
-        for w in [lbl_fail, lbl_rate, lbl_last, lbl_blocked, lbl_last60]:
+        for w in [lbl_fail, lbl_rate, lbl_last, lbl_fail60,
+                  lbl_blocked, lbl_60_label]:
             w.bind("<Button-1>",
                    lambda e, idx=index: self._open_detail(idx))
 
         return {"frame": frame, "status": lbl_status,
                 "fail": lbl_fail, "rate": lbl_rate, "last": lbl_last,
-                "blocked": lbl_blocked, "last60": lbl_last60}
+                "fail60": lbl_fail60, "blocked": lbl_blocked}
 
     # ── Footer ────────────────────────────────────────────
     def _build_footer(self):
@@ -897,8 +924,6 @@ class DLDashboard:
     def _open_detail(self, index: int):
         if not self._last_stats or index >= len(self._last_stats):
             return
-        if self._last_stats[index].get("status") == "NOT EXIST":
-            return   # hidden card — no detail to show
         DetailPopup(self.root, self._last_stats[index])
 
     def _open_threshold_editor(self):
@@ -941,16 +966,7 @@ class DLDashboard:
                 break
             card   = self.cards[i]
             status = s["status"]
-
-            # Non-existent DL — hide the card frame entirely,
-            # don't count it in any summary total.
-            if status == "NOT EXIST":
-                card["frame"].grid_remove()
-                continue
-
-            # Exists but may have been hidden previously — ensure visible
-            card["frame"].grid()
-            color = _status_color(status)
+            color  = _status_color(status)
 
             if   status == "RUNNING": run_c   += 1
             elif status == "WARNING": warn_c  += 1
@@ -964,6 +980,18 @@ class DLDashboard:
             card["fail"].config(text=str(s["fails"]), fg=color)
             card["rate"].config(text=f"{s['rate']:.2f}%")
 
+            # Last-60 row at top of card
+            f60 = s.get("fails_60", 0)
+            r60 = s.get("rate_60", 0.0)
+            f60_color = (COL_BLOCK if f60 >= BLOCK_AT_FAILS()
+                         else COL_WARN if f60 >= WARN_AT_FAILS()
+                         else COL_TEXT)
+            card["fail60"].config(
+                text=f"{f60} fails  {r60:.1f}%",
+                fg=f60_color,
+            )
+
+            # Last stop with date
             if status == "STOPPED" and s.get("minutes_since", 0) > 0:
                 card["last"].config(
                     text=f"no data {s['minutes_since']}min ago",
@@ -971,32 +999,19 @@ class DLDashboard:
                 )
             else:
                 card["last"].config(
-                    text=f"last stop: {s['last_stop']}",
+                    text=f"stop: {s['last_stop']}",
                     fg=COL_MUTED,
                 )
 
-            # BLOCKED — show how long blocked + last-60 fail stats
+            # Blocked duration row
             if status == "BLOCKED":
                 bmin = s.get("blocked_since_min", 0)
-                if bmin >= 60:
-                    hours = bmin // 60
-                    mins  = bmin % 60
-                    dur   = f"{hours}h {mins:02d}m"
-                else:
-                    dur = f"{bmin}min"
+                dur  = (f"{bmin//60}h {bmin%60:02d}m"
+                        if bmin >= 60 else f"{bmin}min")
                 card["blocked"].config(
-                    text=f"⛔ BLOCKED {dur}",
-                    fg=COL_BLOCK,
-                )
-                f60   = s.get("fails_60", 0)
-                r60   = s.get("rate_60", 0.0)
-                card["last60"].config(
-                    text=f"last 60: {f60} fails  {r60:.1f}%",
-                    fg=COL_WARN,
-                )
+                    text=f"⛔ {dur}", fg=COL_BLOCK)
             else:
                 card["blocked"].config(text="")
-                card["last60"].config(text="")
 
             card["frame"].config(
                 highlightbackground=color if status != "RUNNING" else COL_BORDER,
@@ -1018,11 +1033,7 @@ class DLDashboard:
 # Entry point
 # =========================================================
 if __name__ == "__main__":
-    cfg  = get_config()
     root = tk.Tk()
-    root.geometry(
-        f"{cfg['dashboard']['window_width']}x{cfg['dashboard']['window_height']}"
-    )
-    root.minsize(800, 560)
+    # DLDashboard.__init__ sets geometry from screen resolution
     DLDashboard(root)
     root.mainloop()
