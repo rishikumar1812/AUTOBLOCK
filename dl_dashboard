@@ -423,25 +423,50 @@ class DetailPopup(tk.Toplevel):
         body = tk.Frame(self, bg=BG_POPUP, padx=24, pady=20)
         body.pack(fill=tk.BOTH, expand=True)
 
+        f60  = stat.get("fails_60", 0)
+        r60  = stat.get("rate_60", 0.0)
+        bmin = stat.get("blocked_since_min", 0)
+        f60_color = (COL_BLOCK if f60 >= BLOCK_AT_FAILS()
+                     else COL_WARN if f60 >= WARN_AT_FAILS()
+                     else COL_RUN)
+        blocked_dur = (f"{bmin//60}h {bmin%60:02d}m"
+                       if bmin >= 60 else f"{bmin}min") if status == "BLOCKED" else "—"
+
         rows = [
-            ("Status",          status,                         color),
-            ("Fail Count",      str(stat["fails"]),             color),
-            ("Fail Rate",       f"{stat['rate']:.2f}%",         COL_TEXT),
-            ("Total Records",   str(stat["total"]),             COL_TEXT),
-            ("Last Stop",       stat["last_stop"],              COL_WARN),
-            ("Stops Today",     str(stat["stops_today"]),       COL_TEXT),
-            ("Last Data",       stat.get("last_data", "—"),     COL_TEXT),
-            ("Warn Threshold",  f"≥ {WARN_AT_FAILS()} fails",  COL_WARN),
-            ("Block Threshold", f"≥ {BLOCK_AT_FAILS()} fails", COL_BLOCK),
+            ("Status",           status,                         color),
+            ("Fail Count",       str(stat["fails"]),             color),
+            ("Fail Rate",        f"{stat['rate']:.2f}%",         color),
+            ("Total Records",    str(stat["total"]),             COL_TEXT),
+            ("── Last 60 ──",   "",                             COL_MUTED),
+            ("Last 60 Fails",    str(f60),                      f60_color),
+            ("Last 60 Rate",     f"{r60:.2f}%",                 f60_color),
+            ("── Stop Info ──",  "",                            COL_MUTED),
+            ("Last Stop",        stat["last_stop"],              COL_WARN),
+            ("Stops Today",      str(stat["stops_today"]),       COL_TEXT),
+            ("Blocked Duration", blocked_dur,                    COL_BLOCK),
+            ("Last Data",        stat.get("last_data", "—"),    COL_TEXT),
+            ("── Thresholds ──", "",                            COL_MUTED),
+            ("Warn Threshold",   f"≥ {WARN_AT_FAILS()} fails", COL_WARN),
+            ("Block Threshold",  f"≥ {BLOCK_AT_FAILS()} fails",COL_BLOCK),
         ]
 
         for r, (label, value, val_color) in enumerate(rows):
+            # Section divider row — spans both columns, muted small text
+            if label.startswith("──"):
+                tk.Label(body, text=label, font=f_small,
+                         bg=BG_POPUP, fg=COL_MUTED,
+                         anchor="w").grid(
+                    row=r, column=0, columnspan=2,
+                    sticky="w", pady=(8, 2))
+                continue
             tk.Label(body, text=label, font=f_label,
                      bg=BG_POPUP, fg=COL_MUTED,
-                     anchor="w", width=18).grid(row=r, column=0, sticky="w", pady=3)
+                     anchor="w", width=18).grid(
+                row=r, column=0, sticky="w", pady=3)
             tk.Label(body, text=value, font=f_value,
                      bg=BG_POPUP, fg=val_color,
-                     anchor="w").grid(row=r, column=1, sticky="w", padx=12, pady=3)
+                     anchor="w").grid(
+                row=r, column=1, sticky="w", padx=12, pady=3)
 
         tk.Frame(body, bg=COL_BORDER, height=1).grid(
             row=len(rows), column=0, columnspan=2, sticky="ew", pady=8)
