@@ -1,3 +1,4 @@
+
 """
 main_pc_popup.py  —  Main PC  (ENTRY POINT)
 
@@ -34,8 +35,8 @@ from log_cleanup import cleanup_old_logs, DailyFileHandler
 # =========================================================
 def _listen_host()    -> str: return get_config()["listener"]["host"]
 def _listen_port()    -> int: return int(get_config()["listener"]["port"])
-def _ft_listen_port() -> int: return int(get_config()["ft_listener"]["port"])
-def _ft_setup_type()  -> int: return int(get_config()["ft_listener"].get("setup_type", 8))
+def _ft_listen_port() -> int: return int(get_config().get("ft_listener", {}).get("port", 8998))
+def _ft_setup_type()  -> int: return int(get_config().get("ft_listener", {}).get("setup_type", 8))
 def _log_dir()        -> str: return get_config()["paths"]["log_dir"]
 def _exe_name()       -> str: return get_config()["app"]["exe_name"]
 
@@ -93,8 +94,8 @@ _conn_state = {
 }
 _conn_lock = threading.Lock()
 
-# FT connection state — tracks each FT PC (1-8) separately
-# {ft_number: {"connected": bool, "last_hello": datetime, "addr": str}}
+# FT connection state — one entry per FT PC number (1-8)
+# {ft_number: {"connected": bool, "last_hello": datetime, "addr": str, "ft_side": str}}
 _ft_conn_states : dict = {}
 _ft_conn_lock = threading.Lock()
 
@@ -107,6 +108,7 @@ BG_CARD    = "#161b22"
 BG_HEADER  = "#1c2128"
 COL_BLOCK  = "#f85149"
 COL_OK     = "#3fb950"
+COL_DISC   = "#f85149"   # disconnected — same red as BLOCK
 COL_WARN   = "#d29922"
 COL_CHECK  = "#58a6ff"
 COL_TEXT   = "#c9d1d9"
@@ -268,38 +270,33 @@ def _start_tcp_listener() -> None:
 
 
 # =========================================================
-# FT map: ft_number + ft_side + setup_type → function label
+# FT mapping: ft_number + ft_side + setup_type → Function label
 # Matches InLine_Pro HMI screen labels exactly.
+# 8-setup: Front=FT1-4, Rear=FT5-8
+# 6-setup: Front=FT1-3, Rear=FT4-6
 # =========================================================
 def _ft_to_function(ft_number: int, ft_side: str, setup_type: int) -> str:
-    """
-    Returns the HMI function label for this FT signal.
-    e.g. FT1 front 8-setup -> 'Function 1'
-         FT5 rear  8-setup -> 'Function 1' (rear rack)
-    """
     side = ft_side.lower()
     if setup_type == 8:
         fn = ft_number if side == "front" else ft_number - 4
     else:
-        # 6-setup: front=FT1-3, rear=FT4-6
         fn = ft_number if side == "front" else ft_number - 3
     return f"Function {fn}"
 
 
 def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
-    """Handle a connection from an FT PC on port 8998."""
+    """Handle a single connection from an FT PC on port 8998."""
     try:
         raw     = conn.recv(1024)
         data    = json.loads(raw.decode("utf-8"))
         command = data.get("command", "").upper()
         ft_num  = int(data.get("ft_number", 0))
         ft_side = data.get("ft_side", "front").lower()
-        stype   = int(data.get("setup_type", 8))
+        stype   = int(data.get("setup_type", _ft_setup_type()))
 
         logger.info(f"[ft_listener] {addr[0]}:{addr[1]} → {command} "
                     f"FT{ft_num} {ft_side}")
 
-        # ── HELLO handshake ───────────────────────────────
         if command == "HELLO":
             _send_response(conn, "ACK", "Connected")
             with _ft_conn_lock:
@@ -312,26 +309,32 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
             logger.info(f"[ft_listener] HELLO from FT{ft_num} "
                         f"({ft_side}) at {addr[0]} — ACK sent")
 
-        # ── STOP command ──────────────────────────────────
         elif command == "STOP":
-            function_label = data.get("function") or                              _ft_to_function(ft_num, ft_side, stype)
-
             if not ft_num:
                 _send_response(conn, "ERROR", "Missing ft_number")
                 return
 
-            # Build a unique task key: e.g. "FT1_FRONT_Function 1"
+            function_label = data.get("function") or                              _ft_to_function(ft_num, ft_side, stype)
+
             task_key = f"FT{ft_num}_{ft_side.upper()}_{function_label}"
 
-            _send_response(conn, "OK",
-                           f"FT stop queued: {task_key}")
+            # Duplicate check — skip if already queued or processing
+            with _state_lock:
+                existing = _dl_states.get(task_key, {}).get("state")
+            if existing in ("processing",):
+                logger.info(
+                    f"[ft_listener] {task_key} already processing — "
+                    f"duplicate signal ignored")
+                _send_response(conn, "OK",
+                               f"Already processing: {task_key}")
+                return
+
+            _send_response(conn, "OK", f"FT stop queued: {task_key}")
 
             ts = datetime.now().strftime("%H:%M:%S")
             with _state_lock:
                 _dl_states[task_key] = {"state": "processing", "ts": ts}
 
-            # Queue automation — pass function label as the target
-            # run_stop_sequence handles both DL and FT targets
             _task_queue.put(task_key)
             logger.info(f"[ft_listener] {task_key} queued for automation")
 
@@ -351,22 +354,25 @@ def _start_ft_tcp_listener() -> None:
     """Second TCP listener on port 8998 — dedicated to FT PCs."""
     host = _listen_host()
     port = _ft_listen_port()
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((host, port))
-        server.listen(20)
-        logger.info(f"[ft_listener] FT listener on {host}:{port}")
-        while True:
-            try:
-                conn, addr = server.accept()
-                threading.Thread(
-                    target=_handle_ft_connection,
-                    args=(conn, addr),
-                    daemon=True,
-                ).start()
-            except Exception as e:
-                logger.error(f"[ft_listener] Accept error: {e}")
-                time.sleep(1)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((host, port))
+            server.listen(20)
+            logger.info(f"[ft_listener] FT listener on {host}:{port}")
+            while True:
+                try:
+                    conn, addr = server.accept()
+                    threading.Thread(
+                        target=_handle_ft_connection,
+                        args=(conn, addr),
+                        daemon=True,
+                    ).start()
+                except Exception as e:
+                    logger.error(f"[ft_listener] Accept error: {e}")
+                    time.sleep(1)
+    except Exception as e:
+        logger.error(f"[ft_listener] Failed to start on port {port}: {e}")
 
 
 # =========================================================
@@ -508,24 +514,6 @@ class TrayWindow:
 
         tk.Frame(self.root, bg="#30363d", height=1).pack(fill=tk.X, pady=4)
 
-        # ── FT connection dots ────────────────────────────
-        ft_section = tk.Frame(self.root, bg=BG_MAIN, padx=10, pady=4)
-        ft_section.pack(fill=tk.X)
-        tk.Label(ft_section, text="FT PCs",
-                 font=self.f_small, bg=BG_MAIN,
-                 fg=COL_MUTED).pack(anchor="w")
-        ft_dots_row = tk.Frame(ft_section, bg=BG_MAIN)
-        ft_dots_row.pack(anchor="w")
-        self.ft_dots = {}
-        for n in range(1, 9):   # always show 8 slots; dim unused ones
-            dot = tk.Label(ft_dots_row, text=f"FT{n}",
-                           font=self.f_small, bg=BG_MAIN,
-                           fg=COL_MUTED, padx=3)
-            dot.pack(side=tk.LEFT)
-            self.ft_dots[n] = dot
-
-        tk.Frame(self.root, bg="#30363d", height=1).pack(fill=tk.X, pady=4)
-
         # Listener + queue + app status
         for label_text, attr_name, default, default_color in [
             ("Listener",   "lbl_listener", f"● port {_listen_port()}", COL_OK),
@@ -542,20 +530,72 @@ class TrayWindow:
             lbl.pack(side=tk.LEFT, padx=4)
             setattr(self, attr_name, lbl)
 
-        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=6)
+        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
 
-        # Blocked DL list
+        # ── FT PC connection dots ─────────────────────────
+        ft_row = tk.Frame(self.root, bg=BG_MAIN, padx=10)
+        ft_row.pack(fill=tk.X, pady=(2, 2))
+        tk.Label(ft_row, text="FT:", font=self.f_small,
+                 bg=BG_MAIN, fg=COL_MUTED,
+                 width=4, anchor="w").pack(side=tk.LEFT)
+        self.ft_dots = {}
+        for n in range(1, 9):
+            dot = tk.Label(ft_row, text=f"FT{n}",
+                           font=self.f_small, bg=BG_MAIN,
+                           fg=COL_MUTED, padx=2)
+            dot.pack(side=tk.LEFT)
+            self.ft_dots[n] = dot
+
+        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
+
+        # Blocked DL list header
         tk.Label(self.root, text="Blocked DLs today",
                  font=self.f_small, bg=BG_MAIN,
                  fg=COL_MUTED).pack(anchor="w", padx=10)
 
-        self.list_frame = tk.Frame(self.root, bg=BG_MAIN)
-        self.list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        # ── Scrollable list with fixed height ─────────────
+        # Canvas + scrollbar so the list never pushes the
+        # "Clear blocked" button off-screen regardless of
+        # how many DL rows accumulate.
+        list_outer = tk.Frame(self.root, bg=BG_MAIN,
+                              height=180)   # fixed max height
+        list_outer.pack(fill=tk.X, padx=10, pady=4)
+        list_outer.pack_propagate(False)    # enforce fixed height
 
+        canvas = tk.Canvas(list_outer, bg=BG_MAIN,
+                           highlightthickness=0)
+        scrollbar = tk.Scrollbar(list_outer, orient="vertical",
+                                 command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.list_frame = tk.Frame(canvas, bg=BG_MAIN)
+        self._list_canvas_id = canvas.create_window(
+            (0, 0), window=self.list_frame, anchor="nw")
+
+        def _on_frame_resize(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(self._list_canvas_id, width=canvas.winfo_width())
+
+        self.list_frame.bind("<Configure>", _on_frame_resize)
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(
+                        self._list_canvas_id, width=e.width))
+
+        # Mouse wheel scroll
+        def _on_mousewheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        self._list_canvas = canvas   # saved for scroll-to-top on clear
+
+        # ── Footer — always visible, packed LAST at bottom ──
         tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X)
 
         ft = tk.Frame(self.root, bg=BG_MAIN, pady=6)
-        ft.pack(fill=tk.X)
+        ft.pack(fill=tk.X, side=tk.BOTTOM)   # anchor to bottom
         self.lbl_time = tk.Label(ft, text="", font=self.f_small,
                                   bg=BG_MAIN, fg=COL_MUTED)
         self.lbl_time.pack()
@@ -597,32 +637,6 @@ class TrayWindow:
             text=f"Updated: {datetime.now().strftime('%H:%M:%S')}"
         )
         self.root.after(5000, self._refresh)
-
-    def _update_ft_dots(self) -> None:
-        """Update FT connection dots — green if connected, grey if not."""
-        setup = _ft_setup_type()
-        with _ft_conn_lock:
-            states = dict(_ft_conn_states)
-        for n, dot in self.ft_dots.items():
-            if n > setup:
-                # Beyond this setup's count — dim completely
-                dot.config(fg="#2d333b")
-                continue
-            info = states.get(n, {})
-            if info.get("connected"):
-                last = info.get("last_hello")
-                # Consider disconnected if no HELLO in last 2x heartbeat
-                from ft_config_loader import heartbeat_sec as _hb
-                import ft_config_loader as _ftcfg
-                try:
-                    secs = (datetime.now() - last).total_seconds()
-                    # Grace period: 2 heartbeat intervals
-                    alive = secs < (_ftcfg.heartbeat_sec() * 2 + 60)
-                except Exception:
-                    alive = False
-                dot.config(fg=COL_OK if alive else COL_DISC)
-            else:
-                dot.config(fg=COL_DISC)
 
     def _update_conn_status(self) -> None:
         with _conn_lock:
@@ -713,6 +727,30 @@ class TrayWindow:
                      font=self.f_small, bg=BG_CARD,
                      fg=COL_MUTED).pack(side=tk.RIGHT)
 
+    def _update_ft_dots(self) -> None:
+        """Update FT dot colors — green=connected, grey=not connected, dim=beyond setup count."""
+        setup = _ft_setup_type()
+        with _ft_conn_lock:
+            states = dict(_ft_conn_states)
+
+        for n, dot in self.ft_dots.items():
+            if n > setup:
+                # Beyond this setup's FT count — dim out
+                dot.config(fg="#2d333b")
+                continue
+            info = states.get(n, {})
+            if info.get("connected") and info.get("last_hello"):
+                # Consider disconnected if no HELLO in 2x heartbeat + grace
+                last = info["last_hello"]
+                try:
+                    secs  = (datetime.now() - last).total_seconds()
+                    alive = secs < 3660   # ~1 hour grace (heartbeat=1800s)
+                except Exception:
+                    alive = False
+                dot.config(fg=COL_OK if alive else COL_DISC)
+            else:
+                dot.config(fg=COL_DISC)
+
     def _check_app_status(self) -> None:
         import subprocess
         exe = _exe_name()
@@ -739,6 +777,11 @@ class TrayWindow:
             _dl_states.clear()
         logger.info("[tray] DL state list cleared by operator")
         self._refresh_blocked()
+        # Scroll list back to top after clearing
+        try:
+            self._list_canvas.yview_moveto(0)
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -770,12 +813,14 @@ if __name__ == "__main__":
         _spy_controls()
         sys.exit(0)
 
-    threading.Thread(target=_queue_worker, daemon=True).start()
+    threading.Thread(target=_queue_worker,         daemon=True).start()
     threading.Thread(target=_start_tcp_listener,    daemon=True).start()
     threading.Thread(target=_start_ft_tcp_listener, daemon=True).start()
 
-    logger.info("[main] Main PC popup started (DL port=%d, FT port=%d)",
-                _listen_port(), _ft_listen_port())
+    logger.info(
+        f"[main] Main PC popup started — "
+        f"DL port={_listen_port()}, FT port={_ft_listen_port()}"
+    )
 
     root = tk.Tk()
     TrayWindow(root)
