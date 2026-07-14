@@ -9,7 +9,7 @@ from pywinauto.findwindows import(
 from pywinauto.timings import  TimeoutError as PWTimeoutError
 
 from config_loader import get_config
-from ini_editor import uncheck_dl
+from ini_editor import uncheck_dl, uncheck_ft
 
 # =========================================================
 # Use the SAME logger name as main_pc_popup.py so every
@@ -702,8 +702,24 @@ def run_stop_sequence(dl_name:str)->bool:
                         f"[automation] STEP 1/9: Edit Data.ini — SKIPPED "
                         f"(already unchecked or error)")
             else:
-                logger.info(
-                    f"[automation] STEP 1/9: FT task — skipping Data.ini edit")
+                # FT task — uncheck FUNCTION row in Data.ini
+                try:
+                    rack, fn_num = _parse_ft_task(dl_name)
+                    updated = uncheck_ft(fn_num, rack)
+                    if updated:
+                        logger.info(
+                            f"[automation] STEP 1/9: Data.ini — OK, "
+                            f"FUNCTION{fn_num} ({rack}) set to NOT_CHECK"
+                        )
+                    else:
+                        logger.warning(
+                            f"[automation] STEP 1/9: Data.ini — SKIPPED "
+                            f"(FUNCTION{fn_num} already NOT_CHECK or error)"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"[automation] STEP 1/9: Data.ini FT edit failed: {e}"
+                    )
 
             logger.info(f"[automation] STEP 4/9: Click STOP")
             _click_button(window,"STOP")
