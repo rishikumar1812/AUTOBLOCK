@@ -1,4 +1,3 @@
-
 """
 main_pc_popup.py  —  Main PC  (ENTRY POINT)
 
@@ -221,6 +220,18 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
                 _send_response(conn, "ERROR", f"Invalid DL: {dl_name}")
                 return
 
+            # Duplicate check — skip if already processing
+            with _state_lock:
+                existing = _dl_states.get(dl_name, {}).get("state")
+            if existing == "processing":
+                logger.info(
+                    f"[listener] {dl_name} already processing — "
+                    f"duplicate signal ignored"
+                )
+                _send_response(conn, "OK",
+                               f"Already processing: {dl_name}")
+                return
+
             # Acknowledge before automation
             _send_response(conn, "OK", f"Stop queued for {dl_name}")
 
@@ -314,7 +325,8 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
                 _send_response(conn, "ERROR", "Missing ft_number")
                 return
 
-            function_label = data.get("function") or                              _ft_to_function(ft_num, ft_side, stype)
+            function_label = (data.get("function") or
+                             _ft_to_function(ft_num, ft_side, stype))
 
             task_key = f"FT{ft_num}_{ft_side.upper()}_{function_label}"
 
