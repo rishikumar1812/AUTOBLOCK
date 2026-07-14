@@ -14,7 +14,7 @@ from datetime import datetime
 
 from ft_config_loader import (
     get_config, save_config,
-    ft_label, ft_number, ft_side, setup_type,
+    ft_label, ft_number, ft_side,
     main_pc_ip, main_pc_port, refresh_ms, heartbeat_sec,
     warn_at_fail, block_at_fail, log_dir
 )
@@ -77,29 +77,57 @@ class FTConfigEditor(tk.Toplevel):
         form.pack()
 
         cfg = get_config()
+        self._vars = {}
 
-        fields = [
-            ("FT Number (1-4)",    "ft_num",  str(cfg["ft"]["ft_number"])),
-            ("FT Side (front/rear)","ft_side", cfg["ft"]["ft_side"]),
-            ("Main PC IP",          "main_ip", cfg["network"]["main_pc_ip"]),
-            ("Main PC Port",       "main_port",str(cfg["network"]["main_pc_port"])),
-            ("Log Directory",       "log_dir", cfg["paths"]["log_dir"]),
-            ("Warn at fails ≥",     "warn",    str(cfg["thresholds"]["warn_at_fail"])),
-            ("Block at fails ≥",    "block",   str(cfg["thresholds"]["block_at_fails"])),
+        # ── Text entry fields (excluding ft_side) ─────────
+        text_fields = [
+            ("FT Number (1-4)", "ft_num",   str(cfg["ft"]["ft_number"])),
+            ("Main PC IP",      "main_ip",  cfg["network"]["main_pc_ip"]),
+            ("Main PC Port",    "main_port",str(cfg["network"]["main_pc_port"])),
+            ("Log Directory",   "log_dir",  cfg["paths"]["log_dir"]),
+            ("Warn at fails ≥", "warn",     str(cfg["thresholds"]["warn_at_fail"])),
+            ("Block at fails ≥","block",    str(cfg["thresholds"]["block_at_fails"])),
         ]
 
-        self._vars = {}
-        for r, (label, key, default) in enumerate(fields):
+        for r, (label, key, default) in enumerate(text_fields):
             tk.Label(form, text=label, font=f_label,
                      bg=BG_POPUP, fg=COL_TEXT,
-                     anchor="w", width=22).grid(
+                     anchor="w", width=18).grid(
                 row=r, column=0, sticky="w", pady=5)
             var = tk.StringVar(value=default)
-            tk.Entry(form, textvariable=var, width=28,
+            tk.Entry(form, textvariable=var, width=24,
                      font=f_label, bg=BG_HEADER, fg=COL_WHITE,
                      insertbackground=COL_WHITE,
-                     relief=tk.FLAT).grid(row=r, column=1, padx=8)
+                     relief=tk.FLAT).grid(row=r, column=1, padx=8, sticky="w")
             self._vars[key] = var
+
+        # ── FT Side — radio buttons ────────────────────────
+        next_row = len(text_fields)
+        tk.Label(form, text="FT Side", font=f_label,
+                 bg=BG_POPUP, fg=COL_TEXT,
+                 anchor="w", width=18).grid(
+            row=next_row, column=0, sticky="w", pady=5)
+
+        radio_frame = tk.Frame(form, bg=BG_POPUP)
+        radio_frame.grid(row=next_row, column=1, sticky="w", padx=8)
+
+        self._side_var = tk.StringVar(value=cfg["ft"]["ft_side"])
+
+        for side_val, side_text in [("front", "Front Rack"), ("rear", "Rear Rack")]:
+            rb = tk.Radiobutton(
+                radio_frame,
+                text=side_text,
+                value=side_val,
+                variable=self._side_var,
+                font=f_label,
+                bg=BG_POPUP,
+                fg=COL_WHITE,
+                selectcolor=BG_HEADER,
+                activebackground=BG_POPUP,
+                activeforeground=COL_WHITE,
+                cursor="hand2",
+            )
+            rb.pack(side=tk.LEFT, padx=(0, 16))
 
         btn_row = tk.Frame(self, bg=BG_POPUP)
         btn_row.pack(pady=16)
@@ -120,7 +148,7 @@ class FTConfigEditor(tk.Toplevel):
     def _save(self):
         try:
             ft_num = int(self._vars["ft_num"].get())
-            side   = self._vars["ft_side"].get().strip().lower()
+            side   = self._side_var.get().strip().lower()
             ip     = self._vars["main_ip"].get().strip()
             port   = int(self._vars["main_port"].get())
             ldir   = self._vars["log_dir"].get().strip()
@@ -129,8 +157,6 @@ class FTConfigEditor(tk.Toplevel):
 
             if ft_num < 1 or ft_num > 4:
                 raise ValueError("FT Number must be 1–4")
-            if side not in ("front", "rear"):
-                raise ValueError("FT Side must be 'front' or 'rear'")
             if not ip:
                 raise ValueError("Main PC IP cannot be empty")
             if warn >= block:
