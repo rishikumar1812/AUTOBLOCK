@@ -79,14 +79,13 @@ class FTConfigEditor(tk.Toplevel):
         cfg = get_config()
 
         fields = [
-            ("FT Number (1-8)",    "ft_num",    str(cfg["ft"]["ft_number"])),
-            ("FT Side (front/rear)","ft_side",  cfg["ft"]["ft_side"]),
-            ("Setup Type (6 or 8)","setup_type",str(cfg["ft"]["setup_type"])),
-            ("Main PC IP",          "main_ip",  cfg["network"]["main_pc_ip"]),
-            ("Main PC Port",        "main_port",str(cfg["network"]["main_pc_port"])),
-            ("Log Directory",       "log_dir",  cfg["paths"]["log_dir"]),
-            ("Warn at fails ≥",     "warn",     str(cfg["thresholds"]["warn_at_fail"])),
-            ("Block at fails ≥",    "block",    str(cfg["thresholds"]["block_at_fails"])),
+            ("FT Number (1-4)",    "ft_num",  str(cfg["ft"]["ft_number"])),
+            ("FT Side (front/rear)","ft_side", cfg["ft"]["ft_side"]),
+            ("Main PC IP",          "main_ip", cfg["network"]["main_pc_ip"]),
+            ("Main PC Port",       "main_port",str(cfg["network"]["main_pc_port"])),
+            ("Log Directory",       "log_dir", cfg["paths"]["log_dir"]),
+            ("Warn at fails ≥",     "warn",    str(cfg["thresholds"]["warn_at_fail"])),
+            ("Block at fails ≥",    "block",   str(cfg["thresholds"]["block_at_fails"])),
         ]
 
         self._vars = {}
@@ -120,21 +119,18 @@ class FTConfigEditor(tk.Toplevel):
 
     def _save(self):
         try:
-            ft_num    = int(self._vars["ft_num"].get())
-            side      = self._vars["ft_side"].get().strip().lower()
-            stype     = int(self._vars["setup_type"].get())
-            ip        = self._vars["main_ip"].get().strip()
-            port      = int(self._vars["main_port"].get())
-            ldir      = self._vars["log_dir"].get().strip()
-            warn      = int(self._vars["warn"].get())
-            block     = int(self._vars["block"].get())
+            ft_num = int(self._vars["ft_num"].get())
+            side   = self._vars["ft_side"].get().strip().lower()
+            ip     = self._vars["main_ip"].get().strip()
+            port   = int(self._vars["main_port"].get())
+            ldir   = self._vars["log_dir"].get().strip()
+            warn   = int(self._vars["warn"].get())
+            block  = int(self._vars["block"].get())
 
-            if ft_num < 1 or ft_num > 8:
-                raise ValueError("FT Number must be 1–8")
+            if ft_num < 1 or ft_num > 4:
+                raise ValueError("FT Number must be 1–4")
             if side not in ("front", "rear"):
                 raise ValueError("FT Side must be 'front' or 'rear'")
-            if stype not in (6, 8):
-                raise ValueError("Setup Type must be 6 or 8")
             if not ip:
                 raise ValueError("Main PC IP cannot be empty")
             if warn >= block:
@@ -144,14 +140,13 @@ class FTConfigEditor(tk.Toplevel):
             return
 
         cfg = get_config()
-        cfg["ft"]["ft_number"]               = ft_num
-        cfg["ft"]["ft_side"]                 = side
-        cfg["ft"]["setup_type"]              = stype
-        cfg["network"]["main_pc_ip"]         = ip
-        cfg["network"]["main_pc_port"]       = port
-        cfg["paths"]["log_dir"]              = ldir
-        cfg["thresholds"]["warn_at_fail"]    = warn
-        cfg["thresholds"]["block_at_fails"]  = block
+        cfg["ft"]["ft_number"]              = ft_num
+        cfg["ft"]["ft_side"]               = side
+        cfg["network"]["main_pc_ip"]       = ip
+        cfg["network"]["main_pc_port"]     = port
+        cfg["paths"]["log_dir"]            = ldir
+        cfg["thresholds"]["warn_at_fail"]  = warn
+        cfg["thresholds"]["block_at_fails"]= block
         save_config(cfg)
         self.on_save()
         self.destroy()
@@ -163,7 +158,9 @@ class FTConfigEditor(tk.Toplevel):
 class FTDashboard:
     def __init__(self, root: tk.Tk):
         self.root       = root
-        self.root.title(f"FT Monitor — {ft_label()}")
+        self.root.title(
+            f"FT Monitor — {ft_label()} {ft_side().capitalize()} Rack"
+        )
         self.root.configure(bg=BG_MAIN)
         self.root.resizable(False, False)
 
@@ -190,9 +187,11 @@ class FTDashboard:
         # Header
         hdr = tk.Frame(self.root, bg=BG_HEADER, pady=10)
         hdr.pack(fill=tk.X)
-        tk.Label(hdr, text=f"FT Monitor  •  {ft_label()}",
-                 font=self.f_title, bg=BG_HEADER,
-                 fg=COL_WHITE).pack(side=tk.LEFT, padx=16)
+        tk.Label(
+            hdr,
+            text=f"FT Monitor  •  {ft_label()} {ft_side().capitalize()} Rack",
+            font=self.f_title, bg=BG_HEADER,
+            fg=COL_WHITE).pack(side=tk.LEFT, padx=16)
         tk.Button(hdr, text="⚙ Config",
                   command=self._open_config,
                   bg=BG_HEADER, fg=COL_TEXT,
