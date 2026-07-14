@@ -35,7 +35,6 @@ from log_cleanup import cleanup_old_logs, DailyFileHandler
 def _listen_host()    -> str: return get_config()["listener"]["host"]
 def _listen_port()    -> int: return int(get_config()["listener"]["port"])
 def _ft_listen_port() -> int: return int(get_config().get("ft_listener", {}).get("port", 8998))
-def _ft_setup_type()  -> int: return int(get_config().get("ft_listener", {}).get("setup_type", 8))
 def _log_dir()        -> str: return get_config()["paths"]["log_dir"]
 def _exe_name()       -> str: return get_config()["app"]["exe_name"]
 
@@ -286,13 +285,13 @@ def _start_tcp_listener() -> None:
 # 8-setup: Front=FT1-4, Rear=FT5-8
 # 6-setup: Front=FT1-3, Rear=FT4-6
 # =========================================================
-def _ft_to_function(ft_number: int, ft_side: str, setup_type: int) -> str:
-    side = ft_side.lower()
-    if setup_type == 8:
-        fn = ft_number if side == "front" else ft_number - 4
-    else:
-        fn = ft_number if side == "front" else ft_number - 3
-    return f"Function {fn}"
+def _ft_to_function(ft_number: int, ft_side: str) -> str:
+    """
+    ft_number is 1-4 and maps DIRECTLY to Function 1-4.
+    ft_side decides Front Rack or Rear Rack only.
+    No setup_type needed — the number IS the function number.
+    """
+    return f"Function {ft_number}"
 
 
 def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
@@ -303,7 +302,6 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
         command = data.get("command", "").upper()
         ft_num  = int(data.get("ft_number", 0))
         ft_side = data.get("ft_side", "front").lower()
-        stype   = int(data.get("setup_type", _ft_setup_type()))
 
         logger.info(f"[ft_listener] {addr[0]}:{addr[1]} → {command} "
                     f"FT{ft_num} {ft_side}")
@@ -326,7 +324,7 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
                 return
 
             function_label = (data.get("function") or
-                             _ft_to_function(ft_num, ft_side, stype))
+                             _ft_to_function(ft_num, ft_side))
 
             task_key = f"FT{ft_num}_{ft_side.upper()}_{function_label}"
 
@@ -545,18 +543,22 @@ class TrayWindow:
         tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
 
         # ── FT PC connection dots ─────────────────────────
-        ft_row = tk.Frame(self.root, bg=BG_MAIN, padx=10)
-        ft_row.pack(fill=tk.X, pady=(2, 2))
-        tk.Label(ft_row, text="FT:", font=self.f_small,
-                 bg=BG_MAIN, fg=COL_MUTED,
-                 width=4, anchor="w").pack(side=tk.LEFT)
-        self.ft_dots = {}
-        for n in range(1, 9):
-            dot = tk.Label(ft_row, text=f"FT{n}",
-                           font=self.f_small, bg=BG_MAIN,
-                           fg=COL_MUTED, padx=2)
-            dot.pack(side=tk.LEFT)
-            self.ft_dots[n] = dot
+        # FT dots — two rows: Front FT1-4 and Rear FT1-4
+        ft_block = tk.Frame(self.root, bg=BG_MAIN, padx=10)
+        ft_block.pack(fill=tk.X, pady=(2, 2))
+        self.ft_dots = {}   # key: (ft_num, side) e.g. (1,"front")
+        for side_label, side_key in [("Front:", "front"), ("Rear: ", "rear")]:
+            row = tk.Frame(ft_block, bg=BG_MAIN)
+            row.pack(fill=tk.X)
+            tk.Label(row, text=side_label, font=self.f_small,
+                     bg=BG_MAIN, fg=COL_MUTED,
+                     width=6, anchor="w").pack(side=tk.LEFT)
+            for n in range(1, 5):
+                dot = tk.Label(row, text=f"FT{n}",
+                               font=self.f_small, bg=BG_MAIN,
+                               fg=COL_MUTED, padx=3)
+                dot.pack(side=tk.LEFT)
+                self.ft_dots[(n, side_key)] = dot
 
         tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
 
@@ -740,28 +742,32 @@ class TrayWindow:
                      fg=COL_MUTED).pack(side=tk.RIGHT)
 
     def _update_ft_dots(self) -> None:
-        """Update FT dot colors — green=connected, grey=not connected, dim=beyond setup count."""
-        setup = _ft_setup_type()
+        """
+        Update FT dot colors.
+        ft_dots key is (ft_number, side) e.g. (1, "front").
+        _ft_conn_states key is ft_num (int); side stored in info["ft_side"].
+        Green = connected recently, Red = not connected.
+        """
         with _ft_conn_lock:
             states = dict(_ft_conn_states)
 
-        for n, dot in self.ft_dots.items():
-            if n > setup:
-                # Beyond this setup's FT count — dim out
-                dot.config(fg="#2d333b")
-                continue
-            info = states.get(n, {})
+        for (n, side), dot in self.ft_dots.items():
+            # Find matching state entry by ft_num + side
+            info = next(
+                (v for k, v in states.items()
+                 if k == n and v.get("ft_side", "") == side),
+                {}
+            )
             if info.get("connected") and info.get("last_hello"):
-                # Consider disconnected if no HELLO in 2x heartbeat + grace
                 last = info["last_hello"]
                 try:
                     secs  = (datetime.now() - last).total_seconds()
-                    alive = secs < 3660   # ~1 hour grace (heartbeat=1800s)
+                    alive = secs < 3660   # ~1hr grace
                 except Exception:
                     alive = False
                 dot.config(fg=COL_OK if alive else COL_DISC)
             else:
-                dot.config(fg=COL_DISC)
+                dot.config(fg=COL_MUTED)
 
     def _check_app_status(self) -> None:
         import subprocess
