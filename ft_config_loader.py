@@ -1,7 +1,11 @@
 """
 ft_config_loader.py  —  FT PC
-Single source of truth for ft config.json.
+Single source of truth for ft_config.json.
 EXE-safe: reads from beside the EXE when frozen.
+
+ft_number: 1-4 (same range for both front and rear)
+ft_side:   "front" or "rear"
+Function mapping is direct — ft_number == function number.
 """
 
 import os
@@ -10,9 +14,8 @@ import json
 
 _DEFAULTS = {
     "ft": {
-        "ft_number":  1,
-        "ft_side":    "front",
-        "setup_type": 8,
+        "ft_number": 1,
+        "ft_side":   "front",
     },
     "network": {
         "main_pc_ip":       "192.168.0.21",
@@ -78,7 +81,6 @@ def save_config(cfg: dict) -> bool:
 # ── Convenience accessors ──────────────────────────────────
 def ft_number()    -> int: return int(get_config()["ft"]["ft_number"])
 def ft_side()      -> str: return get_config()["ft"]["ft_side"].lower()
-def setup_type()   -> int: return int(get_config()["ft"]["setup_type"])
 def main_pc_ip()   -> str: return get_config()["network"]["main_pc_ip"]
 def main_pc_port() -> int: return int(get_config()["network"]["main_pc_port"])
 def log_dir()      -> str: return get_config()["paths"]["log_dir"]
@@ -93,35 +95,21 @@ def heartbeat_sec()-> int: return int(get_config()["dashboard"]["heartbeat_sec"]
 
 def ft_label() -> str:
     """
-    Human-readable label for this FT, e.g. 'FT1 Front'.
-    Used in dashboard title, log messages, and network payload.
+    Human-readable label: 'FT1' or 'FT3' — exactly what's in config.
+    Used in dashboard title, card header, log messages, network payload.
     """
-    return f"FT{ft_number()} {ft_side().capitalize()}"
+    return f"FT{ft_number()}"
 
 
 def ft_function_name() -> str:
     """
     The Function label this FT maps to on the InLine_Pro HMI screen.
+    ft_number is 1-4 and maps DIRECTLY to Function 1-4.
+    ft_side decides Front Rack or Rear Rack.
 
-    Mapping (confirmed from HMI screenshot):
-      Front Rack: FT1=Function1, FT2=Function2, FT3=Function3, FT4=Function4
-      Rear Rack:  FT5=Function1, FT6=Function2, FT7=Function3, FT8=Function4
-                  (for 8-setup)
-      6-setup:
-      Front Rack: FT1=Function1, FT2=Function2, FT3=Function3
-      Rear Rack:  FT4=Function1, FT5=Function2, FT6=Function3
-
-    Returns e.g. 'Function 1' matching the exact HMI label text.
+    Examples:
+        ft_number=1, ft_side="front" → "Function 1" (Front Rack)
+        ft_number=3, ft_side="rear"  → "Function 3" (Rear Rack)
+        ft_number=4, ft_side="front" → "Function 4" (Front Rack)
     """
-    num  = ft_number()
-    side = ft_side()
-    stype = setup_type()
-
-    if stype == 8:
-        # Front: FT1-FT4, Rear: FT5-FT8
-        fn = num if side == "front" else num - 4
-    else:
-        # 6-setup — Front: FT1-FT3, Rear: FT4-FT6
-        fn = num if side == "front" else num - 3
-
-    return f"Function {fn}"
+    return f"Function {ft_number()}"
