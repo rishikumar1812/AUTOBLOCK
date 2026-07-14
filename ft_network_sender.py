@@ -17,7 +17,7 @@ import logging
 
 from ft_config_loader import (
     main_pc_ip, main_pc_port, ft_number,
-    ft_side, ft_function_name, setup_type, ft_label
+    ft_side, ft_function_name, ft_label
 )
 
 logger = logging.getLogger(__name__)
@@ -34,12 +34,11 @@ def send_stop_signal() -> bool:
     port = main_pc_port()
 
     payload = json.dumps({
-        "command":    "STOP",
-        "source":     "FT",
-        "ft_number":  ft_number(),
-        "ft_side":    ft_side(),
-        "function":   ft_function_name(),
-        "setup_type": setup_type(),
+        "command":   "STOP",
+        "source":    "FT",
+        "ft_number": ft_number(),
+        "ft_side":   ft_side(),
+        "function":  ft_function_name(),
     }).encode("utf-8")
 
     label = ft_label()
