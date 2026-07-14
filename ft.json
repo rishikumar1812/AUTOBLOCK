@@ -1,9 +1,8 @@
 {
-    "_comment": "FT PC configuration - edit this file, not the python scripts. ft_number and ft_side are fixed once set.",
+    "_comment": "FT PC configuration - ft_number is 1-4 for both front and rear, ft_side decides the rack",
     "ft": {
         "ft_number": 1,
-        "ft_side": "front",
-        "setup_type": 8
+        "ft_side": "front"
     },
     "network": {
         "main_pc_ip": "192.168.0.21",
