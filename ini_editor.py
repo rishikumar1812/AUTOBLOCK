@@ -1,57 +1,19 @@
-"""
-ini_editor.py  —  Main PC
-Reads and updates Data.ini for InLine_Pro.
-
-Data.ini structure:
-    [Rack1]
-    Building 1 = Checked
-    Building 2 = Checked
-    ...
-    Building 10 = Checked
-
-    [Rack2]
-    Building 1 = Checked
-    ...
-    Building 10 = Checked
-
-DL to INI mapping:
-    DL01 → Rack1, Building 1
-    DL02 → Rack1, Building 2
-    ...
-    DL10 → Rack1, Building 10
-    DL11 → Rack2, Building 1
-    DL12 → Rack2, Building 2
-    ...
-    DL20 → Rack2, Building 10
-"""
-
 import os
 import logging
 import configparser
-
 from config_loader import get_config
 
 logger = logging.getLogger("ini_editor")
 
 
 # =========================================================
-# DL name → (section, key) mapping
+# DL → ini key mapping
+# DL01-DL10 → [RACK1] BUILDER1-BUILDER10
+# DL11-DL20 → [RACK2] BUILDER1-BUILDER10
 # =========================================================
 def dl_to_ini_key(dl_name: str) -> tuple:
-    """
-    Convert DL name to (section, building_key) in Data.ini.
-
-    DL01-DL10 → Rack1, Building 1-10
-    DL11-DL20 → Rack2, Building 1-10
-
-    Returns:
-        ("Rack1", "Building 1")  for DL01
-        ("Rack2", "Building 5")  for DL15
-    Raises:
-        ValueError if dl_name format is invalid or out of range
-    """
     try:
-        dl_num = int(dl_name[2:])   # "DL03" → 3
+        dl_num = int(dl_name[2:])
     except (ValueError, IndexError):
         raise ValueError(f"Invalid DL name format: {dl_name}")
 
@@ -59,40 +21,56 @@ def dl_to_ini_key(dl_name: str) -> tuple:
         raise ValueError(f"DL number out of range (1-20): {dl_name}")
 
     if dl_num <= 10:
-        section      = "Rack1"
-        building_num = dl_num
+        section     = "RACK1"
+        builder_num = dl_num
     else:
-        section      = "Rack2"
-        building_num = dl_num - 10
+        section     = "RACK2"
+        builder_num = dl_num - 10
 
-    return section, f"Building {building_num}"
+    return section, f"BUILDER{builder_num}"
 
 
 # =========================================================
-# Read Data.ini
+# FT → ini key mapping
+# ft_side="front" → [RACK1] FUNCTION{ft_num}
+# ft_side="rear"  → [RACK2] FUNCTION{ft_num}
+# =========================================================
+def ft_to_ini_key(ft_num: int, ft_side: str) -> tuple:
+    """
+    Map FT PC identity to Data.ini section + key.
+
+    Examples:
+        ft_num=1, ft_side="front" → ("RACK1", "FUNCTION1")
+        ft_num=3, ft_side="rear"  → ("RACK2", "FUNCTION3")
+    """
+    side = ft_side.strip().lower()
+    if side not in ("front", "rear"):
+        raise ValueError(
+            f"Invalid ft_side '{ft_side}' — must be 'front' or 'rear'"
+        )
+    if not (1 <= ft_num <= 8):
+        raise ValueError(
+            f"FT number out of range (1-8): {ft_num}"
+        )
+
+    section = "RACK1" if side == "front" else "RACK2"
+    return section, f"FUNCTION{ft_num}"
+
+
+# =========================================================
+# Read / write Data.ini
 # =========================================================
 def read_ini() -> configparser.RawConfigParser:
-    """
-    Read Data.ini and return parser object.
-    Uses RawConfigParser to preserve exact values (Checked/Not check).
-    """
     ini_path = get_config()["paths"]["data_ini"]
-
     if not os.path.exists(ini_path):
         raise FileNotFoundError(f"Data.ini not found: {ini_path}")
-
     parser = configparser.RawConfigParser()
-    # Preserve key case exactly as written in the file
-    parser.optionxform = str
+    parser.optionxform = str   # preserve key case
     parser.read(ini_path, encoding="utf-8")
     return parser
 
 
-# =========================================================
-# Write Data.ini
-# =========================================================
 def write_ini(parser: configparser.RawConfigParser) -> None:
-    """Write updated parser back to Data.ini."""
     ini_path = get_config()["paths"]["data_ini"]
     with open(ini_path, "w", encoding="utf-8") as f:
         parser.write(f)
@@ -100,49 +78,48 @@ def write_ini(parser: configparser.RawConfigParser) -> None:
 
 
 # =========================================================
-# Uncheck a building for a given DL
+# Shared set/get helper — used by both DL and FT functions
 # =========================================================
-def uncheck_dl(dl_name: str) -> bool:
+def _set_key(label: str, section: str, key: str,
+             new_value: str, skip_value: str) -> bool:
     """
-    Set the Building entry for this DL from 'Checked' to 'Not check'
-    in Data.ini and save the file.
-
-    Returns:
-        True  — successfully updated
-        False — already unchecked or error
+    Read Data.ini, set [section] key = new_value.
+    Skips (returns False) if value is already new_value.
+    Returns True if file was actually updated.
+    label: human-readable name for logging (e.g. 'DL06' or 'FT1 front')
     """
     try:
-        section, key = dl_to_ini_key(dl_name)
-        parser       = read_ini()
+        parser = read_ini()
 
         if not parser.has_section(section):
             logger.error(
-                f"[ini_editor] Section [{section}] not found in Data.ini"
+                f"[ini_editor] {label} — section [{section}] "
+                f"not found in Data.ini"
             )
             return False
 
         if not parser.has_option(section, key):
             logger.error(
-                f"[ini_editor] Key '{key}' not found in [{section}]"
+                f"[ini_editor] {label} — key '{key}' not found "
+                f"in [{section}]"
             )
             return False
 
-        current_value = parser.get(section, key).strip()
+        current = parser.get(section, key).strip()
 
-        if current_value == "Not check":
+        if current == skip_value:
             logger.info(
-                f"[ini_editor] {dl_name} [{section}] {key} "
-                f"already 'Not check' — no change needed"
+                f"[ini_editor] {label} — [{section}] {key} "
+                f"already '{skip_value}' — no change needed"
             )
             return False
 
-        # Update value
-        parser.set(section, key, "Not check")
+        old_value = current
+        parser.set(section, key, new_value)
         write_ini(parser)
-
         logger.info(
-            f"[ini_editor] {dl_name} → [{section}] {key}: "
-            f"'Checked' → 'Not check'"
+            f"[ini_editor] {label} — [{section}] {key}: "
+            f"'{old_value}' → '{new_value}'"
         )
         return True
 
@@ -153,59 +130,68 @@ def uncheck_dl(dl_name: str) -> bool:
         logger.error(f"[ini_editor] {e}")
         return False
     except Exception as e:
-        logger.error(f"[ini_editor] Unexpected error for {dl_name}: {e}")
+        logger.error(f"[ini_editor] {label} — unexpected error: {e}")
         return False
 
 
 # =========================================================
-# Check a building (re-enable after restart if needed)
+# DL functions
 # =========================================================
-def check_dl(dl_name: str) -> bool:
-    """
-    Set the Building entry for this DL from 'Not check' to 'Checked'.
-    Useful if operator wants to re-enable a DL from Main PC.
-
-    Returns:
-        True  — successfully updated
-        False — already checked or error
-    """
+def uncheck_dl(dl_name: str) -> bool:
+    """Set DL building to NOT_CHECK in Data.ini."""
     try:
         section, key = dl_to_ini_key(dl_name)
-        parser       = read_ini()
-
-        if not parser.has_section(section):
-            logger.error(
-                f"[ini_editor] Section [{section}] not found in Data.ini"
-            )
-            return False
-
-        if not parser.has_option(section, key):
-            logger.error(
-                f"[ini_editor] Key '{key}' not found in [{section}]"
-            )
-            return False
-
-        current_value = parser.get(section, key).strip()
-
-        if current_value == "Checked":
-            logger.info(
-                f"[ini_editor] {dl_name} [{section}] {key} "
-                f"already 'Checked' — no change needed"
-            )
-            return False
-
-        parser.set(section, key, "Checked")
-        write_ini(parser)
-
-        logger.info(
-            f"[ini_editor] {dl_name} → [{section}] {key}: "
-            f"'Not check' → 'Checked'"
-        )
-        return True
-
-    except FileNotFoundError as e:
+    except ValueError as e:
         logger.error(f"[ini_editor] {e}")
         return False
-    except Exception as e:
-        logger.error(f"[ini_editor] Unexpected error for {dl_name}: {e}")
+    return _set_key(dl_name, section, key, "NOT_CHECK", "NOT_CHECK")
+
+
+def check_dl(dl_name: str) -> bool:
+    """Set DL building back to CHECK in Data.ini."""
+    try:
+        section, key = dl_to_ini_key(dl_name)
+    except ValueError as e:
+        logger.error(f"[ini_editor] {e}")
         return False
+    return _set_key(dl_name, section, key, "CHECK", "CHECK")
+
+
+# =========================================================
+# FT functions
+# =========================================================
+def uncheck_ft(ft_num: int, ft_side: str) -> bool:
+    """
+    Set FT function to NOT_CHECK in Data.ini.
+
+    Called by inline_automation.run_stop_sequence() for FT tasks,
+    same as uncheck_dl() is called for DL tasks.
+
+    Example:
+        uncheck_ft(1, "front")  →  [RACK1] FUNCTION1 = NOT_CHECK
+        uncheck_ft(3, "rear")   →  [RACK2] FUNCTION3 = NOT_CHECK
+    """
+    try:
+        section, key = ft_to_ini_key(ft_num, ft_side)
+    except ValueError as e:
+        logger.error(f"[ini_editor] {e}")
+        return False
+    label = f"FT{ft_num} {ft_side}"
+    return _set_key(label, section, key, "NOT_CHECK", "NOT_CHECK")
+
+
+def check_ft(ft_num: int, ft_side: str) -> bool:
+    """
+    Set FT function back to CHECK in Data.ini.
+
+    Example:
+        check_ft(1, "front")  →  [RACK1] FUNCTION1 = CHECK
+        check_ft(3, "rear")   →  [RACK2] FUNCTION3 = CHECK
+    """
+    try:
+        section, key = ft_to_ini_key(ft_num, ft_side)
+    except ValueError as e:
+        logger.error(f"[ini_editor] {e}")
+        return False
+    label = f"FT{ft_num} {ft_side}"
+    return _set_key(label, section, key, "CHECK", "CHECK")
