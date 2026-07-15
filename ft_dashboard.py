@@ -90,28 +90,34 @@ class FTConfigEditor(tk.Toplevel):
         ]
 
         for r, (label, key, default) in enumerate(text_fields):
+            # FT Number is row 0, FT Side radio is row 1
+            # remaining text fields start at row 2
+            grid_row = r if r == 0 else r + 1
             tk.Label(form, text=label, font=f_label,
                      bg=BG_POPUP, fg=COL_TEXT,
                      anchor="w", width=18).grid(
-                row=r, column=0, sticky="w", pady=5)
+                row=grid_row, column=0, sticky="w", pady=5)
             var = tk.StringVar(value=default)
             tk.Entry(form, textvariable=var, width=24,
                      font=f_label, bg=BG_HEADER, fg=COL_WHITE,
                      insertbackground=COL_WHITE,
-                     relief=tk.FLAT).grid(row=r, column=1, padx=8, sticky="w")
+                     relief=tk.FLAT).grid(row=grid_row, column=1, padx=8, sticky="w")
             self._vars[key] = var
 
-        # ── FT Side — radio buttons ────────────────────────
-        next_row = len(text_fields)
+        # ── FT Side — radio buttons (2nd position, after FT Number) ──
+        # Inserted at row 1 — FT Number is row 0
+        # White indicator = unselected, Black filled = selected
+        side_row = 1   # always second field
         tk.Label(form, text="FT Side", font=f_label,
                  bg=BG_POPUP, fg=COL_TEXT,
                  anchor="w", width=18).grid(
-            row=next_row, column=0, sticky="w", pady=5)
+            row=side_row, column=0, sticky="w", pady=5)
 
         radio_frame = tk.Frame(form, bg=BG_POPUP)
-        radio_frame.grid(row=next_row, column=1, sticky="w", padx=8)
+        radio_frame.grid(row=side_row, column=1, sticky="w", padx=8)
 
-        self._side_var = tk.StringVar(value=cfg["ft"]["ft_side"])
+        self._side_var = tk.StringVar(master=self,
+                                      value=cfg["ft"]["ft_side"])
 
         for side_val, side_text in [("front", "Front Rack"), ("rear", "Rear Rack")]:
             rb = tk.Radiobutton(
@@ -122,12 +128,15 @@ class FTConfigEditor(tk.Toplevel):
                 font=f_label,
                 bg=BG_POPUP,
                 fg=COL_WHITE,
-                selectcolor=BG_HEADER,
+                selectcolor="#000000",      # black fill when selected
                 activebackground=BG_POPUP,
                 activeforeground=COL_WHITE,
+                indicatoron=True,
+                relief=tk.FLAT,
                 cursor="hand2",
+                command=lambda v=side_val: self._side_var.set(v),
             )
-            rb.pack(side=tk.LEFT, padx=(0, 16))
+            rb.pack(side=tk.LEFT, padx=(0, 20))
 
         btn_row = tk.Frame(self, bg=BG_POPUP)
         btn_row.pack(pady=16)
