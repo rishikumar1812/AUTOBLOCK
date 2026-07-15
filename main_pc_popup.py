@@ -121,16 +121,18 @@ COL_BORDER = "#30363d"
 def _task_display_name(task_key: str) -> str:
     """
     Human-readable name for tray/toast display.
-    DL task:  "DL06"           → "DL06"
-    FT task:  "FT1_FRONT_Function 1" → "FT1 Front — Function 1"
+    DL task:  "DL06"                    → "DL06"
+    FT task:  "FT_F1_front_Function 1"  → "F1 (Front — Function 1)"
+              "FT_R3_rear_Function 3"   → "R3 (Rear — Function 3)"
     """
-    if task_key.upper().startswith("FT"):
+    if task_key.upper().startswith("FT_"):
         try:
-            parts = task_key.split("_", 2)
-            ft    = parts[0]                        # "FT1"
-            side  = parts[1].capitalize()           # "Front"
-            func  = parts[2] if len(parts) > 2 else ""  # "Function 1"
-            return f"{ft} {side} — {func}"
+            # "FT_F1_front_Function 1" → parts[1]="F1"
+            parts    = task_key.split("_", 3)
+            ft_id    = parts[1]                      # "F1"
+            rack     = parts[2].capitalize()         # "Front"
+            func     = parts[3] if len(parts) > 3 else ""
+            return f"{ft_id} ({rack} — {func})"
         except Exception:
             return task_key
     return task_key
@@ -307,13 +309,26 @@ def _start_tcp_listener() -> None:
 # 8-setup: Front=FT1-4, Rear=FT5-8
 # 6-setup: Front=FT1-3, Rear=FT4-6
 # =========================================================
-def _ft_to_function(ft_number: int, ft_side: str) -> str:
+# ft_id → (rack, function_label)
+_FT_ID_MAP = {
+    "F1": ("front", "Function 1"),
+    "F2": ("front", "Function 2"),
+    "F3": ("front", "Function 3"),
+    "F4": ("front", "Function 4"),
+    "R1": ("rear",  "Function 1"),
+    "R2": ("rear",  "Function 2"),
+    "R3": ("rear",  "Function 3"),
+    "R4": ("rear",  "Function 4"),
+}
+
+
+def _ft_id_to_rack_function(ft_id: str) -> tuple:
     """
-    ft_number is 1-4 and maps DIRECTLY to Function 1-4.
-    ft_side decides Front Rack or Rear Rack only.
-    No setup_type needed — the number IS the function number.
+    Map ft_id to (rack, function_label).
+    e.g. 'F1' → ('front', 'Function 1')
+         'R3' → ('rear',  'Function 3')
     """
-    return f"Function {ft_number}"
+    return _FT_ID_MAP.get(ft_id.upper(), ("front", "Function 1"))
 
 
 def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
@@ -322,55 +337,48 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
         raw     = conn.recv(1024)
         data    = json.loads(raw.decode("utf-8"))
         command = data.get("command", "").upper()
-        ft_num  = int(data.get("ft_number", 0))
-        ft_side = data.get("ft_side", "front").lower()
+        ft_id   = data.get("ft_id", "").upper()
 
-        logger.info(f"[ft_listener] {addr[0]}:{addr[1]} → {command} "
-                    f"FT{ft_num} {ft_side}")
+        logger.info(f"[ft_listener] {addr[0]}:{addr[1]} → {command} {ft_id}")
 
         if command == "HELLO":
             _send_response(conn, "ACK", "Connected")
-            # Key is (ft_num, ft_side) so FT1 Front and FT1 Rear
-            # are stored independently and don't overwrite each other
+            # Key is ft_id string e.g. "F1", "R3"
             with _ft_conn_lock:
-                _ft_conn_states[(ft_num, ft_side)] = {
+                _ft_conn_states[ft_id] = {
                     "connected":  True,
                     "last_hello": datetime.now(),
                     "addr":       addr[0],
-                    "ft_side":    ft_side,
                 }
-            logger.info(f"[ft_listener] HELLO from FT{ft_num} "
-                        f"({ft_side}) at {addr[0]} — ACK sent")
+            logger.info(
+                f"[ft_listener] HELLO from {ft_id} at {addr[0]} — ACK sent")
 
         elif command == "STOP":
-            if not ft_num:
-                _send_response(conn, "ERROR", "Missing ft_number")
+            if not ft_id or ft_id not in _FT_ID_MAP:
+                _send_response(conn, "ERROR",
+                               f"Invalid ft_id: {ft_id!r}")
                 return
 
-            function_label = (data.get("function") or
-                             _ft_to_function(ft_num, ft_side))
+            rack, function_label = _ft_id_to_rack_function(ft_id)
+            task_key = f"FT_{ft_id}_{rack}_{function_label}"
 
-            task_key = f"FT{ft_num}_{ft_side.upper()}_{function_label}"
-
-            # Duplicate check — skip if already queued or processing
+            # Duplicate check
             with _state_lock:
                 existing = _dl_states.get(task_key, {}).get("state")
-            if existing in ("processing",):
+            if existing == "processing":
                 logger.info(
                     f"[ft_listener] {task_key} already processing — "
-                    f"duplicate signal ignored")
+                    f"duplicate ignored")
                 _send_response(conn, "OK",
                                f"Already processing: {task_key}")
                 return
 
             _send_response(conn, "OK", f"FT stop queued: {task_key}")
-
             ts = datetime.now().strftime("%H:%M:%S")
             with _state_lock:
                 _dl_states[task_key] = {"state": "processing", "ts": ts}
-
             _task_queue.put(task_key)
-            logger.info(f"[ft_listener] {task_key} queued for automation")
+            logger.info(f"[ft_listener] {task_key} queued")
 
         else:
             _send_response(conn, "ERROR", f"Unknown command: {command}")
@@ -581,18 +589,18 @@ class TrayWindow:
         tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
 
         # ── FT PC connection dots ─────────────────────────
-        # FT dots — flat single row FT1-FT8
+        # FT dots — F1-F4 (Front) and R1-R4 (Rear) in one row
         ft_block = tk.Frame(self.root, bg=BG_MAIN, padx=10)
         ft_block.pack(fill=tk.X, pady=(2, 2))
         ft_row = tk.Frame(ft_block, bg=BG_MAIN)
         ft_row.pack(fill=tk.X)
-        self.ft_dots = {}   # key: ft_num (1-8)
-        for n in range(1, 9):
-            dot = tk.Label(ft_row, text=f"FT{n}",
+        self.ft_dots = {}   # key: ft_id string e.g. "F1", "R3"
+        for ft_id_key in ["F1","F2","F3","F4","R1","R2","R3","R4"]:
+            dot = tk.Label(ft_row, text=ft_id_key,
                            font=self.f_small, bg=BG_MAIN,
                            fg=COL_MUTED, padx=3)
             dot.pack(side=tk.LEFT)
-            self.ft_dots[n] = dot
+            self.ft_dots[ft_id_key] = dot
 
         tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
 
@@ -794,30 +802,26 @@ class TrayWindow:
 
     def _update_ft_dots(self) -> None:
         """
-        Update FT dot colors — flat FT1-FT8 list.
-        ft_dots key = ft_num (1-8).
-        _ft_conn_states key = (ft_num, ft_side).
-        A dot goes green if ANY side (front or rear) for that
-        ft_num has connected recently — since FT1 could be
-        either front or rear depending on the physical setup.
+        Update FT dot colors — flat F1-F4, R1-R4 list.
+        ft_dots key = ft_id string e.g. "F1", "R3".
+        _ft_conn_states key = ft_id string.
+        Green = HELLO received within grace period.
         """
         with _ft_conn_lock:
             states = dict(_ft_conn_states)
 
-        for n, dot in self.ft_dots.items():
-            # Check both front and rear for this ft_num
-            alive = False
-            for side in ("front", "rear"):
-                info = states.get((n, side), {})
-                if info.get("connected") and info.get("last_hello"):
-                    try:
-                        secs = (datetime.now() - info["last_hello"]).total_seconds()
-                        if secs < 3660:
-                            alive = True
-                            break
-                    except Exception:
-                        pass
-            dot.config(fg=COL_OK if alive else COL_DISC)
+        for ft_id_key, dot in self.ft_dots.items():
+            info = states.get(ft_id_key, {})
+            if info.get("connected") and info.get("last_hello"):
+                try:
+                    secs  = (datetime.now() -
+                             info["last_hello"]).total_seconds()
+                    alive = secs < 3660
+                except Exception:
+                    alive = False
+                dot.config(fg=COL_OK if alive else COL_DISC)
+            else:
+                dot.config(fg=COL_MUTED)
 
     def _check_app_status(self) -> None:
         import subprocess
