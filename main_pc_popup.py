@@ -24,7 +24,7 @@ from tkinter import font as tkfont
 from datetime import datetime
 
 from config_loader import get_config
-from ini_editor import uncheck_dl
+from ini_editor import uncheck_dl, uncheck_ft
 from inline_automation import run_stop_sequence
 from log_cleanup import cleanup_old_logs, DailyFileHandler
 
@@ -118,50 +118,70 @@ COL_BORDER = "#30363d"
 # =========================================================
 # Sequential task queue worker
 # =========================================================
+def _task_display_name(task_key: str) -> str:
+    """
+    Human-readable name for tray/toast display.
+    DL task:  "DL06"           → "DL06"
+    FT task:  "FT1_FRONT_Function 1" → "FT1 Front — Function 1"
+    """
+    if task_key.upper().startswith("FT"):
+        try:
+            parts = task_key.split("_", 2)
+            ft    = parts[0]                        # "FT1"
+            side  = parts[1].capitalize()           # "Front"
+            func  = parts[2] if len(parts) > 2 else ""  # "Function 1"
+            return f"{ft} {side} — {func}"
+        except Exception:
+            return task_key
+    return task_key
+
+
 def _queue_worker() -> None:
     logger.info("[queue] Worker started")
     while True:
         dl_name = _task_queue.get()
         if dl_name is None:
             break
+        display = _task_display_name(dl_name)
         try:
-            logger.info(f"[queue] Processing stop for {dl_name}")
+            logger.info(f"[queue] Processing stop for {display}")
             success = run_stop_sequence(dl_name)
 
             ts = datetime.now().strftime("%H:%M:%S")
             if success:
-                # Automation confirmed — mark as stopped
                 with _state_lock:
                     _dl_states[dl_name] = {"state": "stopped", "ts": ts}
-
-                # Queue toast
                 with _queue_lock:
                     _popup_queue.append({
                         "type":    "STOP",
-                        "dl_name": dl_name,
+                        "dl_name": display,
                         "ts":      ts,
                     })
-
-                logger.info(f"[queue] {dl_name} — stopped OK at {ts}")
+                logger.info(f"[queue] {display} — stopped OK at {ts}")
             else:
-                # Automation failed — mark as error, operator must act
                 with _state_lock:
                     _dl_states[dl_name] = {"state": "error", "ts": ts}
-
-                # Queue error toast
                 with _queue_lock:
                     _popup_queue.append({
                         "type":    "ERROR",
-                        "dl_name": dl_name,
+                        "dl_name": display,
                         "ts":      ts,
                     })
-
                 logger.error(
-                    f"[queue] {dl_name} — automation FAILED at {ts}. "
+                    f"[queue] {display} — automation FAILED at {ts}. "
                     f"Manual intervention required."
                 )
         except Exception as e:
-            logger.error(f"[queue] {dl_name} — error: {e}")
+            logger.error(f"[queue] {display} — unexpected error: {e}")
+            ts = datetime.now().strftime("%H:%M:%S")
+            with _state_lock:
+                _dl_states[dl_name] = {"state": "error", "ts": ts}
+            with _queue_lock:
+                _popup_queue.append({
+                    "type":    "ERROR",
+                    "dl_name": display,
+                    "ts":      ts,
+                })
         finally:
             _task_queue.task_done()
 
@@ -201,14 +221,16 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
                 _conn_state["last_hello"] = datetime.now()
                 _conn_state["dl_pc_addr"] = addr[0]
 
-            # Queue toast
-            with _queue_lock:
-                _popup_queue.append({
-                    "type": "HELLO",
-                    "addr": addr[0],
-                    "ts":   datetime.now().strftime("%H:%M:%S"),
-                })
-
+            # Toast only on FIRST connect or reconnect, not every heartbeat
+            with _conn_lock:
+                was_connected = _conn_state.get("connected", False)
+            if not was_connected:
+                with _queue_lock:
+                    _popup_queue.append({
+                        "type": "HELLO",
+                        "addr": addr[0],
+                        "ts":   datetime.now().strftime("%H:%M:%S"),
+                    })
             logger.info(f"[listener] HELLO from {addr[0]} — ACK sent, Connected")
 
         # ── STOP command ──────────────────────────────────
@@ -308,8 +330,10 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
 
         if command == "HELLO":
             _send_response(conn, "ACK", "Connected")
+            # Key is (ft_num, ft_side) so FT1 Front and FT1 Rear
+            # are stored independently and don't overwrite each other
             with _ft_conn_lock:
-                _ft_conn_states[ft_num] = {
+                _ft_conn_states[(ft_num, ft_side)] = {
                     "connected":  True,
                     "last_hello": datetime.now(),
                     "addr":       addr[0],
@@ -396,16 +420,18 @@ def show_toast(root: tk.Tk, item: dict) -> None:
     toast.configure(bg=BG_CARD)
 
     kind      = item["type"]
+    dl_name   = item.get("dl_name", "")
+    is_ft     = dl_name.upper().startswith("FT")
     if kind == "STOP":
         bar_color = COL_BLOCK
         icon      = "⛔"
-        title     = "DL STOPPED"
-        body_text = f"{item['dl_name']}  automation completed"
+        title     = "FT STOPPED" if is_ft else "DL STOPPED"
+        body_text = f"{dl_name}  automation completed"
     elif kind == "ERROR":
         bar_color = COL_WARN
         icon      = "⚠"
         title     = "AUTOMATION FAILED"
-        body_text = f"{item['dl_name']}  manual intervention required"
+        body_text = f"{dl_name}  manual intervention required"
     else:   # HELLO
         bar_color = COL_OK
         icon      = "🔗"
@@ -465,7 +491,7 @@ def show_toast(root: tk.Tk, item: dict) -> None:
 class TrayWindow:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("DL Monitor — Main PC")
+        self.root.title("DL & FT Monitor — Main PC")
         self.root.configure(bg=BG_MAIN)
         self.root.attributes("-topmost", True)
         self.root.resizable(False, False)
@@ -490,7 +516,7 @@ class TrayWindow:
         # Header
         hdr = tk.Frame(self.root, bg=BG_HEADER, pady=8)
         hdr.pack(fill=tk.X)
-        tk.Label(hdr, text="DL Monitor  •  Main PC",
+        tk.Label(hdr, text="DL & FT Monitor  •  Main PC",
                  font=self.f_title, bg=BG_HEADER,
                  fg=COL_WHITE).pack(padx=10)
 
@@ -526,9 +552,10 @@ class TrayWindow:
 
         # Listener + queue + app status
         for label_text, attr_name, default, default_color in [
-            ("Listener",   "lbl_listener", f"● port {_listen_port()}", COL_OK),
-            ("Queue",      "lbl_queue",    "0 pending",                COL_TEXT),
-            ("InLine_Pro", "lbl_app",      "checking...",              COL_MUTED),
+            ("DL port",    "lbl_listener", f"● {_listen_port()}", COL_OK),
+            ("FT port",    "lbl_ft_port",  f"● {_ft_listen_port()}", COL_OK),
+            ("Queue",      "lbl_queue",    "0 pending",           COL_TEXT),
+            ("InLine_Pro", "lbl_app",      "checking...",         COL_MUTED),
         ]:
             row = tk.Frame(self.root, bg=BG_MAIN)
             row.pack(fill=tk.X, padx=10, pady=1)
@@ -562,8 +589,8 @@ class TrayWindow:
 
         tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
 
-        # Blocked DL list header
-        tk.Label(self.root, text="Blocked DLs today",
+        # Blocked list header
+        tk.Label(self.root, text="Activity today (DL + FT)",
                  font=self.f_small, bg=BG_MAIN,
                  fg=COL_MUTED).pack(anchor="w", padx=10)
 
@@ -722,6 +749,7 @@ class TrayWindow:
             ts        = info["ts"]
             color     = STATE_COLOR.get(state, COL_MUTED)
             label_txt = STATE_LABEL.get(state, state)
+            display   = _task_display_name(dl)
 
             row = tk.Frame(self.list_frame, bg=BG_CARD,
                            pady=3, padx=8,
@@ -729,9 +757,9 @@ class TrayWindow:
                            highlightthickness=1)
             row.pack(fill=tk.X, pady=2)
 
-            tk.Label(row, text=dl, font=self.f_body,
+            tk.Label(row, text=display, font=self.f_body,
                      bg=BG_CARD, fg=color,
-                     width=6, anchor="w").pack(side=tk.LEFT)
+                     anchor="w").pack(side=tk.LEFT)
 
             tk.Label(row, text=label_txt,
                      font=self.f_small, bg=BG_CARD,
@@ -752,12 +780,8 @@ class TrayWindow:
             states = dict(_ft_conn_states)
 
         for (n, side), dot in self.ft_dots.items():
-            # Find matching state entry by ft_num + side
-            info = next(
-                (v for k, v in states.items()
-                 if k == n and v.get("ft_side", "") == side),
-                {}
-            )
+            # Direct key lookup now that key is (ft_num, ft_side)
+            info = states.get((n, side), {})
             if info.get("connected") and info.get("last_hello"):
                 last = info["last_hello"]
                 try:
