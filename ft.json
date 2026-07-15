@@ -1,13 +1,12 @@
 {
-    "_comment": "FT PC configuration - ft_number is 1-4 for both front and rear, ft_side decides the rack",
+    "_comment": "FT PC config — set ft_id once and never change it. F1-F4=Front Rack Function 1-4, R1-R4=Rear Rack Function 1-4",
     "ft": {
-        "ft_number": 1,
-        "ft_side": "front"
+        "ft_id": "F1"
     },
     "network": {
         "main_pc_ip": "192.168.0.21",
         "main_pc_port": 8998,
-        "ping_timeout_sec": 1
+        "timeout_sec": 10
     },
     "paths": {
         "log_dir": "C:\\FT\\logs",
@@ -15,7 +14,7 @@
     },
     "monitor": {
         "poll_interval_sec": 30,
-        "max_record_window": 60
+        "record_window": 60
     },
     "thresholds": {
         "warn_at_fail": 2,
