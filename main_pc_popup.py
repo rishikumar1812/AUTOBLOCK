@@ -551,11 +551,22 @@ class TrayWindow:
         tk.Frame(self.root, bg="#30363d", height=1).pack(fill=tk.X, pady=4)
 
         # Listener + queue + app status
+        # Ports on same line
+        ports_row = tk.Frame(self.root, bg=BG_MAIN)
+        ports_row.pack(fill=tk.X, padx=10, pady=1)
+        tk.Label(ports_row, text="Ports", font=self.f_small,
+                 bg=BG_MAIN, fg=COL_MUTED, width=10,
+                 anchor="w").pack(side=tk.LEFT)
+        self.lbl_listener = tk.Label(
+            ports_row,
+            text=f"● DL:{_listen_port()}  FT:{_ft_listen_port()}",
+            font=self.f_small, bg=BG_MAIN, fg=COL_OK)
+        self.lbl_listener.pack(side=tk.LEFT, padx=4)
+
+        # Queue and app status
         for label_text, attr_name, default, default_color in [
-            ("DL port",    "lbl_listener", f"● {_listen_port()}", COL_OK),
-            ("FT port",    "lbl_ft_port",  f"● {_ft_listen_port()}", COL_OK),
-            ("Queue",      "lbl_queue",    "0 pending",           COL_TEXT),
-            ("InLine_Pro", "lbl_app",      "checking...",         COL_MUTED),
+            ("Queue",      "lbl_queue",   "0 pending",  COL_TEXT),
+            ("InLine_Pro", "lbl_app",     "checking...", COL_MUTED),
         ]:
             row = tk.Frame(self.root, bg=BG_MAIN)
             row.pack(fill=tk.X, padx=10, pady=1)
@@ -570,22 +581,18 @@ class TrayWindow:
         tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
 
         # ── FT PC connection dots ─────────────────────────
-        # FT dots — two rows: Front FT1-4 and Rear FT1-4
+        # FT dots — flat single row FT1-FT8
         ft_block = tk.Frame(self.root, bg=BG_MAIN, padx=10)
         ft_block.pack(fill=tk.X, pady=(2, 2))
-        self.ft_dots = {}   # key: (ft_num, side) e.g. (1,"front")
-        for side_label, side_key in [("Front:", "front"), ("Rear: ", "rear")]:
-            row = tk.Frame(ft_block, bg=BG_MAIN)
-            row.pack(fill=tk.X)
-            tk.Label(row, text=side_label, font=self.f_small,
-                     bg=BG_MAIN, fg=COL_MUTED,
-                     width=6, anchor="w").pack(side=tk.LEFT)
-            for n in range(1, 5):
-                dot = tk.Label(row, text=f"FT{n}",
-                               font=self.f_small, bg=BG_MAIN,
-                               fg=COL_MUTED, padx=3)
-                dot.pack(side=tk.LEFT)
-                self.ft_dots[(n, side_key)] = dot
+        ft_row = tk.Frame(ft_block, bg=BG_MAIN)
+        ft_row.pack(fill=tk.X)
+        self.ft_dots = {}   # key: ft_num (1-8)
+        for n in range(1, 9):
+            dot = tk.Label(ft_row, text=f"FT{n}",
+                           font=self.f_small, bg=BG_MAIN,
+                           fg=COL_MUTED, padx=3)
+            dot.pack(side=tk.LEFT)
+            self.ft_dots[n] = dot
 
         tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
 
@@ -636,15 +643,19 @@ class TrayWindow:
         tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X)
 
         ft = tk.Frame(self.root, bg=BG_MAIN, pady=6)
-        ft.pack(fill=tk.X, side=tk.BOTTOM)   # anchor to bottom
+        ft.pack(fill=tk.X, side=tk.BOTTOM)
         self.lbl_time = tk.Label(ft, text="", font=self.f_small,
                                   bg=BG_MAIN, fg=COL_MUTED)
         self.lbl_time.pack()
-        tk.Button(ft, text="Clear blocked",
-                  command=self._clear_blocked,
-                  bg=BG_HEADER, fg=COL_TEXT,
-                  font=self.f_small, relief=tk.FLAT,
-                  padx=10, pady=3, cursor="hand2").pack(pady=(2, 0))
+        # Clear button — always visible, greyed when nothing to clear
+        self.btn_clear = tk.Button(
+            ft, text="Clear blocked",
+            command=self._clear_blocked,
+            bg=BG_HEADER, fg=COL_MUTED,   # starts greyed
+            font=self.f_small, relief=tk.FLAT,
+            padx=10, pady=3, cursor="hand2",
+            state=tk.DISABLED)
+        self.btn_clear.pack(pady=(2, 0))
 
     # ── Connection dot animation ──────────────────────────
     def _start_dot_animation(self):
@@ -709,6 +720,18 @@ class TrayWindow:
         with _state_lock:
             states = dict(_dl_states)
 
+        # Enable/disable clear button based on whether there is activity
+        if states:
+            self.btn_clear.config(
+                state=tk.NORMAL,
+                fg=COL_TEXT,
+                cursor="hand2")
+        else:
+            self.btn_clear.config(
+                state=tk.DISABLED,
+                fg=COL_MUTED,
+                cursor="arrow")
+
         if not states:
             tk.Label(self.list_frame, text="No activity yet",
                      font=self.f_small, bg=BG_MAIN,
@@ -771,27 +794,30 @@ class TrayWindow:
 
     def _update_ft_dots(self) -> None:
         """
-        Update FT dot colors.
-        ft_dots key is (ft_number, side) e.g. (1, "front").
-        _ft_conn_states key is ft_num (int); side stored in info["ft_side"].
-        Green = connected recently, Red = not connected.
+        Update FT dot colors — flat FT1-FT8 list.
+        ft_dots key = ft_num (1-8).
+        _ft_conn_states key = (ft_num, ft_side).
+        A dot goes green if ANY side (front or rear) for that
+        ft_num has connected recently — since FT1 could be
+        either front or rear depending on the physical setup.
         """
         with _ft_conn_lock:
             states = dict(_ft_conn_states)
 
-        for (n, side), dot in self.ft_dots.items():
-            # Direct key lookup now that key is (ft_num, ft_side)
-            info = states.get((n, side), {})
-            if info.get("connected") and info.get("last_hello"):
-                last = info["last_hello"]
-                try:
-                    secs  = (datetime.now() - last).total_seconds()
-                    alive = secs < 3660   # ~1hr grace
-                except Exception:
-                    alive = False
-                dot.config(fg=COL_OK if alive else COL_DISC)
-            else:
-                dot.config(fg=COL_MUTED)
+        for n, dot in self.ft_dots.items():
+            # Check both front and rear for this ft_num
+            alive = False
+            for side in ("front", "rear"):
+                info = states.get((n, side), {})
+                if info.get("connected") and info.get("last_hello"):
+                    try:
+                        secs = (datetime.now() - info["last_hello"]).total_seconds()
+                        if secs < 3660:
+                            alive = True
+                            break
+                    except Exception:
+                        pass
+            dot.config(fg=COL_OK if alive else COL_DISC)
 
     def _check_app_status(self) -> None:
         import subprocess
