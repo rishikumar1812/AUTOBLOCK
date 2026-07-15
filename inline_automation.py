@@ -476,20 +476,22 @@ def _click_dialog_button(app:Application,button_name:str)->None:
 # task_key format: "FT1_FRONT_Function 1"
 # =========================================================
 def _is_ft_task(task_key: str) -> bool:
-    return task_key.upper().startswith("FT")
+    return task_key.upper().startswith("FT_")
 
 
 def _parse_ft_task(task_key: str) -> tuple:
     """
-    Parse 'FT1_FRONT_Function 1' into (rack, function_num).
-    rack: 'front' or 'rear'
-    function_num: 1-4
+    Parse new format 'FT_F1_front_Function 1' into (rack, function_num).
+    Format: FT_{ft_id}_{rack}_{function_label}
+    e.g. 'FT_F1_front_Function 1' → ('front', 1)
+         'FT_R3_rear_Function 3'  → ('rear',  3)
     """
-    parts = task_key.split("_", 2)   # ['FT1', 'FRONT', 'Function 1']
-    if len(parts) < 3:
+    # "FT_F1_front_Function 1" → ["FT", "F1", "front", "Function 1"]
+    parts = task_key.split("_", 3)
+    if len(parts) < 4:
         raise ValueError(f"Invalid FT task key: {task_key!r}")
-    rack         = parts[1].lower()        # 'front' or 'rear'
-    function_str = parts[2]               # 'Function 1'
+    rack         = parts[2].lower()    # 'front' or 'rear'
+    function_str = parts[3]            # 'Function 1'
     try:
         fn_num = int(function_str.split()[-1])
     except (ValueError, IndexError):
