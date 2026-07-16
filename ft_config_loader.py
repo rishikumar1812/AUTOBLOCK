@@ -20,7 +20,7 @@ import json
 
 _DEFAULTS = {
     "ft": {
-        "ft_id": "F1",
+        "ft_id": "R3",
     },
     "network": {
         "main_pc_ip":   "192.168.0.21",
@@ -28,8 +28,8 @@ _DEFAULTS = {
         "timeout_sec":  10,
     },
     "paths": {
-        "log_dir":     "C:\\FT\\logs",
-        "log_reg_dir": "C:\\FT\\log_register",
+        "log_dir":     "DGS//logs",
+        "log_reg_dir": "log_register",
     },
     "monitor": {
         "poll_interval_sec": 30,
@@ -41,6 +41,7 @@ _DEFAULTS = {
     },
     "dashboard": {
         "refresh_interval_ms": 10000,
+        "no_data_stop_minutes": 60,
         "heartbeat_sec":       1800,
     },
 }
@@ -108,7 +109,7 @@ def warn_at_fail()  -> int: return int(get_config()["thresholds"]["warn_at_fail"
 def block_at_fail() -> int: return int(get_config()["thresholds"]["block_at_fails"])
 def refresh_ms()    -> int: return int(get_config()["dashboard"]["refresh_interval_ms"])
 def heartbeat_sec() -> int: return int(get_config()["dashboard"]["heartbeat_sec"])
-
+def NO_DATA_MINUTES()->int: return int(get_config()['dashboard']["no_data_stop_minutes"])
 
 def ft_mapping() -> tuple:
     """
