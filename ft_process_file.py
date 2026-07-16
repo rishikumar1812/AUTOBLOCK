@@ -19,7 +19,8 @@ from datetime import datetime, date
 
 from ft_config_loader import (
     log_dir, log_reg_dir, poll_interval, record_window,
-    warn_at_fail, block_at_fail, ft_display_label, ft_id
+    warn_at_fail, block_at_fail, ft_display_label, ft_id,
+    NO_DATA_MINUTES
 )
 from ft_network_sender import send_stop_signal
 from log_cleanup import cleanup_old_logs, DailyFileHandler
@@ -113,18 +114,18 @@ def read_csv_file(filepath: str):
 
     for section in sections:
         for line in section:
-            if line.startswith("RESULT:"):
-                current["RESULT"] = line.split("RESULT:")[1].strip()
-            if line.startswith("TIME :"):
+            if line.startswith("RESULT :"):
+                current["RESULT"] = line.split("RESULT :")[1].strip()
+            elif line.startswith("TIME :"):
                 current["Update_Time"] = line.split("TIME :")[1].strip()
-            if line.startswith("DATE :"):
+            elif line.startswith("DATE :"):
                 current["DATE"] = line.split("DATE :")[1].strip()
-            if line.startswith("ARRAY :"):
-                current["ARRAY"] = line.split("ARRAY :")[1].strip()
-            if line.startswith("JIG :"):
+            elif line.startswith("JIG :"):
                 current["JIG"] = line.split("JIG :")[1].strip()
+            # Collect record when all required fields found
+            # ARRAY not required — FT CSV format has no ARRAY field
             if all(k in current for k in
-                   ["DATE", "Update_Time", "JIG", "ARRAY", "RESULT"]):
+                   ["DATE", "Update_Time", "JIG", "RESULT"]):
                 rows.append(current)
                 current = {}
 
@@ -132,9 +133,12 @@ def read_csv_file(filepath: str):
         return None
 
     df = pd.DataFrame(rows, columns=["DATE", "Update_Time",
-                                     "JIG", "ARRAY", "RESULT"])
+                                     "JIG", "RESULT"])
+    # DATE format is 2026/07/08 (slashes) — use infer_datetime_format
+    # DATE format: 2026/07/08 — pandas handles slashes automatically
     df["Time_stamp"] = pd.to_datetime(
-        df["DATE"] + " " + df["Update_Time"], errors="coerce")
+        df["DATE"] + " " + df["Update_Time"],
+        errors="coerce")
     return df.sort_values("Time_stamp").reset_index(drop=True)
 
 
@@ -171,7 +175,6 @@ def scan_and_check() -> dict:
         if f.endswith(".csv") and is_today(
             os.path.join(directory, f))
     ]
-
     if not all_files:
         logger.debug(f"[ft_process] {label} — no CSV files today")
         return _empty_stats("STOPPED")
@@ -182,25 +185,28 @@ def scan_and_check() -> dict:
         df = read_csv_file(fpath)
         if df is not None:
             combined = pd.concat([combined, df], ignore_index=True)
-
     if combined.empty:
         return _empty_stats("STOPPED")
 
     combined  = combined.sort_values("Time_stamp").reset_index(drop=True)
+    print(f"[ft_process] {label} — combined {len(combined)} records from "
+          f"{len(all_files)} files")
+    print(f"combined data:\n{combined}")
     latest_ts = combined["Time_stamp"].max()
+    print(f"[ft_process] {label} — latest timestamp: {latest_ts}")
 
-    # Check if last data is older than 60 minutes → STOPPED
     try:
-        minutes_since = (datetime.now() - latest_ts).total_seconds() / 60
+        minutes_since=(datetime.now()-latest_ts).total_seconds()/60
     except Exception:
-        minutes_since = 0
-
-    if minutes_since >= 60:
+        minutes_since=0
+    
+    no_data_limit = NO_DATA_MINUTES()
+    if minutes_since >= no_data_limit:
         logger.info(
-            f"[ft_process] {label} — no data for {int(minutes_since)}min → STOPPED")
+            f"[ft_process] {label} — no data for {int(minutes_since)}min "
+            f"(limit={no_data_limit}min) → STOPPED"
+        )
         return _empty_stats("STOPPED")
-
-    # Filter records after last stop
     last_stop_ts = get_last_stop()
     if last_stop_ts is not None:
         active = combined[combined["Time_stamp"] >
@@ -270,20 +276,21 @@ def scan_and_check() -> dict:
         f"[ft_process] {label} — {status} | "
         f"fails={fails}/{total} ({rate:.1f}%) | "
         f"files={len(all_files)}")
-
+        
     return {
-        "label":        label,
-        "ft_id":        ft_id(),
-        "status":       status,
-        "total":        total,
-        "fails":        fails,
-        "rate":         rate,
-        "fails_60":     fails_60,
-        "rate_60":      rate_60,
-        "last_stop":    last_stop_str,
-        "last_data":    latest_ts.strftime("%H:%M:%S"),
-        "blocked_min":  blocked_min,
-        "files_today":  len(all_files),
+        "label":         label,
+        "ft_id":         ft_id(),
+        "status":        status,
+        "total":         total,
+        "fails":         fails,
+        "rate":          rate,
+        "fails_60":      fails_60,
+        "rate_60":       rate_60,
+        "last_stop":     last_stop_str,
+        "last_data":     latest_ts.strftime("%H:%M:%S"),
+        "blocked_min":   blocked_min,
+        "files_today":   len(all_files),
+        "minutes_since": int(minutes_since),
     }
 
 
@@ -295,18 +302,19 @@ def _empty_stats(status="STOPPED", last_stop=None) -> dict:
         else:
             last_stop_str = last_stop.strftime("%b %d  %H:%M:%S")
     return {
-        "label":       ft_display_label(),
-        "ft_id":       ft_id(),
-        "status":      status,
-        "total":       0,
-        "fails":       0,
-        "rate":        0.0,
-        "fails_60":    0,
-        "rate_60":     0.0,
-        "last_stop":   last_stop_str,
-        "last_data":   "—",
-        "blocked_min": 0,
-        "files_today": 0,
+        "label":         ft_display_label(),
+        "ft_id":         ft_id(),
+        "status":        status,
+        "total":         0,
+        "fails":         0,
+        "rate":          0.0,
+        "fails_60":      0,
+        "rate_60":       0.0,
+        "last_stop":     last_stop_str,
+        "last_data":     "—",
+        "blocked_min":   0,
+        "files_today":   0,
+        "minutes_since": 0,
     }
 
 
