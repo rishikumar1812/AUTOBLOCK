@@ -228,15 +228,17 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
             # Reply ACK immediately
             _send_response(conn, "ACK", "Connected")
 
+            # Read was_connected BEFORE updating so toast fires on first connect
+            with _conn_lock:
+                was_connected = _conn_state["connected"]
+
             # Update connection state
             with _conn_lock:
                 _conn_state["connected"]  = True
                 _conn_state["last_hello"] = datetime.now()
                 _conn_state["dl_pc_addr"] = addr[0]
 
-            # Toast only on FIRST connect or reconnect, not every heartbeat
-            with _conn_lock:
-                was_connected = _conn_state.get("connected", False)
+            # Toast only on first connect or reconnect — not every heartbeat
             if not was_connected:
                 with _queue_lock:
                     _popup_queue.append({
@@ -555,4 +557,391 @@ class TrayWindow:
 
         self.lbl_conn_dot = tk.Label(
             conn_row, text="●", font=self.f_conn,
-        
+            bg=BG_MAIN, fg=COL_CHECK,
+        )
+        self.lbl_conn_dot.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.lbl_conn_status = tk.Label(
+            conn_row, text="Waiting for DL PC...",
+            font=self.f_conn, bg=BG_MAIN, fg=COL_CHECK,
+        )
+        self.lbl_conn_status.pack(side=tk.LEFT)
+
+        self.lbl_conn_since = tk.Label(
+            conn_bar, text="",
+            font=self.f_small, bg=BG_MAIN, fg=COL_MUTED,
+        )
+        self.lbl_conn_since.pack(anchor="w", padx=18)
+
+        # Start dot animation immediately
+        self._start_dot_animation()
+
+        tk.Frame(self.root, bg="#30363d", height=1).pack(fill=tk.X, pady=4)
+
+        # Listener + queue + app status
+        # Ports on same line
+        ports_row = tk.Frame(self.root, bg=BG_MAIN)
+        ports_row.pack(fill=tk.X, padx=10, pady=1)
+        tk.Label(ports_row, text="Ports", font=self.f_small,
+                 bg=BG_MAIN, fg=COL_MUTED, width=10,
+                 anchor="w").pack(side=tk.LEFT)
+        self.lbl_listener = tk.Label(
+            ports_row,
+            text=f"● DL:{_listen_port()}  FT:{_ft_listen_port()}",
+            font=self.f_small, bg=BG_MAIN, fg=COL_OK)
+        self.lbl_listener.pack(side=tk.LEFT, padx=4)
+
+        # Queue and app status
+        for label_text, attr_name, default, default_color in [
+            ("Queue",      "lbl_queue",   "0 pending",  COL_TEXT),
+            ("InLine_Pro", "lbl_app",     "checking...", COL_MUTED),
+        ]:
+            row = tk.Frame(self.root, bg=BG_MAIN)
+            row.pack(fill=tk.X, padx=10, pady=1)
+            tk.Label(row, text=label_text, font=self.f_small,
+                     bg=BG_MAIN, fg=COL_MUTED, width=10,
+                     anchor="w").pack(side=tk.LEFT)
+            lbl = tk.Label(row, text=default, font=self.f_small,
+                           bg=BG_MAIN, fg=default_color)
+            lbl.pack(side=tk.LEFT, padx=4)
+            setattr(self, attr_name, lbl)
+
+        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
+
+        # ── FT PC connection dots ─────────────────────────
+        # Two rows: Front (F1-F4) and Rear (R1-R4)
+        ft_block = tk.Frame(self.root, bg=BG_MAIN, padx=10)
+        ft_block.pack(fill=tk.X, pady=(2, 2))
+        self.ft_dots = {}   # key: ft_id string e.g. "F1", "R3"
+
+        for row_label, keys in [
+            ("Front:", ["F1","F2","F3","F4"]),
+            ("Rear: ", ["R1","R2","R3","R4"]),
+        ]:
+            row = tk.Frame(ft_block, bg=BG_MAIN)
+            row.pack(fill=tk.X, pady=1)
+            tk.Label(row, text=row_label, font=self.f_small,
+                     bg=BG_MAIN, fg=COL_MUTED,
+                     width=6, anchor="w").pack(side=tk.LEFT)
+            for ft_id_key in keys:
+                dot = tk.Label(row, text=ft_id_key,
+                               font=self.f_small, bg=BG_MAIN,
+                               fg=COL_MUTED, padx=3)
+                dot.pack(side=tk.LEFT)
+                self.ft_dots[ft_id_key] = dot
+
+        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
+
+        # Blocked list header
+        tk.Label(self.root, text="Activity today (DL + FT)",
+                 font=self.f_small, bg=BG_MAIN,
+                 fg=COL_MUTED).pack(anchor="w", padx=10)
+
+        # ── Scrollable list with fixed height ─────────────
+        # Canvas + scrollbar so the list never pushes the
+        # "Clear blocked" button off-screen regardless of
+        # how many DL rows accumulate.
+        list_outer = tk.Frame(self.root, bg=BG_MAIN,
+                              height=180)   # fixed max height
+        list_outer.pack(fill=tk.X, padx=10, pady=4)
+        list_outer.pack_propagate(False)    # enforce fixed height
+
+        canvas = tk.Canvas(list_outer, bg=BG_MAIN,
+                           highlightthickness=0)
+        scrollbar = tk.Scrollbar(list_outer, orient="vertical",
+                                 command=canvas.yview,
+                                 bg=BG_MAIN, troughcolor=BG_MAIN,
+                                 bd=0, width=6)
+
+        def _update_scrollbar(*args):
+            # Only show scrollbar when content overflows
+            lo, hi = map(float, args)
+            if lo <= 0.0 and hi >= 1.0:
+                scrollbar.pack_forget()
+            else:
+                scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        canvas.configure(yscrollcommand=_update_scrollbar)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.list_frame = tk.Frame(canvas, bg=BG_MAIN)
+        self._list_canvas_id = canvas.create_window(
+            (0, 0), window=self.list_frame, anchor="nw")
+
+        def _on_frame_resize(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(self._list_canvas_id, width=canvas.winfo_width())
+
+        self.list_frame.bind("<Configure>", _on_frame_resize)
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(
+                        self._list_canvas_id, width=e.width))
+
+        # Mouse wheel scroll
+        def _on_mousewheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        self._list_canvas = canvas   # saved for scroll-to-top on clear
+
+        # ── Footer — always visible, packed LAST at bottom ──
+        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X)
+
+        ft = tk.Frame(self.root, bg=BG_MAIN, pady=6)
+        ft.pack(fill=tk.X, side=tk.BOTTOM)
+        self.lbl_time = tk.Label(ft, text="", font=self.f_small,
+                                  bg=BG_MAIN, fg=COL_MUTED)
+        self.lbl_time.pack()
+        # Clear button — always visible, greyed when nothing to clear
+        self.btn_clear = tk.Button(
+            ft, text="Clear blocked",
+            command=self._clear_blocked,
+            bg=BG_HEADER, fg=COL_MUTED,   # starts greyed
+            font=self.f_small, relief=tk.FLAT,
+            padx=10, pady=3, cursor="hand2",
+            state=tk.DISABLED)
+        self.btn_clear.pack(pady=(2, 0))
+
+    # ── Connection dot animation ──────────────────────────
+    def _start_dot_animation(self):
+        self._stop_dot_animation()
+        self._animate_dots()
+
+    def _animate_dots(self):
+        dots = "." * (self._dot_count % 4)
+        self.lbl_conn_status.config(text=f"Waiting for DL PC{dots}")
+        self._dot_count += 1
+        self._dot_anim_id = self.root.after(500, self._animate_dots)
+
+    def _stop_dot_animation(self):
+        if self._dot_anim_id:
+            self.root.after_cancel(self._dot_anim_id)
+            self._dot_anim_id = None
+
+    # ── Refresh ───────────────────────────────────────────
+    def _refresh(self) -> None:
+        self._update_conn_status()
+        self._update_ft_dots()
+        self._refresh_blocked()
+
+        qsize = _task_queue.qsize()
+        self.lbl_queue.config(
+            text=f"{qsize} pending",
+            fg=COL_WARN if qsize > 0 else COL_TEXT,
+        )
+        self._check_app_status()
+        self.lbl_time.config(
+            text=f"Updated: {datetime.now().strftime('%H:%M:%S')}"
+        )
+        self.root.after(5000, self._refresh)
+
+    def _update_conn_status(self) -> None:
+        with _conn_lock:
+            connected  = _conn_state["connected"]
+            last_hello = _conn_state["last_hello"]
+            dl_addr    = _conn_state["dl_pc_addr"]
+
+        if connected and last_hello:
+            self._stop_dot_animation()
+            self.lbl_conn_dot.config(fg=COL_OK)
+            self.lbl_conn_status.config(
+                text=f"Connected  •  {dl_addr}",
+                fg=COL_OK,
+            )
+            self.lbl_conn_since.config(
+                text=f"since {last_hello.strftime('%H:%M:%S')}",
+                fg=COL_MUTED,
+            )
+        else:
+            # Still waiting for first HELLO
+            self.lbl_conn_dot.config(fg=COL_CHECK)
+            self.lbl_conn_since.config(text="", fg=COL_MUTED)
+            if self._dot_anim_id is None:
+                self._start_dot_animation()
+
+    def _refresh_blocked(self) -> None:
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+        with _state_lock:
+            states = dict(_dl_states)
+
+        # Enable/disable clear button based on whether there is activity
+        if states:
+            self.btn_clear.config(
+                state=tk.NORMAL,
+                fg=COL_TEXT,
+                cursor="hand2")
+        else:
+            self.btn_clear.config(
+                state=tk.DISABLED,
+                fg=COL_MUTED,
+                cursor="arrow")
+
+        if not states:
+            tk.Label(self.list_frame, text="No activity yet",
+                     font=self.f_small, bg=BG_MAIN,
+                     fg=COL_MUTED).pack(pady=6)
+            return
+
+        # Count each state for summary header
+        n_proc  = sum(1 for v in states.values() if v["state"] == "processing")
+        n_stop  = sum(1 for v in states.values() if v["state"] == "stopped")
+        n_err   = sum(1 for v in states.values() if v["state"] == "error")
+
+        summary = []
+        if n_proc: summary.append(f"{n_proc} processing")
+        if n_stop: summary.append(f"{n_stop} stopped")
+        if n_err:  summary.append(f"{n_err} error")
+
+        tk.Label(
+            self.list_frame,
+            text="  •  ".join(summary),
+            font=self.f_small, bg=BG_MAIN,
+            fg=COL_WARN if n_err else COL_BLOCK,
+        ).pack(anchor="w", pady=(0, 4))
+
+        # State colors and labels
+        STATE_COLOR = {
+            "processing": COL_CHECK,   # blue
+            "stopped":    COL_BLOCK,   # red
+            "error":      COL_WARN,    # yellow
+        }
+        STATE_LABEL = {
+            "processing": "Processing...",
+            "stopped":    "Stopped",
+            "error":      "⚠ Error — manual needed",
+        }
+
+        for dl, info in sorted(states.items()):
+            state     = info["state"]
+            ts        = info["ts"]
+            color     = STATE_COLOR.get(state, COL_MUTED)
+            label_txt = STATE_LABEL.get(state, state)
+            display   = _task_display_name(dl)
+
+            row = tk.Frame(self.list_frame, bg=BG_CARD,
+                           pady=3, padx=8,
+                           highlightbackground=color,
+                           highlightthickness=1)
+            row.pack(fill=tk.X, pady=2)
+
+            tk.Label(row, text=display, font=self.f_body,
+                     bg=BG_CARD, fg=color,
+                     anchor="w").pack(side=tk.LEFT)
+
+            tk.Label(row, text=label_txt,
+                     font=self.f_small, bg=BG_CARD,
+                     fg=color).pack(side=tk.LEFT, padx=(4, 8))
+
+            tk.Label(row, text=ts,
+                     font=self.f_small, bg=BG_CARD,
+                     fg=COL_MUTED).pack(side=tk.RIGHT)
+
+    def _update_ft_dots(self) -> None:
+        """
+        Update FT dot colors — flat F1-F4, R1-R4 list.
+        ft_dots key = ft_id string e.g. "F1", "R3".
+        _ft_conn_states key = ft_id string.
+        Green = HELLO received within grace period.
+        """
+        with _ft_conn_lock:
+            states = dict(_ft_conn_states)
+
+        for ft_id_key, dot in self.ft_dots.items():
+            info = states.get(ft_id_key, {})
+            if info.get("connected") and info.get("last_hello"):
+                try:
+                    secs  = (datetime.now() -
+                             info["last_hello"]).total_seconds()
+                    alive = secs < 3660
+                except Exception:
+                    alive = False
+                dot.config(fg=COL_OK if alive else COL_DISC)
+            else:
+                dot.config(fg=COL_MUTED)
+
+    def _check_app_status(self) -> None:
+        import subprocess
+        exe = _exe_name()
+        try:
+            kwargs = {}
+            if sys.platform == "win32":
+                # Prevent console window flashing on Windows
+                kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+            out = subprocess.run(
+                ["tasklist", "/FI", f"IMAGENAME eq {exe}"],
+                capture_output=True, text=True, timeout=3,
+                **kwargs
+            )
+            if exe.lower() in out.stdout.lower():
+                self.lbl_app.config(text="● running", fg=COL_OK)
+            else:
+                self.lbl_app.config(text="● not found", fg=COL_BLOCK)
+        except Exception:
+            self.lbl_app.config(text="● unknown", fg=COL_MUTED)
+
+    def _poll_popup_queue(self) -> None:
+        with _queue_lock:
+            while _popup_queue:
+                show_toast(self.root, _popup_queue.pop(0))
+        self.root.after(500, self._poll_popup_queue)
+
+    def _clear_blocked(self) -> None:
+        with _state_lock:
+            _dl_states.clear()
+        logger.info("[tray] DL state list cleared by operator")
+        self._refresh_blocked()
+        # Scroll list back to top after clearing
+        try:
+            self._list_canvas.yview_moveto(0)
+        except Exception:
+            pass
+
+
+# =========================================================
+# Spy helper
+# =========================================================
+def _spy_controls() -> None:
+    from pywinauto import Application
+    title = get_config()["app"]["window_title"]
+    print(f"\nConnecting to: '{title}' ...")
+    try:
+        app = Application(backend="uia").connect(title=title, timeout=10)
+        win = app.window(title=title)
+        print("\n=== Main Window Controls ===")
+        win.print_control_identifiers()
+        print("\nOpen any dialog then press Enter ...")
+        input()
+        dlg = app.top_window()
+        print("\n=== Top Dialog Controls ===")
+        dlg.print_control_identifiers()
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+# =========================================================
+# Entry point
+# =========================================================
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "spy":
+        _spy_controls()
+        sys.exit(0)
+
+    # Create Tk root FIRST on the main thread before starting
+    # any background threads — required on Windows for stable
+    # tkinter behaviour. Threads are started after window exists.
+    root = tk.Tk()
+    tray = TrayWindow(root)
+
+    # Start background threads after Tk is initialised
+    threading.Thread(target=_queue_worker,          daemon=True).start()
+    threading.Thread(target=_start_tcp_listener,     daemon=True).start()
+    threading.Thread(target=_start_ft_tcp_listener,  daemon=True).start()
+
+    logger.info(
+        f"[main] Main PC popup started — "
+        f"DL port={_listen_port()}, FT port={_ft_listen_port()}"
+    )
+
+    root.mainloop()
+    _task_queue.put(None)
