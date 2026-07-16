@@ -77,7 +77,15 @@ class FTConfigEditor(tk.Toplevel):
         form = tk.Frame(self, bg=BG_POPUP, padx=24, pady=8)
         form.pack()
 
-        cfg = get_config()
+        try:
+            cfg = get_config()
+        except Exception:
+            cfg = {
+                "ft": {"ft_id": "F1"},
+                "network": {"main_pc_ip": "192.168.0.21", "main_pc_port": 8998},
+                "paths": {"log_dir": "C:\\FT\\logs"},
+                "thresholds": {"warn_at_fail": 2, "block_at_fails": 4},
+            }
         self._vars = {}
 
         # ft_id dropdown
@@ -143,11 +151,26 @@ class FTConfigEditor(tk.Toplevel):
                   cursor="hand2").pack(side=tk.LEFT, padx=8)
 
         self.update_idletasks()
-        px = parent.winfo_x() + \
-             (parent.winfo_width()  - self.winfo_width())  // 2
-        py = parent.winfo_y() + \
-             (parent.winfo_height() - self.winfo_height()) // 2
-        self.geometry(f"+{px}+{py}")
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        w  = self.winfo_reqwidth()
+        h  = self.winfo_reqheight()
+        if pw <= 1:
+            # Parent not rendered yet — center on screen
+            x = (sw - w) // 2
+            y = (sh - h) // 2
+        else:
+            x = parent.winfo_x() + (pw - w) // 2
+            y = parent.winfo_y() + (ph - h) // 2
+        # Clamp to screen bounds
+        x = max(0, min(x, sw - w))
+        y = max(0, min(y, sh - h))
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.lift()
+        self.focus_force()
 
     def _update_preview(self, *_):
         fid = self._ftid_var.get()
@@ -230,10 +253,17 @@ class FTDashboard:
             except Exception: pass
             self._dot_id = None
 
-        fid       = ft_id()
-        label     = ft_display_label()
-        rack_name = "Front Rack" if ft_rack() == "front" else "Rear Rack"
-        func      = ft_function_label()
+        # Safely read config — fall back to defaults if config missing
+        try:
+            fid       = ft_id()
+            label     = ft_display_label()
+            rack_name = "Front Rack" if ft_rack() == "front" else "Rear Rack"
+            func      = ft_function_label()
+        except Exception:
+            fid       = "F1"
+            label     = "F1 (Front Rack — Function 1)"
+            rack_name = "Front Rack"
+            func      = "Function 1"
 
         self.root.title(f"FT Monitor — {label}")
 
@@ -242,16 +272,15 @@ class FTDashboard:
         hdr.pack(fill=tk.X)
 
         tk.Label(hdr, text=f"FT Monitor  •  {label}",
-                 font=self.f_title, bg=BG_HEADER,
-                 fg=COL_WHITE).pack(side=tk.LEFT, padx=14)
+                 font=self.f_title, bg=COL_TEXT,
+                 fg=BG_HEADER).pack(side=tk.LEFT, padx=14)
 
-        tk.Button(hdr, text="⚙  Config",
+        tk.Button(hdr, text="⚙ Config",
                   command=self._open_config,
-                  bg="#21262d", fg=COL_TEXT,
-                  font=self.f_note, relief=tk.FLAT,
+                  bg=COL_TEXT, fg=BG_MAIN,
+                  font=self.f_note, relief=tk.RAISED,
                   padx=10, pady=4,
-                  bd=1, highlightbackground=COL_BDR,
-                  cursor="hand2").pack(side=tk.RIGHT, padx=10)
+                  cursor="hand2").pack(side=tk.RIGHT, padx=10, pady=4)
 
         # ── Connection bar ────────────────────────────────
         conn = tk.Frame(self.root, bg=BG_MAIN, pady=6)
@@ -270,8 +299,11 @@ class FTDashboard:
                                   bg=BG_MAIN, fg=COL_CHECK)
         self.lbl_conn.pack(side=tk.LEFT)
 
-        tk.Label(conn,
-                 text=f"Main PC: {main_pc_ip()}:{main_pc_port()}",
+        try:
+            ip_text = f"Main PC: {main_pc_ip()}:{main_pc_port()}"
+        except Exception:
+            ip_text = "Main PC: not configured"
+        tk.Label(conn, text=ip_text,
                  font=self.f_note, bg=BG_MAIN,
                  fg=COL_MUTED).pack(anchor="w", padx=18)
 
@@ -343,17 +375,19 @@ class FTDashboard:
 
         # ── Refresh button ────────────────────────────────
         tk.Button(self.root,
-                  text="⟳   Refresh Now",
+                  text="⟳  Refresh Now",
                   command=self.refresh,
-                  bg="#21262d", fg=COL_WHITE,
-                  font=self.f_bold, relief=tk.FLAT,
+                  bg=COL_TEXT, fg=BG_MAIN,
+                  font=self.f_bold, relief=tk.RAISED,
                   padx=14, pady=6,
-                  bd=1, highlightbackground=COL_BDR,
-                  cursor="hand2").pack(pady=(0, 10))
+                  cursor="hand2").pack(pady=(4, 10))
 
         # ── Footer ────────────────────────────────────────
-        tk.Label(self.root,
-                 text=f"Log: {log_dir()}   Warn≥{warn_at_fail()}  Block≥{block_at_fail()}",
+        try:
+            footer_text = f"Log: {log_dir()}   Warn≥{warn_at_fail()}  Block≥{block_at_fail()}"
+        except Exception:
+            footer_text = "Log: not configured"
+        tk.Label(self.root, text=footer_text,
                  font=self.f_note, bg=BG_HEADER,
                  fg=COL_MUTED, pady=4).pack(
             fill=tk.X, side=tk.BOTTOM)
@@ -469,7 +503,13 @@ class FTDashboard:
 
     # ── Config ────────────────────────────────────────────
     def _open_config(self):
-        FTConfigEditor(self.root, on_save=self._on_config_saved)
+        try:
+            FTConfigEditor(self.root, on_save=self._on_config_saved)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            from tkinter import messagebox
+            messagebox.showerror("Config Error", str(e), parent=self.root)
 
     def _on_config_saved(self):
         """Rebuild entire UI so new ft_id reflects everywhere instantly."""
@@ -485,6 +525,24 @@ class FTDashboard:
 # Entry point
 # =========================================================
 if __name__ == "__main__":
+    import threading
+    from ft_process_file import scan_and_check as _scan
+
+    # Start ft_process_file polling in background thread
+    # so it monitors CSVs and sends STOP signals automatically
+    import time as _time
+    from ft_config_loader import poll_interval as _poll_interval
+
+    def _process_loop():
+        while True:
+            try:
+                _scan()
+            except Exception as e:
+                print(f"[ft_process_loop] Error: {e}")
+            _time.sleep(_poll_interval())
+
+    threading.Thread(target=_process_loop, daemon=True).start()
+
     root = tk.Tk()
     root.geometry("420x560")
     root.minsize(380, 480)
