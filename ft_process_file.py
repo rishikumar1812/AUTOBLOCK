@@ -18,8 +18,8 @@ import pandas as pd
 from datetime import datetime, date
 
 from ft_config_loader import (
-    log_dir, log_reg_dir, poll_interval, max_records,
-    warn_at_fail, block_at_fail, ft_label, ft_number, ft_side
+    log_dir, log_reg_dir, poll_interval, record_window,
+    warn_at_fail, block_at_fail, ft_display_label, ft_id
 )
 from ft_network_sender import send_stop_signal
 from log_cleanup import cleanup_old_logs, DailyFileHandler
@@ -33,11 +33,12 @@ def _setup_logger() -> logging.Logger:
     os.makedirs(ldir, exist_ok=True)
     cleanup_old_logs(ldir, retention_days=7)
 
-    logger = logging.getLogger("ft_process_file")
+    logger = logging.getLogger("ft_process")
     if not logger.handlers:
         logger.setLevel(logging.INFO)
-        fh = DailyFileHandler(f"ft_process_{ft_label().replace(' ','_')}",
-                              ldir, retention_days=7)
+        safe_id = ft_id().replace("/", "_")
+        fh = DailyFileHandler(
+            f"ft_process_{safe_id}", ldir, retention_days=7)
         logger.addHandler(fh)
         sh = logging.StreamHandler()
         sh.setFormatter(
@@ -49,11 +50,11 @@ logger = _setup_logger()
 
 
 # =========================================================
-# Last stop tracker — simple JSON per FT PC
+# Last stop tracker — one shared timestamp for this FT PC
 # =========================================================
 def _last_stop_path() -> str:
-    return os.path.join(log_reg_dir(),
-                        f"ft{ft_number()}_{ft_side()}_last_stop.json")
+    safe_id = ft_id().replace("/", "_")
+    return os.path.join(log_reg_dir(), f"ft_{safe_id}_last_stop.json")
 
 
 def get_last_stop():
@@ -77,7 +78,10 @@ def save_last_stop(ts: datetime) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     try:
         with open(path, "w") as f:
-            json.dump({"last_stop": ts.isoformat()}, f)
+            json.dump({
+                "last_stop": ts.isoformat(),
+                "ft_id":     ft_id(),
+            }, f)
     except Exception as e:
         logger.error(f"[ft_process] Failed to save last_stop: {e}")
 
@@ -92,7 +96,7 @@ def read_csv_file(filepath: str):
     current         = {}
 
     try:
-        with open(filepath, "r") as f:
+        with open(filepath, "r", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if line.startswith("#INIT"):
@@ -135,8 +139,11 @@ def read_csv_file(filepath: str):
 
 
 def is_today(filepath: str) -> bool:
-    mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
-    return mtime.date() == date.today()
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+        return mtime.date() == date.today()
+    except Exception:
+        return False
 
 
 # =========================================================
@@ -145,13 +152,13 @@ def is_today(filepath: str) -> bool:
 def scan_and_check() -> dict:
     """
     Scans all CSV files in log_dir, combines today's data
-    across all stations (_01–_06), computes fail stats,
-    and sends STOP to Main PC if threshold is hit.
+    across all stations (_01-_06), computes fail stats,
+    and sends ONE STOP to Main PC if combined fails hit threshold.
 
     Returns stats dict for ft_dashboard.py to display.
     """
     directory = log_dir()
-    label     = ft_label()
+    label     = ft_display_label()
 
     if not os.path.isdir(directory):
         logger.error(f"[ft_process] Log dir not found: {directory}")
@@ -182,6 +189,17 @@ def scan_and_check() -> dict:
     combined  = combined.sort_values("Time_stamp").reset_index(drop=True)
     latest_ts = combined["Time_stamp"].max()
 
+    # Check if last data is older than 60 minutes → STOPPED
+    try:
+        minutes_since = (datetime.now() - latest_ts).total_seconds() / 60
+    except Exception:
+        minutes_since = 0
+
+    if minutes_since >= 60:
+        logger.info(
+            f"[ft_process] {label} — no data for {int(minutes_since)}min → STOPPED")
+        return _empty_stats("STOPPED")
+
     # Filter records after last stop
     last_stop_ts = get_last_stop()
     if last_stop_ts is not None:
@@ -190,8 +208,8 @@ def scan_and_check() -> dict:
     else:
         active = combined
 
-    if len(active) > max_records():
-        active = active.tail(max_records()).reset_index(drop=True)
+    if len(active) > record_window():
+        active = active.tail(record_window()).reset_index(drop=True)
 
     total = len(active)
     if total == 0:
@@ -204,7 +222,7 @@ def scan_and_check() -> dict:
     pass_count = int(active[active["RESULT"].str.upper() == "PASS"].shape[0])
     rate       = (fails / total * 100) if total > 0 else 0.0
 
-    # Last-60 for display even when blocked
+    # Last-60 stats for display
     last60   = combined.tail(60)
     fails_60 = int(last60[last60["RESULT"].str.upper() == "FAIL"].shape[0])
     rate_60  = (fails_60 / len(last60) * 100) if len(last60) > 0 else 0.0
@@ -219,9 +237,9 @@ def scan_and_check() -> dict:
     else:
         status = "RUNNING"
 
-    blocked_since_min = 0
+    blocked_min = 0
     if status == "BLOCKED" and last_stop_ts is not None:
-        blocked_since_min = int(
+        blocked_min = int(
             (datetime.now() - last_stop_ts).total_seconds() / 60)
 
     # Send STOP signal when threshold hit
@@ -241,41 +259,54 @@ def scan_and_check() -> dict:
                 f"[ft_process] {label} — STOP signal FAILED. "
                 f"Will retry next poll.")
 
-    stats = {
-        "label":              label,
-        "status":             status,
-        "total":              total,
-        "fails":              fails,
-        "rate":               rate,
-        "fails_60":           fails_60,
-        "rate_60":            rate_60,
-        "last_stop":          last_stop_ts.strftime("%H:%M:%S")
-                              if last_stop_ts else "—",
-        "last_data":          latest_ts.strftime("%H:%M:%S"),
-        "blocked_since_min":  blocked_since_min,
-        "files_today":        len(all_files),
-    }
+    last_stop_str = "—"
+    if last_stop_ts:
+        if last_stop_ts.date() == date.today():
+            last_stop_str = last_stop_ts.strftime("%H:%M:%S")
+        else:
+            last_stop_str = last_stop_ts.strftime("%b %d  %H:%M:%S")
+
     logger.info(
         f"[ft_process] {label} — {status} | "
         f"fails={fails}/{total} ({rate:.1f}%) | "
         f"files={len(all_files)}")
-    return stats
+
+    return {
+        "label":        label,
+        "ft_id":        ft_id(),
+        "status":       status,
+        "total":        total,
+        "fails":        fails,
+        "rate":         rate,
+        "fails_60":     fails_60,
+        "rate_60":      rate_60,
+        "last_stop":    last_stop_str,
+        "last_data":    latest_ts.strftime("%H:%M:%S"),
+        "blocked_min":  blocked_min,
+        "files_today":  len(all_files),
+    }
 
 
 def _empty_stats(status="STOPPED", last_stop=None) -> dict:
+    last_stop_str = "—"
+    if last_stop:
+        if last_stop.date() == date.today():
+            last_stop_str = last_stop.strftime("%H:%M:%S")
+        else:
+            last_stop_str = last_stop.strftime("%b %d  %H:%M:%S")
     return {
-        "label":             ft_label(),
-        "status":            status,
-        "total":             0,
-        "fails":             0,
-        "rate":              0.0,
-        "fails_60":          0,
-        "rate_60":           0.0,
-        "last_stop":         last_stop.strftime("%H:%M:%S")
-                             if last_stop else "—",
-        "last_data":         "—",
-        "blocked_since_min": 0,
-        "files_today":       0,
+        "label":       ft_display_label(),
+        "ft_id":       ft_id(),
+        "status":      status,
+        "total":       0,
+        "fails":       0,
+        "rate":        0.0,
+        "fails_60":    0,
+        "rate_60":     0.0,
+        "last_stop":   last_stop_str,
+        "last_data":   "—",
+        "blocked_min": 0,
+        "files_today": 0,
     }
 
 
@@ -284,8 +315,9 @@ def _empty_stats(status="STOPPED", last_stop=None) -> dict:
 # =========================================================
 if __name__ == "__main__":
     interval = poll_interval()
+    label    = ft_display_label()
     logger.info(
-        f"[ft_process] {ft_label()} monitor started. "
+        f"[ft_process] {label} monitor started. "
         f"Scanning every {interval}s. Press Ctrl+C to stop.")
     while True:
         try:
