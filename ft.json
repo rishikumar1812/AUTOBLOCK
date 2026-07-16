@@ -1,7 +1,7 @@
 {
-    "_comment": "FT PC config — set ft_id once and never change it. F1-F4=Front Rack Function 1-4, R1-R4=Rear Rack Function 1-4",
+    "_comment": "FT PC config \u2014 set ft_id once and never change it. F1-F4=Front Rack Function 1-4, R1-R4=Rear Rack Function 1-4",
     "ft": {
-        "ft_id": "F1"
+        "ft_id": "R1"
     },
     "network": {
         "main_pc_ip": "192.168.0.21",
@@ -9,8 +9,8 @@
         "timeout_sec": 10
     },
     "paths": {
-        "log_dir": "C:\\FT\\logs",
-        "log_reg_dir": "C:\\FT\\log_register"
+        "log_dir": "DGS//logs",
+        "log_reg_dir": "log_register"
     },
     "monitor": {
         "poll_interval_sec": 30,
@@ -22,6 +22,7 @@
     },
     "dashboard": {
         "refresh_interval_ms": 10000,
+        "no_data_stop_minutes": 60,
         "heartbeat_sec": 1800
     }
 }
