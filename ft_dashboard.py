@@ -1,9 +1,6 @@
 """
 ft_dashboard.py  —  FT PC
-Small single-card dashboard showing this FT PC's status.
-Runs ft_process_file.scan_and_check() on refresh.
-Shows per-station breakdown, connection status, config editor.
-
+Small single-card dashboard showing this FT PC status.
 Run:  python ft_dashboard.py
 """
 
@@ -49,6 +46,7 @@ def _status_color(status: str) -> str:
         "BLOCKED": COL_BLOCK,
         "STOPPED": COL_STOP,
         "EMPTY":   COL_MUTED,
+        "NO DIR":  COL_MUTED,
     }.get(status, COL_STOP)
 
 
@@ -72,7 +70,7 @@ class FTConfigEditor(tk.Toplevel):
                  font=f_title, bg=BG_POPUP,
                  fg=COL_WHITE).pack(pady=(16, 2))
         tk.Label(self,
-                 text="Set ft_id once — it identifies this PC permanently.",
+                 text="Set ft_id once — identifies this PC permanently.",
                  font=f_note, bg=BG_POPUP,
                  fg=COL_MUTED).pack(pady=(0, 10))
 
@@ -82,13 +80,13 @@ class FTConfigEditor(tk.Toplevel):
         cfg = get_config()
         self._vars = {}
 
-        # ── ft_id dropdown ────────────────────────────────
+        # ft_id dropdown
         tk.Label(form, text="FT ID", font=f_label,
                  bg=BG_POPUP, fg=COL_TEXT,
                  anchor="w", width=18).grid(
             row=0, column=0, sticky="w", pady=5)
 
-        ft_ids    = list(_FT_MAP.keys())
+        ft_ids = list(_FT_MAP.keys())
         self._ftid_var = tk.StringVar(master=self,
                                       value=cfg["ft"]["ft_id"])
         ft_menu = tk.OptionMenu(form, self._ftid_var, *ft_ids)
@@ -100,25 +98,24 @@ class FTConfigEditor(tk.Toplevel):
                                font=f_label)
         ft_menu.grid(row=0, column=1, sticky="w", padx=8)
 
-        # Preview label — updates when ft_id changes
+        # Live preview
         self._preview = tk.Label(form, text="", font=f_note,
-                                  bg=BG_POPUP, fg=COL_MUTED)
+                                  bg=BG_POPUP, fg=COL_CHECK)
         self._preview.grid(row=1, column=0, columnspan=2,
-                           sticky="w", pady=(0, 6))
+                           sticky="w", pady=(0, 8))
         self._ftid_var.trace_add("write", self._update_preview)
         self._update_preview()
 
-        # ── Text fields ───────────────────────────────────
+        # Text fields
         text_fields = [
-            ("Main PC IP",      "main_ip",  cfg["network"]["main_pc_ip"]),
-            ("Main PC Port",    "main_port",str(cfg["network"]["main_pc_port"])),
-            ("Log Directory",   "log_dir",  cfg["paths"]["log_dir"]),
-            ("Warn at fails ≥", "warn",     str(cfg["thresholds"]["warn_at_fail"])),
-            ("Block at fails ≥","block",    str(cfg["thresholds"]["block_at_fails"])),
+            ("Main PC IP",       "main_ip",   cfg["network"]["main_pc_ip"]),
+            ("Main PC Port",     "main_port", str(cfg["network"]["main_pc_port"])),
+            ("Log Directory",    "log_dir",   cfg["paths"]["log_dir"]),
+            ("Warn at fails ≥",  "warn",      str(cfg["thresholds"]["warn_at_fail"])),
+            ("Block at fails ≥", "block",     str(cfg["thresholds"]["block_at_fails"])),
         ]
-
         for i, (label, key, default) in enumerate(text_fields):
-            r = i + 2   # start after ft_id + preview rows
+            r = i + 2
             tk.Label(form, text=label, font=f_label,
                      bg=BG_POPUP, fg=COL_TEXT,
                      anchor="w", width=18).grid(
@@ -131,7 +128,7 @@ class FTConfigEditor(tk.Toplevel):
                 row=r, column=1, padx=8, sticky="w")
             self._vars[key] = var
 
-        # ── Buttons ───────────────────────────────────────
+        # Buttons
         btn_row = tk.Frame(self, bg=BG_POPUP)
         btn_row.pack(pady=16)
         tk.Button(btn_row, text="Save",
@@ -158,26 +155,27 @@ class FTConfigEditor(tk.Toplevel):
             rack, fn, label = _FT_MAP[fid]
             rack_name = "Front Rack" if rack == "front" else "Rear Rack"
             self._preview.config(
-                text=f"→ {rack_name} — {label}")
+                text=f"→ {rack_name} — {label}",
+                fg=COL_CHECK)
         else:
-            self._preview.config(text="→ Invalid FT ID")
+            self._preview.config(
+                text="→ Invalid FT ID", fg=COL_BLOCK)
 
     def _save(self):
         try:
-            fid    = self._ftid_var.get().upper()
-            ip     = self._vars["main_ip"].get().strip()
-            port   = int(self._vars["main_port"].get())
-            ldir   = self._vars["log_dir"].get().strip()
-            warn   = int(self._vars["warn"].get())
-            block  = int(self._vars["block"].get())
+            fid   = self._ftid_var.get().upper()
+            ip    = self._vars["main_ip"].get().strip()
+            port  = int(self._vars["main_port"].get())
+            ldir  = self._vars["log_dir"].get().strip()
+            warn  = int(self._vars["warn"].get())
+            block = int(self._vars["block"].get())
 
             if fid not in _FT_MAP:
-                raise ValueError(
-                    f"Invalid FT ID '{fid}'. Must be F1-F4 or R1-R4.")
+                raise ValueError(f"Invalid FT ID '{fid}'.")
             if not ip:
-                raise ValueError("Main PC IP cannot be empty")
+                raise ValueError("Main PC IP cannot be empty.")
             if warn >= block:
-                raise ValueError("Warn must be less than Block")
+                raise ValueError("Warn must be less than Block.")
         except ValueError as e:
             messagebox.showerror("Invalid Input", str(e), parent=self)
             return
@@ -199,159 +197,209 @@ class FTConfigEditor(tk.Toplevel):
 # =========================================================
 class FTDashboard:
     def __init__(self, root: tk.Tk):
-        self.root         = root
-        self._after_id    = None
-        self._hb_id       = None
-        self._conn        = False
-        self._last_stats  = _empty_stats()
-        self._dot_count   = 0
-        self._dot_id      = None
+        self.root        = root
+        self._after_id   = None
+        self._hb_id      = None
+        self._conn       = False
+        self._last_stats = _empty_stats()
+        self._dot_count  = 0
+        self._dot_id     = None
 
-        self.f_title  = tkfont.Font(family="Consolas", size=12, weight="bold")
-        self.f_name   = tkfont.Font(family="Consolas", size=11, weight="bold")
-        self.f_val    = tkfont.Font(family="Consolas", size=10)
-        self.f_status = tkfont.Font(family="Consolas", size=9,  weight="bold")
-        self.f_sub    = tkfont.Font(family="Consolas", size=8)
+        self.f_title    = tkfont.Font(family="Consolas", size=13, weight="bold")
+        self.f_name     = tkfont.Font(family="Consolas", size=12, weight="bold")
+        self.f_status   = tkfont.Font(family="Consolas", size=9,  weight="bold")
+        self.f_bold     = tkfont.Font(family="Consolas", size=9,  weight="bold")
+        self.f_sub      = tkfont.Font(family="Consolas", size=9)
+        self.f_note     = tkfont.Font(family="Consolas", size=8)
 
-        self._set_title()
         self.root.configure(bg=BG_MAIN)
         self.root.resizable(False, False)
-
-        self._build()
+        self._rebuild_ui()
         self._start_handshake()
         self.refresh()
 
-    def _set_title(self):
-        self.root.title(f"FT Monitor — {ft_display_label()}")
+    # ── Full UI rebuild — called on init and after config save ──
+    def _rebuild_ui(self):
+        """Destroy and recreate all widgets so config changes reflect immediately."""
+        for w in self.root.winfo_children():
+            w.destroy()
 
-    # ── Build UI ──────────────────────────────────────────
-    def _build(self):
-        # Header
-        hdr = tk.Frame(self.root, bg=BG_HEADER, pady=8)
+        # Cancel any pending animation
+        if self._dot_id:
+            try: self.root.after_cancel(self._dot_id)
+            except Exception: pass
+            self._dot_id = None
+
+        fid       = ft_id()
+        label     = ft_display_label()
+        rack_name = "Front Rack" if ft_rack() == "front" else "Rear Rack"
+        func      = ft_function_label()
+
+        self.root.title(f"FT Monitor — {label}")
+
+        # ── Header ────────────────────────────────────────
+        hdr = tk.Frame(self.root, bg=BG_HEADER, pady=10)
         hdr.pack(fill=tk.X)
-        tk.Label(hdr, text=f"FT Monitor  •  {ft_display_label()}",
+
+        tk.Label(hdr, text=f"FT Monitor  •  {label}",
                  font=self.f_title, bg=BG_HEADER,
                  fg=COL_WHITE).pack(side=tk.LEFT, padx=14)
-        tk.Button(hdr, text="⚙ Config",
+
+        tk.Button(hdr, text="⚙  Config",
                   command=self._open_config,
-                  bg=BG_HEADER, fg=COL_TEXT,
-                  font=self.f_sub, relief=tk.FLAT,
+                  bg="#21262d", fg=COL_TEXT,
+                  font=self.f_note, relief=tk.FLAT,
                   padx=10, pady=4,
+                  bd=1, highlightbackground=COL_BDR,
                   cursor="hand2").pack(side=tk.RIGHT, padx=10)
 
-        # Connection bar
-        conn = tk.Frame(self.root, bg=BG_MAIN, pady=5)
+        # ── Connection bar ────────────────────────────────
+        conn = tk.Frame(self.root, bg=BG_MAIN, pady=6)
         conn.pack(fill=tk.X, padx=14)
+
         crow = tk.Frame(conn, bg=BG_MAIN)
         crow.pack(fill=tk.X)
+
         self.lbl_dot = tk.Label(crow, text="●",
                                  font=self.f_status,
                                  bg=BG_MAIN, fg=COL_CHECK)
-        self.lbl_dot.pack(side=tk.LEFT, padx=(0, 5))
+        self.lbl_dot.pack(side=tk.LEFT, padx=(0, 6))
+
         self.lbl_conn = tk.Label(crow, text="Checking...",
-                                  font=self.f_status,
+                                  font=self.f_bold,
                                   bg=BG_MAIN, fg=COL_CHECK)
         self.lbl_conn.pack(side=tk.LEFT)
-        self.lbl_conn_detail = tk.Label(
-            conn,
-            text=f"Main PC: {main_pc_ip()}:{main_pc_port()}",
-            font=self.f_sub, bg=BG_MAIN, fg=COL_MUTED)
-        self.lbl_conn_detail.pack(anchor="w", padx=16)
+
+        tk.Label(conn,
+                 text=f"Main PC: {main_pc_ip()}:{main_pc_port()}",
+                 font=self.f_note, bg=BG_MAIN,
+                 fg=COL_MUTED).pack(anchor="w", padx=18)
 
         tk.Frame(self.root, bg=COL_BDR, height=1).pack(
-            fill=tk.X, padx=14, pady=4)
+            fill=tk.X, padx=14, pady=(4, 0))
 
-        # Main card
+        # ── Main card ─────────────────────────────────────
         card = tk.Frame(self.root, bg=BG_CARD,
-                        padx=14, pady=10,
+                        padx=16, pady=12,
                         highlightbackground=COL_BDR,
                         highlightthickness=1)
-        card.pack(fill=tk.BOTH, expand=True,
-                  padx=14, pady=(0, 8))
+        card.pack(fill=tk.X, padx=14, pady=10)
 
-        # Card top row
+        # Card header: FT ID + status badge
         top = tk.Frame(card, bg=BG_CARD)
-        top.pack(fill=tk.X)
-        tk.Label(top, text=ft_id(),
+        top.pack(fill=tk.X, pady=(0, 2))
+
+        tk.Label(top, text=fid,
                  font=self.f_name, bg=BG_CARD,
                  fg=COL_WHITE).pack(side=tk.LEFT)
+
         self.lbl_status = tk.Label(top, text="—",
                                     font=self.f_status,
-                                    bg=COL_STOP, fg=BG_MAIN,
-                                    padx=6, pady=2)
+                                    bg=COL_STOP, fg=COL_WHITE,
+                                    padx=8, pady=3)
         self.lbl_status.pack(side=tk.RIGHT)
 
-        # Mapping label
+        # Mapping subtitle
         tk.Label(card,
-                 text=f"→ {'Front' if ft_rack()=='front' else 'Rear'} Rack  {ft_function_label()}",
-                 font=self.f_sub, bg=BG_CARD,
-                 fg=COL_MUTED).pack(anchor="w", pady=(2, 6))
-
-        tk.Frame(card, bg=COL_BDR, height=1).pack(fill=tk.X, pady=4)
-
-        # Summary stats
-        self.lbl_fails = tk.Label(card, text="0",
-                                   font=self.f_name,
-                                   bg=BG_CARD, fg=COL_RUN)
-        self.lbl_fails.pack()
-        tk.Label(card, text="total fails this cycle",
-                 font=self.f_sub, bg=BG_CARD,
-                 fg=COL_MUTED).pack()
-        self.lbl_rate = tk.Label(card, text="0.00%",
-                                  font=self.f_val,
-                                  bg=BG_CARD, fg=COL_TEXT)
-        self.lbl_rate.pack()
+                 text=f"→ {rack_name}   {func}",
+                 font=self.f_note, bg=BG_CARD,
+                 fg=COL_MUTED).pack(anchor="w", pady=(0, 8))
 
         tk.Frame(card, bg=COL_BDR, height=1).pack(
-            fill=tk.X, pady=6)
+            fill=tk.X, pady=(0, 6))
 
-        # Per-station breakdown
-        tk.Label(card, text="Station breakdown:",
-                 font=self.f_sub, bg=BG_CARD,
-                 fg=COL_MUTED).pack(anchor="w")
-        self.station_frame = tk.Frame(card, bg=BG_CARD)
-        self.station_frame.pack(fill=tk.X, pady=(2, 4))
+        # Stat rows helper
+        def _row(label_text, attr, fg=COL_TEXT, top_pad=2):
+            row = tk.Frame(card, bg=BG_CARD)
+            row.pack(fill=tk.X, pady=(top_pad, 2))
+            tk.Label(row, text=label_text,
+                     font=self.f_bold,
+                     bg=BG_CARD, fg=COL_MUTED,
+                     width=11, anchor="w").pack(side=tk.LEFT)
+            lbl = tk.Label(row, text="—",
+                           font=self.f_bold,
+                           bg=BG_CARD, fg=fg)
+            lbl.pack(side=tk.LEFT)
+            setattr(self, attr, lbl)
+
+        _row("Fails:",     "lbl_fails",     COL_RUN)
+        _row("Rate:",      "lbl_rate",      COL_TEXT)
+        _row("Last 60:",   "lbl_fails60",   COL_TEXT)
+        _row("Rate 60:",   "lbl_rate60",    COL_TEXT)
 
         tk.Frame(card, bg=COL_BDR, height=1).pack(
-            fill=tk.X, pady=4)
+            fill=tk.X, pady=(6, 4))
 
-        # Last stop + blocked duration
-        self.lbl_last = tk.Label(card, text="stop: —",
-                                  font=self.f_sub,
-                                  bg=BG_CARD, fg=COL_MUTED)
-        self.lbl_last.pack(anchor="w")
+        _row("Last Stop:", "lbl_last_stop", COL_MUTED)
+        _row("Last Data:", "lbl_last_data", COL_MUTED)
+        _row("Updated:",   "lbl_updated",   COL_MUTED)
+
+        # Blocked banner
         self.lbl_blocked = tk.Label(card, text="",
-                                     font=self.f_sub,
-                                     bg=BG_CARD, fg=COL_BLOCK)
-        self.lbl_blocked.pack(anchor="w")
+                                     font=self.f_bold,
+                                     bg=BG_CARD, fg=COL_BLOCK,
+                                     anchor="w")
+        self.lbl_blocked.pack(fill=tk.X, pady=(6, 0))
 
-        tk.Frame(card, bg=COL_BDR, height=1).pack(
-            fill=tk.X, pady=4)
-
-        self.lbl_files = tk.Label(card, text="files today: 0",
-                                   font=self.f_sub,
-                                   bg=BG_CARD, fg=COL_MUTED)
-        self.lbl_files.pack(anchor="w")
-        self.lbl_updated = tk.Label(card, text="",
-                                     font=self.f_sub,
-                                     bg=BG_CARD, fg=COL_MUTED)
-        self.lbl_updated.pack(anchor="w")
-
-        # Refresh button
-        tk.Button(self.root, text="⟳  Refresh Now",
+        # ── Refresh button ────────────────────────────────
+        tk.Button(self.root,
+                  text="⟳   Refresh Now",
                   command=self.refresh,
-                  bg=BG_HEADER, fg=COL_WHITE,
-                  font=self.f_sub, relief=tk.FLAT,
-                  padx=12, pady=5,
+                  bg="#21262d", fg=COL_WHITE,
+                  font=self.f_bold, relief=tk.FLAT,
+                  padx=14, pady=6,
+                  bd=1, highlightbackground=COL_BDR,
                   cursor="hand2").pack(pady=(0, 10))
 
-        # Footer
+        # ── Footer ────────────────────────────────────────
         tk.Label(self.root,
-                 text=f"Log: {log_dir()}  |  "
-                      f"Warn≥{warn_at_fail()}  Block≥{block_at_fail()}",
-                 font=self.f_sub, bg=BG_HEADER,
-                 fg=COL_MUTED, pady=3).pack(
+                 text=f"Log: {log_dir()}   Warn≥{warn_at_fail()}  Block≥{block_at_fail()}",
+                 font=self.f_note, bg=BG_HEADER,
+                 fg=COL_MUTED, pady=4).pack(
             fill=tk.X, side=tk.BOTTOM)
+
+        # Restart dot animation after rebuild
+        self._start_dots()
+
+    # ── Update UI with latest stats ───────────────────────
+    def _update_ui(self, stats: dict):
+        self._last_stats = stats
+        status = stats["status"]
+        color  = _status_color(status)
+
+        self.lbl_status.config(
+            text=status, bg=color,
+            fg=BG_MAIN if status in ("RUNNING", "WARNING", "STOPPED")
+            else COL_WHITE)
+
+        self.lbl_fails.config(
+            text=str(stats["fails"]), fg=color)
+        self.lbl_rate.config(
+            text=f"{stats['rate']:.2f}%", fg=color)
+
+        f60       = stats.get("fails_60", 0)
+        r60       = stats.get("rate_60", 0.0)
+        f60_color = (COL_BLOCK if f60 >= block_at_fail()
+                     else COL_WARN  if f60 >= warn_at_fail()
+                     else COL_RUN)
+        self.lbl_fails60.config(text=str(f60), fg=f60_color)
+        self.lbl_rate60.config(text=f"{r60:.2f}%", fg=f60_color)
+
+        self.lbl_last_stop.config(text=stats.get("last_stop", "—"))
+        self.lbl_last_data.config(text=stats.get("last_data", "—"))
+        self.lbl_updated.config(
+            text=datetime.now().strftime("%H:%M:%S"))
+
+        if status == "BLOCKED":
+            bmin = stats.get("blocked_min", 0)
+            dur  = (f"{bmin//60}h {bmin%60:02d}m"
+                    if bmin >= 60 else f"{bmin}min")
+            self.lbl_blocked.config(
+                text=f"⛔   BLOCKED   {dur}", fg=COL_BLOCK)
+        else:
+            self.lbl_blocked.config(text="")
+
+        self._after_id = self.root.after(refresh_ms(), self.refresh)
 
     # ── Connection ────────────────────────────────────────
     def _start_handshake(self):
@@ -365,16 +413,19 @@ class FTDashboard:
     def _on_hello(self, ok: bool):
         self._stop_dots()
         self._conn = ok
-        if ok:
-            self.lbl_dot.config(fg=COL_CONN)
-            self.lbl_conn.config(
-                text=f"Connected  •  {main_pc_ip()}:{main_pc_port()}",
-                fg=COL_CONN)
-        else:
-            self.lbl_dot.config(fg=COL_DISC)
-            self.lbl_conn.config(
-                text="Disconnected  •  Main PC unreachable",
-                fg=COL_DISC)
+        try:
+            if ok:
+                self.lbl_dot.config(fg=COL_CONN)
+                self.lbl_conn.config(
+                    text=f"Connected  •  {main_pc_ip()}:{main_pc_port()}",
+                    fg=COL_CONN)
+            else:
+                self.lbl_dot.config(fg=COL_DISC)
+                self.lbl_conn.config(
+                    text="Disconnected  •  Main PC unreachable",
+                    fg=COL_DISC)
+        except tk.TclError:
+            pass   # widget may have been destroyed during rebuild
         if self._hb_id:
             self.root.after_cancel(self._hb_id)
         self._hb_id = self.root.after(
@@ -386,15 +437,19 @@ class FTDashboard:
 
     def _animate_dots(self):
         dots = "." * (self._dot_count % 4)
-        self.lbl_conn.config(
-            text=f"Checking{dots}", fg=COL_CHECK)
-        self.lbl_dot.config(fg=COL_CHECK)
+        try:
+            self.lbl_conn.config(
+                text=f"Checking{dots}", fg=COL_CHECK)
+            self.lbl_dot.config(fg=COL_CHECK)
+        except tk.TclError:
+            return
         self._dot_count += 1
         self._dot_id = self.root.after(500, self._animate_dots)
 
     def _stop_dots(self):
         if self._dot_id:
-            self.root.after_cancel(self._dot_id)
+            try: self.root.after_cancel(self._dot_id)
+            except Exception: pass
             self._dot_id = None
 
     # ── Refresh ───────────────────────────────────────────
@@ -412,57 +467,16 @@ class FTDashboard:
             stats = _empty_stats()
         self.root.after(0, lambda: self._update_ui(stats))
 
-    def _update_ui(self, stats: dict):
-        self._last_stats = stats
-        status = stats["status"]
-        color  = _status_color(status)
-
-        self.lbl_status.config(
-            text=status, bg=color,
-            fg=BG_MAIN if status != "BLOCKED" else COL_WHITE)
-        self.lbl_fails.config(
-            text=str(stats["fails"]), fg=color)
-        self.lbl_rate.config(
-            text=f"{stats['rate']:.2f}%")
-        self.lbl_last.config(
-            text=f"stop: {stats['last_stop']}")
-        self.lbl_files.config(
-            text=f"files today: {stats.get('files_today', 0)}")
-        self.lbl_updated.config(
-            text=f"updated: {datetime.now().strftime('%H:%M:%S')}")
-
-        # Blocked duration
-        if status == "BLOCKED":
-            bmin = stats.get("blocked_min", 0)
-            dur  = (f"{bmin//60}h {bmin%60:02d}m"
-                    if bmin >= 60 else f"{bmin}min")
-            self.lbl_blocked.config(
-                text=f"⛔ BLOCKED {dur}", fg=COL_BLOCK)
-        else:
-            self.lbl_blocked.config(text="")
-
-        # Per-station breakdown
-        for w in self.station_frame.winfo_children():
-            w.destroy()
-        for s in stats.get("stations", []):
-            sc    = _status_color(s["status"])
-            stext = (f"ST{s['station']:02d}  "
-                     f"{s['fails']}/{s['total']}  "
-                     f"{s['rate']:.1f}%  "
-                     f"[{s['status']}]")
-            tk.Label(self.station_frame, text=stext,
-                     font=self.f_sub, bg=BG_CARD,
-                     fg=sc, anchor="w").pack(
-                fill=tk.X, pady=1)
-
-        self._after_id = self.root.after(refresh_ms(), self.refresh)
-
     # ── Config ────────────────────────────────────────────
     def _open_config(self):
         FTConfigEditor(self.root, on_save=self._on_config_saved)
 
     def _on_config_saved(self):
-        self._set_title()
+        """Rebuild entire UI so new ft_id reflects everywhere instantly."""
+        if self._after_id:
+            self.root.after_cancel(self._after_id)
+            self._after_id = None
+        self._rebuild_ui()
         self._start_handshake()
         self.refresh()
 
@@ -472,7 +486,7 @@ class FTDashboard:
 # =========================================================
 if __name__ == "__main__":
     root = tk.Tk()
-    root.geometry("400x580")
-    root.minsize(380, 520)
+    root.geometry("420x560")
+    root.minsize(380, 480)
     FTDashboard(root)
     root.mainloop()
