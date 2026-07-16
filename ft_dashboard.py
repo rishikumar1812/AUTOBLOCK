@@ -362,11 +362,12 @@ class FTDashboard:
         tk.Frame(card, bg=COL_BDR, height=1).pack(
             fill=tk.X, pady=(6, 4))
 
-        _row("Last Stop:", "lbl_last_stop", COL_MUTED)
-        _row("Last Data:", "lbl_last_data", COL_MUTED)
-        _row("Updated:",   "lbl_updated",   COL_MUTED)
+        _row("Last Stop:",     "lbl_last_stop",    COL_MUTED)
+        _row("Blocked Since:", "lbl_blocked_since",COL_BLOCK)
+        _row("Last Data:",     "lbl_last_data",    COL_MUTED)
+        _row("Updated:",       "lbl_updated",      COL_MUTED)
 
-        # Blocked banner
+        # Blocked banner — full width
         self.lbl_blocked = tk.Label(card, text="",
                                      font=self.f_bold,
                                      bg=BG_CARD, fg=COL_BLOCK,
@@ -382,15 +383,23 @@ class FTDashboard:
                   padx=14, pady=6,
                   cursor="hand2").pack(pady=(4, 10))
 
-        # ── Footer ────────────────────────────────────────
+        # ── Footer — two lines: static config + dynamic no-data ──
+        footer_frame = tk.Frame(self.root, bg=BG_HEADER)
+        footer_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
         try:
             footer_text = f"Log: {log_dir()}   Warn≥{warn_at_fail()}  Block≥{block_at_fail()}"
         except Exception:
             footer_text = "Log: not configured"
-        tk.Label(self.root, text=footer_text,
+        tk.Label(footer_frame, text=footer_text,
                  font=self.f_note, bg=BG_HEADER,
-                 fg=COL_MUTED, pady=4).pack(
-            fill=tk.X, side=tk.BOTTOM)
+                 fg=COL_MUTED, pady=2).pack(fill=tk.X)
+
+        # Dynamic no-data line — updated in _update_ui
+        self.lbl_no_data = tk.Label(footer_frame, text="",
+                                     font=self.f_note, bg=BG_HEADER,
+                                     fg=COL_WARN, pady=2)
+        self.lbl_no_data.pack(fill=tk.X)
 
         # Restart dot animation after rebuild
         self._start_dots()
@@ -420,18 +429,36 @@ class FTDashboard:
         self.lbl_rate60.config(text=f"{r60:.2f}%", fg=f60_color)
 
         self.lbl_last_stop.config(text=stats.get("last_stop", "—"))
+
+        # Blocked since row — show duration if BLOCKED, else hide
+        bmin = stats.get("blocked_min", 0)
+        if status == "BLOCKED" and bmin > 0:
+            dur = (f"{bmin//60}h {bmin%60:02d}m"
+                   if bmin >= 60 else f"{bmin}min")
+            self.lbl_blocked_since.config(
+                text=dur, fg=COL_BLOCK)
+        else:
+            self.lbl_blocked_since.config(text="—", fg=COL_MUTED)
+
         self.lbl_last_data.config(text=stats.get("last_data", "—"))
         self.lbl_updated.config(
             text=datetime.now().strftime("%H:%M:%S"))
 
+        # Blocked banner
         if status == "BLOCKED":
-            bmin = stats.get("blocked_min", 0)
-            dur  = (f"{bmin//60}h {bmin%60:02d}m"
-                    if bmin >= 60 else f"{bmin}min")
             self.lbl_blocked.config(
-                text=f"⛔   BLOCKED   {dur}", fg=COL_BLOCK)
+                text=f"⛔   BLOCKED", fg=COL_BLOCK)
         else:
             self.lbl_blocked.config(text="")
+
+        # Footer no-data line
+        mins = stats.get("minutes_since", 0)
+        if mins > 0 and status == "STOPPED":
+            self.lbl_no_data.config(
+                text=f"No data for {mins}min",
+                fg=COL_WARN)
+        else:
+            self.lbl_no_data.config(text="")
 
         self._after_id = self.root.after(refresh_ms(), self.refresh)
 
@@ -525,24 +552,10 @@ class FTDashboard:
 # Entry point
 # =========================================================
 if __name__ == "__main__":
-    import threading
-    from ft_process_file import scan_and_check as _scan
-
-    # Start ft_process_file polling in background thread
-    # so it monitors CSVs and sends STOP signals automatically
-    import time as _time
-    from ft_config_loader import poll_interval as _poll_interval
-
-    def _process_loop():
-        while True:
-            try:
-                _scan()
-            except Exception as e:
-                print(f"[ft_process_loop] Error: {e}")
-            _time.sleep(_poll_interval())
-
-    threading.Thread(target=_process_loop, daemon=True).start()
-
+    # ft_process_file.py runs separately as a 24/7 background process.
+    # This dashboard only displays stats — run both independently:
+    #   Terminal 1: python ft_process_file.py   (runs 24/7)
+    #   Terminal 2: python ft_dashboard.py       (UI display)
     root = tk.Tk()
     root.geometry("420x560")
     root.minsize(380, 480)
