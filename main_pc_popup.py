@@ -82,8 +82,8 @@ except Exception as _log_err:
 # =========================================================
 # Shared state
 # =========================================================
-_task_queue  : queue.Queue = queue.Queue()
-_popup_queue : list        = []
+_task_queue  = queue.Queue()   # type: queue.Queue
+_popup_queue = []              # type: list
 _state_lock  = threading.Lock()
 _queue_lock  = threading.Lock()
 
@@ -93,7 +93,7 @@ _queue_lock  = threading.Lock()
 #   "error"      — automation failed, manual intervention needed
 #
 # Structure: {dl_name: {"state": str, "ts": str}}
-_dl_states : dict = {}
+_dl_states = {}  # type: dict
 
 # Connection state — updated when HELLO arrives
 _conn_state = {
@@ -105,7 +105,7 @@ _conn_lock = threading.Lock()
 
 # FT connection state — one entry per FT PC number (1-8)
 # {ft_number: {"connected": bool, "last_hello": datetime, "addr": str, "ft_side": str}}
-_ft_conn_states : dict = {}
+_ft_conn_states = {}  # type: dict
 _ft_conn_lock = threading.Lock()
 
 
@@ -522,11 +522,13 @@ class TrayWindow:
 
         # Position bottom-right corner with safe margin from edges
         # Use update_idletasks first so winfo values are accurate
-        w = 300
-        h = 480
-        x = 8                    # bottom-left, 8px from left edge
-        y = sh - h - 48          # 48px above taskbar
-        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        # Fixed static size — does not resize
+        W, H = 320, 560
+        x = 8
+        y = max(0, sh - H - 48)
+        self.root.geometry(f"{W}x{H}+{x}+{y}")
+        self.root.maxsize(W, H)
+        self.root.minsize(W, H)
 
         self.f_title = tkfont.Font(family="Consolas", size=10, weight="bold")
         self.f_conn  = tkfont.Font(family="Consolas", size=9,  weight="bold")
@@ -541,110 +543,112 @@ class TrayWindow:
         self._refresh()
 
     def _build(self) -> None:
-        # Header
-        hdr = tk.Frame(self.root, bg=BG_HEADER, pady=8)
-        hdr.pack(fill=tk.X)
+        # ── Static layout — all positions hardcoded in pixels ──
+        # Window is 320x560, fixed. No pack/grid confusion.
+        W = 320  # must match geometry W above
+
+        # ── Header (y=0, h=36) ───────────────────────────────
+        hdr = tk.Frame(self.root, bg=BG_HEADER,
+                       width=W, height=36)
+        hdr.place(x=0, y=0)
+        hdr.pack_propagate(False)
         tk.Label(hdr, text="DL & FT Monitor  •  Main PC",
                  font=self.f_title, bg=BG_HEADER,
-                 fg=COL_WHITE).pack(padx=10)
+                 fg=COL_WHITE).pack(expand=True)
 
-        # ── Connection bar ────────────────────────────────
-        conn_bar = tk.Frame(self.root, bg=BG_MAIN, pady=6)
-        conn_bar.pack(fill=tk.X, padx=10)
-
-        conn_row = tk.Frame(conn_bar, bg=BG_MAIN)
-        conn_row.pack(fill=tk.X)
-
+        # ── Connection row (y=36, h=44) ──────────────────────
+        conn = tk.Frame(self.root, bg=BG_CARD,
+                        width=W, height=44)
+        conn.place(x=0, y=37)
+        conn.pack_propagate(False)
         self.lbl_conn_dot = tk.Label(
-            conn_row, text="●", font=self.f_conn,
-            bg=BG_MAIN, fg=COL_CHECK,
-        )
-        self.lbl_conn_dot.pack(side=tk.LEFT, padx=(0, 4))
-
+            conn, text="●", font=self.f_conn,
+            bg=BG_CARD, fg=COL_CHECK)
+        self.lbl_conn_dot.place(x=8, y=6)
         self.lbl_conn_status = tk.Label(
-            conn_row, text="Waiting for DL PC...",
-            font=self.f_conn, bg=BG_MAIN, fg=COL_CHECK,
-        )
-        self.lbl_conn_status.pack(side=tk.LEFT)
-
+            conn, text="Waiting for DL PC...",
+            font=self.f_conn, bg=BG_CARD, fg=COL_CHECK)
+        self.lbl_conn_status.place(x=26, y=6)
         self.lbl_conn_since = tk.Label(
-            conn_bar, text="",
-            font=self.f_small, bg=BG_MAIN, fg=COL_MUTED,
-        )
-        self.lbl_conn_since.pack(anchor="w", padx=18)
-
-        # Start dot animation immediately
+            conn, text="",
+            font=self.f_small, bg=BG_CARD, fg=COL_MUTED)
+        self.lbl_conn_since.place(x=26, y=24)
         self._start_dot_animation()
 
-        tk.Frame(self.root, bg="#30363d", height=1).pack(fill=tk.X, pady=4)
+        # ── Separator ─────────────────────────────────────────
+        tk.Frame(self.root, bg=COL_BORDER,
+                 width=W, height=1).place(x=0, y=81)
 
-        # Listener + queue + app status
-        # Ports on same line
-        ports_row = tk.Frame(self.root, bg=BG_MAIN)
-        ports_row.pack(fill=tk.X, padx=10, pady=1)
-        tk.Label(ports_row, text="Ports", font=self.f_small,
-                 bg=BG_MAIN, fg=COL_MUTED, width=10,
-                 anchor="w").pack(side=tk.LEFT)
-        self.lbl_listener = tk.Label(
-            ports_row,
-            text=f"● DL:{_listen_port()}  FT:{_ft_listen_port()}",
-            font=self.f_small, bg=BG_MAIN, fg=COL_OK)
-        self.lbl_listener.pack(side=tk.LEFT, padx=4)
+        # ── Status rows (y=82, h=70) ─────────────────────────
+        status = tk.Frame(self.root, bg=BG_CARD,
+                          width=W, height=70)
+        status.place(x=0, y=82)
+        status.pack_propagate(False)
 
-        # Queue and app status
-        for label_text, attr_name, default, default_color in [
-            ("Queue",      "lbl_queue",   "0 pending",  COL_TEXT),
-            ("InLine_Pro", "lbl_app",     "checking...", COL_MUTED),
-        ]:
-            row = tk.Frame(self.root, bg=BG_MAIN)
-            row.pack(fill=tk.X, padx=10, pady=1)
-            tk.Label(row, text=label_text, font=self.f_small,
-                     bg=BG_MAIN, fg=COL_MUTED, width=10,
-                     anchor="w").pack(side=tk.LEFT)
-            lbl = tk.Label(row, text=default, font=self.f_small,
-                           bg=BG_MAIN, fg=default_color)
-            lbl.pack(side=tk.LEFT, padx=4)
-            setattr(self, attr_name, lbl)
+        def _srow(label, attr, default, color, ypos):
+            tk.Label(status, text=label, font=self.f_small,
+                     bg=BG_CARD, fg=COL_MUTED,
+                     width=11, anchor="w").place(x=8, y=ypos)
+            lbl = tk.Label(status, text=default,
+                           font=self.f_small, bg=BG_CARD, fg=color)
+            lbl.place(x=100, y=ypos)
+            setattr(self, attr, lbl)
 
-        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
+        _srow("Ports",
+              "lbl_listener",
+              f"● DL:{_listen_port()}  FT:{_ft_listen_port()}",
+              COL_OK, 4)
+        _srow("Queue",      "lbl_queue", "0 pending",   COL_TEXT,  26)
+        _srow("InLine_Pro", "lbl_app",   "checking...", COL_MUTED, 48)
 
-        # ── FT PC connection dots ─────────────────────────
-        # Two rows: Front (F1-F4) and Rear (R1-R4)
-        ft_block = tk.Frame(self.root, bg=BG_MAIN, padx=10)
-        ft_block.pack(fill=tk.X, pady=(2, 2))
-        self.ft_dots = {}   # key: ft_id string e.g. "F1", "R3"
+        # ── Separator ─────────────────────────────────────────
+        tk.Frame(self.root, bg=COL_BORDER,
+                 width=W, height=1).place(x=0, y=152)
 
-        for row_label, keys in [
-            ("Front:", ["F1","F2","F3","F4"]),
-            ("Rear: ", ["R1","R2","R3","R4"]),
-        ]:
-            row = tk.Frame(ft_block, bg=BG_MAIN)
-            row.pack(fill=tk.X, pady=1)
-            tk.Label(row, text=row_label, font=self.f_small,
-                     bg=BG_MAIN, fg=COL_MUTED,
-                     width=6, anchor="w").pack(side=tk.LEFT)
-            for ft_id_key in keys:
-                dot = tk.Label(row, text=ft_id_key,
-                               font=self.f_small, bg=BG_MAIN,
-                               fg=COL_MUTED, padx=3)
-                dot.pack(side=tk.LEFT)
-                self.ft_dots[ft_id_key] = dot
+        # ── FT dots (y=153, h=52) ────────────────────────────
+        ft_frame = tk.Frame(self.root, bg=BG_CARD,
+                            width=W, height=52)
+        ft_frame.place(x=0, y=153)
+        ft_frame.pack_propagate(False)
+        self.ft_dots = {}
 
-        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
+        tk.Label(ft_frame, text="Front:",
+                 font=self.f_small, bg=BG_CARD,
+                 fg=COL_MUTED).place(x=8, y=4)
+        tk.Label(ft_frame, text="Rear:",
+                 font=self.f_small, bg=BG_CARD,
+                 fg=COL_MUTED).place(x=8, y=28)
 
-        # Blocked list header
-        tk.Label(self.root, text="Activity today (DL + FT)",
+        ft_x = {"F": 58, "R": 58}
+        for key in ["F1","F2","F3","F4"]:
+            dot = tk.Label(ft_frame, text=key,
+                           font=self.f_small, bg=BG_CARD,
+                           fg=COL_MUTED, padx=2)
+            dot.place(x=ft_x["F"], y=4)
+            ft_x["F"] += 48
+            self.ft_dots[key] = dot
+        for key in ["R1","R2","R3","R4"]:
+            dot = tk.Label(ft_frame, text=key,
+                           font=self.f_small, bg=BG_CARD,
+                           fg=COL_MUTED, padx=2)
+            dot.place(x=ft_x["R"], y=28)
+            ft_x["R"] += 48
+            self.ft_dots[key] = dot
+
+        # ── Separator ─────────────────────────────────────────
+        tk.Frame(self.root, bg=COL_BORDER,
+                 width=W, height=1).place(x=0, y=205)
+
+        # ── Activity label (y=206, h=22) ─────────────────────
+        tk.Label(self.root, text="Activity today  (DL + FT)",
                  font=self.f_small, bg=BG_MAIN,
-                 fg=COL_MUTED).pack(anchor="w", padx=10)
+                 fg=COL_MUTED).place(x=10, y=208)
 
-        # ── Scrollable list with fixed height ─────────────
-        # Canvas + scrollbar so the list never pushes the
-        # "Clear blocked" button off-screen regardless of
-        # how many DL rows accumulate.
+        # ── Activity list (y=228, h=260) ─────────────────────
         list_outer = tk.Frame(self.root, bg=BG_MAIN,
-                              height=180)   # fixed max height
-        list_outer.pack(fill=tk.X, padx=10, pady=4)
-        list_outer.pack_propagate(False)    # enforce fixed height
+                              width=W-12, height=256)
+        list_outer.place(x=6, y=228)
+        list_outer.pack_propagate(False)
 
         canvas = tk.Canvas(list_outer, bg=BG_MAIN,
                            highlightthickness=0)
@@ -654,7 +658,6 @@ class TrayWindow:
                                  bd=0, width=6)
 
         def _update_scrollbar(*args):
-            # Only show scrollbar when content overflows
             lo, hi = map(float, args)
             if lo <= 0.0 and hi >= 1.0:
                 scrollbar.pack_forget()
@@ -670,37 +673,37 @@ class TrayWindow:
 
         def _on_frame_resize(e):
             canvas.configure(scrollregion=canvas.bbox("all"))
-            canvas.itemconfig(self._list_canvas_id, width=canvas.winfo_width())
+            canvas.itemconfig(
+                self._list_canvas_id, width=canvas.winfo_width())
 
         self.list_frame.bind("<Configure>", _on_frame_resize)
         canvas.bind("<Configure>",
                     lambda e: canvas.itemconfig(
                         self._list_canvas_id, width=e.width))
 
-        # Mouse wheel scroll
         def _on_mousewheel(e):
             canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self._list_canvas = canvas
 
-        self._list_canvas = canvas   # saved for scroll-to-top on clear
+        # ── Separator ─────────────────────────────────────────
+        tk.Frame(self.root, bg=COL_BORDER,
+                 width=W, height=1).place(x=0, y=487)
 
-        # ── Footer — always visible, packed LAST at bottom ──
-        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X)
+        # ── Footer (y=488, h=72) — always at fixed position ──
+        self.lbl_time = tk.Label(
+            self.root, text="",
+            font=self.f_small, bg=BG_MAIN, fg=COL_MUTED)
+        self.lbl_time.place(x=0, y=492, width=W, anchor="nw")
 
-        ft = tk.Frame(self.root, bg=BG_MAIN, pady=6)
-        ft.pack(fill=tk.X, side=tk.BOTTOM)
-        self.lbl_time = tk.Label(ft, text="", font=self.f_small,
-                                  bg=BG_MAIN, fg=COL_MUTED)
-        self.lbl_time.pack()
-        # Clear button — always visible, greyed when nothing to clear
         self.btn_clear = tk.Button(
-            ft, text="Clear blocked",
+            self.root, text="Clear blocked",
             command=self._clear_blocked,
-            bg=BG_HEADER, fg=COL_MUTED,   # starts greyed
-            font=self.f_small, relief=tk.FLAT,
-            padx=10, pady=3, cursor="hand2",
+            bg=BG_HEADER, fg=COL_MUTED,
+            font=self.f_small, relief=tk.RAISED,
+            padx=12, pady=3, cursor="hand2",
             state=tk.DISABLED)
-        self.btn_clear.pack(pady=(2, 0))
+        self.btn_clear.place(x=W//2, y=516, anchor="n")
 
     # ── Connection dot animation ──────────────────────────
     def _start_dot_animation(self):
