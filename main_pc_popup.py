@@ -2,13 +2,13 @@
 main_pc_popup.py  —  Main PC  (ENTRY POINT)
 
 TCP commands handled:
-  {"command": "HELLO"}  — handshake from DL PC, replies ACK
+  {"command": "HELLO"}  — handshake from DL PC, replies ACK,
+                           tray shows Connected + timestamp
   {"command": "STOP",  "dl": "DL03"}  — triggers automation
 
-Changes:
-  - HELLO toast shown only once every 30 minutes (not every heartbeat)
-  - Every automation step logged to main_pc_popup.log with timestamp
-  - 3 DL states: processing / stopped / error
+Connection bar in tray:
+  Checking... → Connected (green) / Disconnected (red)
+  Updates every time a HELLO arrives or connection drops.
 """
 
 import os
@@ -19,68 +19,62 @@ import queue
 import socket
 import logging
 import threading
-import subprocess
 import tkinter as tk
 from tkinter import font as tkfont
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from config_loader import get_config
-from ini_editor import uncheck_dl
+from ini_editor import uncheck_dl,uncheck_ft
 from inline_automation import run_stop_sequence
+from log_cleanup import cleanup_old_logs, DailyFileHandler
 
 
 # =========================================================
 # Config accessors
 # =========================================================
-def _listen_host()      -> str: return get_config()["listener"]["host"]
-def _listen_port()      -> int: return int(get_config()["listener"]["port"])
-def _log_dir()          -> str: return get_config()["paths"]["log_dir"]
-def _exe_name()         -> str: return get_config()["app"]["exe_name"]
-def _hello_toast_min()  -> int: return int(get_config()["dashboard"].get("hello_toast_minutes", 30))
+def _listen_host()    -> str: return get_config()["listener"]["host"]
+def _listen_port()    -> int: return int(get_config()["listener"]["port"])
+def _ft_listen_port() -> int: return int(get_config().get("ft_listener", {}).get("port", 8998))
+def _log_dir()        -> str: return get_config()["paths"]["log_dir"]
+def _exe_name()       -> str: return get_config()["app"]["exe_name"]
 
-
-def cleanup_old_logs(log_dir: str, keep_days: int = 7):
-    cutoff = datetime.now() - timedelta(days=keep_days)
-
-    for fname in os.listdir(log_dir):
-        if not fname.endswith(".log"):
-            continue
-
-        path = os.path.join(log_dir, fname)
-
-        try:
-            modified = datetime.fromtimestamp(os.path.getmtime(path))
-
-            if modified < cutoff:
-                os.remove(path)
-                print(f"Deleted old log: {fname}")
-
-        except Exception as e:
-            print(f"Cleanup error: {e}")
 
 # =========================================================
-# Logging — every step written to main_pc_popup.log
+# Logging
 # =========================================================
 def _setup_logger() -> logging.Logger:
     log_dir = _log_dir()
     os.makedirs(log_dir, exist_ok=True)
-    cleanup_old_logs(log_dir, keep_days=7)
-    today = datetime.now().strftime("%Y-%m-%d")
-    log_path = os.path.join(log_dir, f"main_pc_popup_{today}.log")
+
+    # Delete log files older than 7 days — runs once at startup
+    cleanup_old_logs(log_dir, retention_days=7)
+
     logger = logging.getLogger("main_pc_popup")
     if not logger.handlers:
         logger.setLevel(logging.INFO)
-        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-        fh  = logging.FileHandler(log_path, encoding="utf-8")
-        fh.setFormatter(fmt)
-        sh  = logging.StreamHandler()
-        sh.setFormatter(fmt)
+
+        # DailyFileHandler rolls to a new file at midnight automatically.
+        # This tray app runs 24/7 in the background (root.mainloop()),
+        # so the old fixed-date filename never updated itself — this
+        # handler checks the date on every emit() call instead.
+        fh = DailyFileHandler("main_pc_popup", log_dir, retention_days=7)
         logger.addHandler(fh)
+
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         logger.addHandler(sh)
     return logger
 
-logger = _setup_logger()
-
+try:
+    logger=_setup_logger()
+except Exception as _log_err:
+    logger=logging.getLogger("main_pc_popup")
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        sh=logging.StreamHandler()
+        sh.setFormatter(logging.Formatter("%(asctime)s[%(levelname)s] %(message)s"))
+        logger.addHandler(sh)
+    logger.warning(f"[main] Log file setup failed: {_log_err} - using console only")
 
 # =========================================================
 # Shared state
@@ -90,23 +84,26 @@ _popup_queue : list        = []
 _state_lock  = threading.Lock()
 _queue_lock  = threading.Lock()
 
-# DL state tracking — 3 states per DL:
+# DL state tracking — 3 possible states per DL:
 #   "processing" — signal received, automation running
 #   "stopped"    — automation confirmed success
 #   "error"      — automation failed, manual intervention needed
+#
+# Structure: {dl_name: {"state": str, "ts": str}}
 _dl_states : dict = {}
 
-# Connection state
+# Connection state — updated when HELLO arrives
 _conn_state = {
     "connected":    False,
-    "last_hello":   None,
-    "dl_pc_addr":   None,
+    "last_hello":   None,   # datetime of last HELLO
+    "dl_pc_addr":   None,   # IP of DL PC
 }
 _conn_lock = threading.Lock()
 
-# HELLO toast throttle — only show toast once per N minutes
-_last_hello_toast : datetime = None
-_hello_toast_lock = threading.Lock()
+# FT connection state — one entry per FT PC number (1-8)
+# {ft_number: {"connected": bool, "last_hello": datetime, "addr": str, "ft_side": str}}
+_ft_conn_states : dict = {}
+_ft_conn_lock = threading.Lock()
 
 
 # =========================================================
@@ -117,6 +114,7 @@ BG_CARD    = "#161b22"
 BG_HEADER  = "#1c2128"
 COL_BLOCK  = "#f85149"
 COL_OK     = "#3fb950"
+COL_DISC   = "#f85149"   # disconnected — same red as BLOCK
 COL_WARN   = "#d29922"
 COL_CHECK  = "#58a6ff"
 COL_TEXT   = "#c9d1d9"
@@ -125,97 +123,82 @@ COL_WHITE  = "#ffffff"
 COL_BORDER = "#30363d"
 
 
-# =========================================================
-# Step logger — writes every automation step to log file
-# Called from queue worker with stage name and result
-# =========================================================
-def log_step(dl_name: str, step: str, result: str, detail: str = "") -> None:
-    """
-    Write a single automation step to the log.
-    Format:
-      2026-06-01 10:34:22 [INFO] [DL03] STEP: STOP        | OK
-      2026-06-01 10:34:25 [INFO] [DL03] STEP: SETUP       | OK
-      2026-06-01 10:34:28 [ERROR][DL03] STEP: OK_DIALOG   | FAILED — button not found
-    """
-    padded_step = f"{step:<14}"
-    if result == "OK":
-        logger.info(f"[{dl_name}] STEP: {padded_step} | OK{(' — ' + detail) if detail else ''}")
-    else:
-        logger.error(f"[{dl_name}] STEP: {padded_step} | FAILED{(' — ' + detail) if detail else ''}")
-
-
+def _task_display_name(task_key:str)->str:
+    if task_key.upper().startswith("FT_"):
+        try:
+            parts=task_key.split("_",3)
+            ft_id=parts[1]
+            rack=parts[2].capitalize()
+            func=parts[3] if len(parts)>3 else ""
+            return f"{ft_id} ({rack} - {func})"
+        except Exception:
+            return task_key
+    return task_key
 # =========================================================
 # Sequential task queue worker
-# Runs automation and logs every step
 # =========================================================
 def _queue_worker() -> None:
-    logger.info("[queue] Worker started — waiting for stop tasks")
+    logger.info("[queue] Worker started")
     while True:
         dl_name = _task_queue.get()
         if dl_name is None:
-            logger.info("[queue] Worker stopping")
             break
+        display=_task_display_name(dl_name)
         try:
-            logger.info(f"[{dl_name}] {'='*50}")
-            logger.info(f"[{dl_name}] AUTOMATION START — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            logger.info(f"[{dl_name}] {'='*50}")
-
-            # Mark as processing
-            ts = datetime.now().strftime("%H:%M:%S")
-            with _state_lock:
-                _dl_states[dl_name] = {"state": "processing", "ts": ts}
-
-            # Run full sequence — inline_automation logs each sub-step
-            # We wrap each logical stage here for the popup log
-            logger.info(f"[{dl_name}] Stage 1/4 — Editing Data.ini (uncheck building)")
-            logger.info(f"[{dl_name}] Stage 2/4 — Connecting to InLine_Pro process")
-            logger.info(f"[{dl_name}] Stage 3/4 — GUI sequence: STOP→SETUP→OK→START→YES→OK")
-            logger.info(f"[{dl_name}] Stage 4/4 — Waiting for confirmation")
-
+            logger.info(f"[queue] Processing stop for {dl_name}")
             success = run_stop_sequence(dl_name)
 
             ts = datetime.now().strftime("%H:%M:%S")
             if success:
+                # Automation confirmed — mark as stopped
                 with _state_lock:
                     _dl_states[dl_name] = {"state": "stopped", "ts": ts}
 
+                # Queue toast
                 with _queue_lock:
                     _popup_queue.append({
                         "type":    "STOP",
-                        "dl_name": dl_name,
+                        "dl_name": display,
+                        "source":  "FT" if _is_ft_task(dl_name) else "DL",
                         "ts":      ts,
                     })
 
-                logger.info(f"[{dl_name}] AUTOMATION COMPLETE — all steps OK at {ts}")
-                logger.info(f"[{dl_name}] {'='*50}")
-
+                logger.info(f"[queue] {display} — stopped OK at {ts}")
             else:
+                # Automation failed — mark as error, operator must act
                 with _state_lock:
                     _dl_states[dl_name] = {"state": "error", "ts": ts}
 
+                # Queue error toast
                 with _queue_lock:
                     _popup_queue.append({
                         "type":    "ERROR",
-                        "dl_name": dl_name,
+                        "dl_name": display,
+                        "source":  "FT" if _is_ft_task(dl_name) else "DL",
                         "ts":      ts,
                     })
 
-                logger.error(f"[{dl_name}] AUTOMATION FAILED at {ts} — manual intervention required")
-                logger.error(f"[{dl_name}] Check inline_automation.py log for exact failed step")
-                logger.error(f"[{dl_name}] {'='*50}")
-
+                logger.error(
+                    f"[queue] {display} — automation FAILED at {ts}. "
+                    f"Manual intervention required."
+                )
         except Exception as e:
-            ts = datetime.now().strftime("%H:%M:%S")
+            logger.error(f"[queue] {display} — unexpected error: {e}")
+            ts=datetime.now().strftime("%H:%M:%S")
             with _state_lock:
-                _dl_states[dl_name] = {"state": "error", "ts": ts}
-            logger.error(f"[{dl_name}] UNHANDLED ERROR: {e}")
-            logger.error(f"[{dl_name}] {'='*50}")
+                _dl_states[dl_name]={"state":"error","ts":ts}
+            with _queue_lock:
+                _popup_queue.append({
+                    "type": "ERROR",
+                    "dl_name": display,
+                    "ts":      ts,
+                })
         finally:
             _task_queue.task_done()
 
 
 # =========================================================
-# Send TCP response
+# Send response
 # =========================================================
 def _send_response(conn: socket.socket, status: str, message: str = "") -> None:
     try:
@@ -228,6 +211,7 @@ def _send_response(conn: socket.socket, status: str, message: str = "") -> None:
 
 # =========================================================
 # Handle TCP connection
+# Commands: HELLO, STOP
 # =========================================================
 def _handle_connection(conn: socket.socket, addr: tuple) -> None:
     try:
@@ -239,38 +223,27 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
 
         # ── HELLO handshake ───────────────────────────────
         if command == "HELLO":
+            # Reply ACK immediately
             _send_response(conn, "ACK", "Connected")
 
-            now = datetime.now()
+            with _conn_lock:
+                was_connected=_conn_state["connected"]
+            # Update connection state
             with _conn_lock:
                 _conn_state["connected"]  = True
-                _conn_state["last_hello"] = now
+                _conn_state["last_hello"] = datetime.now()
                 _conn_state["dl_pc_addr"] = addr[0]
 
-            logger.info(f"[listener] HELLO from {addr[0]} — ACK sent")
-
-            # ── Toast throttle ────────────────────────────
-            # Only show HELLO toast once every hello_toast_minutes.
-            # Heartbeats arrive every 30s — without throttle the
-            # operator gets a toast every 30 seconds all day.
-            global _last_hello_toast
-            show_toast_now = False
-            with _hello_toast_lock:
-                limit = timedelta(minutes=_hello_toast_min())
-                if _last_hello_toast is None or (now - _last_hello_toast) >= limit:
-                    _last_hello_toast = now
-                    show_toast_now    = True
-
-            if show_toast_now:
+            # Queue toast
+            if not was_connected:
                 with _queue_lock:
                     _popup_queue.append({
                         "type": "HELLO",
                         "addr": addr[0],
-                        "ts":   now.strftime("%H:%M:%S"),
+                        "ts":   datetime.now().strftime("%H:%M:%S"),
                     })
-                logger.info(f"[listener] HELLO toast shown (next in {_hello_toast_min()}min)")
-            else:
-                logger.info(f"[listener] HELLO toast suppressed (throttle active)")
+
+            logger.info(f"[listener] HELLO from {addr[0]} — ACK sent, Connected")
 
         # ── STOP command ──────────────────────────────────
         elif command == "STOP":
@@ -278,31 +251,40 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
 
             if not dl_name or not dl_name.startswith("DL"):
                 _send_response(conn, "ERROR", f"Invalid DL: {dl_name}")
-                logger.error(f"[listener] Invalid DL name received: '{dl_name}'")
                 return
 
-            # Acknowledge immediately before automation
+            # Duplicate check — skip if already processing
+            with _state_lock:
+                existing = _dl_states.get(dl_name, {}).get("state")
+            if existing == "processing":
+                logger.info(
+                    f"[listener] {dl_name} already processing — "
+                    f"duplicate signal ignored"
+                )
+                _send_response(conn, "OK",
+                               f"Already processing: {dl_name}")
+                return
+
+            # Acknowledge before automation
             _send_response(conn, "OK", f"Stop queued for {dl_name}")
 
-            # Mark as processing right away so tray shows it
+            # Mark as processing immediately so operator sees it in tray
             ts = datetime.now().strftime("%H:%M:%S")
             with _state_lock:
                 _dl_states[dl_name] = {"state": "processing", "ts": ts}
 
-            logger.info(f"[{dl_name}] STOP signal received from {addr[0]} at {ts}")
-
+            # Queue automation task
             _task_queue.put(dl_name)
-            logger.info(f"[{dl_name}] Queued for automation (queue size: {_task_queue.qsize()})")
+            logger.info(f"[listener] {dl_name} queued for automation")
 
         else:
             _send_response(conn, "ERROR", f"Unknown command: {command}")
-            logger.warning(f"[listener] Unknown command: '{command}' from {addr[0]}")
 
     except json.JSONDecodeError as e:
         logger.error(f"[listener] Bad JSON from {addr}: {e}")
         _send_response(conn, "ERROR", "Invalid JSON")
     except Exception as e:
-        logger.error(f"[listener] Error handling {addr}: {e}")
+        logger.error(f"[listener] Error from {addr}: {e}")
     finally:
         conn.close()
 
@@ -317,7 +299,7 @@ def _start_tcp_listener() -> None:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
         server.listen(20)
-        logger.info(f"[listener] Started — listening on {host}:{port}")
+        logger.info(f"[listener] Listening on {host}:{port}")
         while True:
             try:
                 conn, addr = server.accept()
@@ -330,6 +312,106 @@ def _start_tcp_listener() -> None:
                 logger.error(f"[listener] Accept error: {e}")
                 time.sleep(1)
 
+_FT_ID_MAP = {
+    "F1": ("front", 1, "Function 1"),
+    "F2": ("front", 2, "Function 2"),
+    "F3": ("front", 3, "Function 3"),
+    "F4": ("front", 4, "Function 4"),
+    "R1": ("rear",  1, "Function 1"),
+    "R2": ("rear",  2, "Function 2"),
+    "R3": ("rear",  3, "Function 3"),
+    "R4": ("rear",  4, "Function 4"),
+}
+
+def _ft_id_to_rack_function(ft_id: str)-> tuple:
+    return _FT_ID_MAP.get(ft_id.upper(),("front","Function 1"))
+
+def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
+    """Handle a single connection from an FT PC on port 8998."""
+    try:
+        raw     = conn.recv(1024)
+        data    = json.loads(raw.decode("utf-8"))
+        command = data.get("command", "").upper()
+        ft_id   = data.get("ft_id","").upper()
+
+        logger.info(f"[ft_listener] {addr[0]}:{addr[1]} → {command} {ft_id}")
+
+        if command == "HELLO":
+            _send_response(conn, "ACK", "Connected")
+            with _ft_conn_lock:
+                _ft_conn_states[ft_num] = {
+                    "connected":  True,
+                    "last_hello": datetime.now(),
+                    "addr":       addr[0],
+                    "ft_side":    ft_side,
+                }
+            logger.info(f"[ft_listener] HELLO from FT{ft_id} at {addr[0]} — ACK sent")
+
+        elif command == "STOP":
+            if not ft_id or ft_id not in _FT_ID_MAP:
+                _send_response(conn, "ERROR", f"Invalid ft_id: {ft_id!r}")
+                return
+
+            rack,function_label = _ft_id_to_rack_function(ft_id)
+
+            task_key = f"FT{ft_id}_{rack}_{function_label}"
+
+            # Duplicate check — skip if already queued or processing
+            with _state_lock:
+                existing = _dl_states.get(task_key, {}).get("state")
+            if existing in ("processing",):
+                logger.info(
+                    f"[ft_listener] {task_key} already processing — "
+                    f"duplicate signal ignored")
+                _send_response(conn, "OK",
+                               f"Already processing: {task_key}")
+                return
+
+            _send_response(conn, "OK", f"FT stop queued: {task_key}")
+
+            ts = datetime.now().strftime("%H:%M:%S")
+            with _state_lock:
+                _dl_states[task_key] = {"state": "processing", "ts": ts}
+
+            _task_queue.put(task_key)
+            logger.info(f"[ft_listener] {task_key} queued for automation")
+
+        else:
+            _send_response(conn, "ERROR", f"Unknown command: {command}")
+
+    except json.JSONDecodeError as e:
+        logger.error(f"[ft_listener] Bad JSON from {addr}: {e}")
+        _send_response(conn, "ERROR", "Invalid JSON")
+    except Exception as e:
+        logger.error(f"[ft_listener] Error from {addr}: {e}")
+    finally:
+        conn.close()
+
+
+def _start_ft_tcp_listener() -> None:
+    """Second TCP listener on port 8998 — dedicated to FT PCs."""
+    host = _listen_host()
+    port = _ft_listen_port()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((host, port))
+            server.listen(20)
+            logger.info(f"[ft_listener] FT listener on {host}:{port}")
+            while True:
+                try:
+                    conn, addr = server.accept()
+                    threading.Thread(
+                        target=_handle_ft_connection,
+                        args=(conn, addr),
+                        daemon=True,
+                    ).start()
+                except Exception as e:
+                    logger.error(f"[ft_listener] Accept error: {e}")
+                    time.sleep(1)
+    except Exception as e:
+        logger.error(f"[ft_listener] Failed to start on port {port}: {e}")
+
 
 # =========================================================
 # Toast popup
@@ -341,18 +423,20 @@ def show_toast(root: tk.Tk, item: dict) -> None:
     toast.attributes("-alpha", 0.96)
     toast.configure(bg=BG_CARD)
 
-    kind = item["type"]
+    kind      = item["type"]
+    dl_name   = item.get("dl_name", "")
+    source    = item.get("source", "DL")   # "DL" or "FT"
     if kind == "STOP":
         bar_color = COL_BLOCK
         icon      = "⛔"
-        title     = "DL STOPPED"
-        body_text = f"{item['dl_name']}  automation completed"
+        title     = "FT STOPPED" if source == "FT" else "DL STOPPED"
+        body_text = f"{dl_name}  automation completed"
     elif kind == "ERROR":
         bar_color = COL_WARN
         icon      = "⚠"
-        title     = "AUTOMATION FAILED"
-        body_text = f"{item['dl_name']}  manual intervention required"
-    else:  # HELLO
+        title     = f"{source} AUTOMATION FAILED"
+        body_text = f"{dl_name}  manual intervention required"
+    else:   # HELLO
         bar_color = COL_OK
         icon      = "🔗"
         title     = "DL PC CONNECTED"
@@ -411,14 +495,18 @@ def show_toast(root: tk.Tk, item: dict) -> None:
 class TrayWindow:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("DL Monitor — Main PC")
+        self.root.title("DL  & FT Monitor — Main PC")
         self.root.configure(bg=BG_MAIN)
         self.root.attributes("-topmost", True)
         self.root.resizable(False, False)
 
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
-        self.root.geometry(f"300x460+{sw - 316}+{sh - 500}")
+        w=300
+        h=480
+        x=8
+        y=sh-h-48
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
 
         self.f_title = tkfont.Font(family="Consolas", size=10, weight="bold")
         self.f_conn  = tkfont.Font(family="Consolas", size=9,  weight="bold")
@@ -436,7 +524,7 @@ class TrayWindow:
         # Header
         hdr = tk.Frame(self.root, bg=BG_HEADER, pady=8)
         hdr.pack(fill=tk.X)
-        tk.Label(hdr, text="DL Monitor  •  Main PC",
+        tk.Label(hdr, text="DL & FT Monitor  •  Main PC",
                  font=self.f_title, bg=BG_HEADER,
                  fg=COL_WHITE).pack(padx=10)
 
@@ -449,24 +537,40 @@ class TrayWindow:
 
         self.lbl_conn_dot = tk.Label(
             conn_row, text="●", font=self.f_conn,
-            bg=BG_MAIN, fg=COL_CHECK)
+            bg=BG_MAIN, fg=COL_CHECK,
+        )
         self.lbl_conn_dot.pack(side=tk.LEFT, padx=(0, 4))
 
         self.lbl_conn_status = tk.Label(
-            conn_row, text="Checking...",
-            font=self.f_conn, bg=BG_MAIN, fg=COL_CHECK)
+            conn_row, text="Waiting for DL PC ....",
+            font=self.f_conn, bg=BG_MAIN, fg=COL_CHECK,
+        )
         self.lbl_conn_status.pack(side=tk.LEFT)
 
         self.lbl_conn_since = tk.Label(
             conn_bar, text="",
-            font=self.f_small, bg=BG_MAIN, fg=COL_MUTED)
+            font=self.f_small, bg=BG_MAIN, fg=COL_MUTED,
+        )
         self.lbl_conn_since.pack(anchor="w", padx=18)
 
+        # Start dot animation immediately
         self._start_dot_animation()
 
-        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
+        tk.Frame(self.root, bg="#30363d", height=1).pack(fill=tk.X, pady=4)
 
-        # Status rows — Listener / Queue / InLine_Pro
+        # port on same line
+        port_row=tk.Frame(self.root,bg=BG_MAIN)
+        port_row.pack(fill=tk.X,padx=10,pady=1)
+        tk.Label(port_row,text="Port",font=self.f_small,
+                 bg=BG_MAIN,fg=COL_MUTED,width=10,
+                 anchor='w').pack(side=tk.LEFT)
+        self.lbl_listener=tk.Label(
+            port_row,
+            text=f"● DL:{_listen_port()}  FT: {_ft_listen_port()}",
+            font=self.f_small,bg=BG_MAIN,fg=COL_OK)
+        self.lbl_listener.pack(side=tk.LEFT,padx=4)
+
+        # Listener + queue + app status
         for label_text, attr_name, default, default_color in [
             ("Listener",   "lbl_listener", f"● port {_listen_port()}", COL_OK),
             ("Queue",      "lbl_queue",    "0 pending",                COL_TEXT),
@@ -475,47 +579,107 @@ class TrayWindow:
             row = tk.Frame(self.root, bg=BG_MAIN)
             row.pack(fill=tk.X, padx=10, pady=1)
             tk.Label(row, text=label_text, font=self.f_small,
-                     bg=BG_MAIN, fg=COL_MUTED,
-                     width=10, anchor="w").pack(side=tk.LEFT)
+                     bg=BG_MAIN, fg=COL_MUTED, width=10,
+                     anchor="w").pack(side=tk.LEFT)
             lbl = tk.Label(row, text=default, font=self.f_small,
                            bg=BG_MAIN, fg=default_color)
             lbl.pack(side=tk.LEFT, padx=4)
             setattr(self, attr_name, lbl)
 
-        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=6)
+        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
 
-        # DL state list header
-        tk.Label(self.root, text="DL Activity",
+        # ── FT PC connection dots ─────────────────────────
+        ft_block = tk.Frame(self.root, bg=BG_MAIN, padx=10)
+        ft_block.pack(fill=tk.X, pady=(2, 2))
+        self.ft_dots = {}
+        for row_label, keys in [("Front:", ["F1","F2","F3","F4"]), ("Rear: ", ["R1","R2","R3","R4"])]:
+            row = tk.Label(ft_block, bg=BG_MAIN)
+            row.pack(fill=tk.X,pady=1)
+            tk.Label(row,text=row_label,font=self.f_small,
+                     bg=BG_MAIN,fg=COL_MUTED,
+                        width=6,anchor="w").pack(side=tk.LEFT)
+            for ft_id_key in keys:
+                dot=tk.Label(row,text=ft_id_key,
+                             font=self.f_small,bg=BG_MAIN,
+                             fg=COL_MUTED,padx=3)
+                dot.pack(side=tk.LEFT)
+                self.ft_dots[ft_id_key]=dot
+
+        tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X, pady=4)
+
+        # Blocked DL list header
+        tk.Label(self.root, text="Activity today (DL + FT)",
                  font=self.f_small, bg=BG_MAIN,
                  fg=COL_MUTED).pack(anchor="w", padx=10)
 
-        self.list_frame = tk.Frame(self.root, bg=BG_MAIN)
-        self.list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        # ── Scrollable list with fixed height ─────────────
+        # Canvas + scrollbar so the list never pushes the
+        # "Clear blocked" button off-screen regardless of
+        # how many DL rows accumulate.
+        list_outer = tk.Frame(self.root, bg=BG_MAIN,
+                              height=180)   # fixed max height
+        list_outer.pack(fill=tk.X, padx=10, pady=4)
+        list_outer.pack_propagate(False)    # enforce fixed height
 
+        canvas = tk.Canvas(list_outer, bg=BG_MAIN,
+                           highlightthickness=0)
+        scrollbar = tk.Scrollbar(list_outer, orient="vertical",
+                                 command=canvas.yview,
+                                 bg=BG_MAIN,troughcolor=BG_MAIN,
+                                 bd=0,width=6)
+        def _update_scrollbar(*args):
+            lo,hi=map(float,args)
+            if lo<=0.0 and hi>=1.0:
+                scrollbar.pack_forget()
+            else:
+                scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.configure(yscrollcommand=_update_scrollbar)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.list_frame = tk.Frame(canvas, bg=BG_MAIN)
+        self._list_canvas_id = canvas.create_window(
+            (0, 0), window=self.list_frame, anchor="nw")
+
+        def _on_frame_resize(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(self._list_canvas_id, width=canvas.winfo_width())
+
+        self.list_frame.bind("<Configure>", _on_frame_resize)
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(
+                        self._list_canvas_id, width=e.width))
+
+        # Mouse wheel scroll
+        def _on_mousewheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        self._list_canvas = canvas   # saved for scroll-to-top on clear
+
+        # ── Footer — always visible, packed LAST at bottom ──
         tk.Frame(self.root, bg=COL_BORDER, height=1).pack(fill=tk.X)
 
-        # Footer
         ft = tk.Frame(self.root, bg=BG_MAIN, pady=6)
-        ft.pack(fill=tk.X)
-        self.lbl_time = tk.Label(
-            ft, text="", font=self.f_small, bg=BG_MAIN, fg=COL_MUTED)
+        ft.pack(fill=tk.X, side=tk.BOTTOM)   # anchor to bottom
+        self.lbl_time = tk.Label(ft, text="", font=self.f_small,
+                                  bg=BG_MAIN, fg=COL_MUTED)
         self.lbl_time.pack()
-        tk.Button(
-            ft, text="Clear list",
-            command=self._clear_states,
-            bg=BG_HEADER, fg=COL_TEXT,
-            font=self.f_small, relief=tk.FLAT,
-            padx=10, pady=3, cursor="hand2",
-        ).pack(pady=(2, 0))
+        self.btn_clear = tk.Button(ft, text="Clear blocked",
+                  command=self._clear_blocked,
+                  bg=BG_HEADER, fg=COL_MUTED,
+                  font=self.f_small, relief=tk.FLAT,
+                  padx=10, pady=3, cursor="hand2",
+                  state=tk.DISABLED)
+        self.btn_clear.pack(pady=(2, 0))
 
-    # ── Dot animation ─────────────────────────────────────
+    # ── Connection dot animation ──────────────────────────
     def _start_dot_animation(self):
         self._stop_dot_animation()
         self._animate_dots()
 
     def _animate_dots(self):
         dots = "." * (self._dot_count % 4)
-        self.lbl_conn_status.config(text=f"Checking{dots}")
+        self.lbl_conn_status.config(text=f"Waiting for DL PC {dots}")
         self._dot_count += 1
         self._dot_anim_id = self.root.after(500, self._animate_dots)
 
@@ -524,10 +688,11 @@ class TrayWindow:
             self.root.after_cancel(self._dot_anim_id)
             self._dot_anim_id = None
 
-    # ── Refresh every 5s ──────────────────────────────────
+    # ── Refresh ───────────────────────────────────────────
     def _refresh(self) -> None:
         self._update_conn_status()
-        self._refresh_dl_states()
+        self._update_ft_dots()
+        self._refresh_blocked()
 
         qsize = _task_queue.qsize()
         self.lbl_queue.config(
@@ -550,52 +715,65 @@ class TrayWindow:
             self._stop_dot_animation()
             self.lbl_conn_dot.config(fg=COL_OK)
             self.lbl_conn_status.config(
-                text=f"Connected  •  {dl_addr}", fg=COL_OK)
+                text=f"Connected  •  {dl_addr}",
+                fg=COL_OK,
+            )
             self.lbl_conn_since.config(
                 text=f"since {last_hello.strftime('%H:%M:%S')}",
-                fg=COL_MUTED)
+                fg=COL_MUTED,
+            )
         else:
+            # Still waiting for first HELLO
             self.lbl_conn_dot.config(fg=COL_CHECK)
             self.lbl_conn_since.config(text="", fg=COL_MUTED)
             if self._dot_anim_id is None:
                 self._start_dot_animation()
 
-    # ── DL state list — 3 states ──────────────────────────
-    def _refresh_dl_states(self) -> None:
+    def _refresh_blocked(self) -> None:
         for w in self.list_frame.winfo_children():
             w.destroy()
-
         with _state_lock:
             states = dict(_dl_states)
 
+        if  states:
+            self.btn_clear.config(
+                state=tk.DISABLED,
+                fg=COL_MUTED,
+                cursor="arrow")
+        else:
+            self.btn_clear.config(
+                state=tk.DISABLED,
+                fg=COL_MUTED,
+                cursor="arrow"
+            )
         if not states:
-            tk.Label(self.list_frame, text="No activity yet",
-                     font=self.f_small, bg=BG_MAIN,
+            tk.Label(self.list_frame,text="No activity yet",
+                     font=self.f_small,bg=BG_MAIN,
                      fg=COL_MUTED).pack(pady=6)
             return
 
-        # Summary count header
-        n_proc = sum(1 for v in states.values() if v["state"] == "processing")
-        n_stop = sum(1 for v in states.values() if v["state"] == "stopped")
-        n_err  = sum(1 for v in states.values() if v["state"] == "error")
+        # Count each state for summary header
+        n_proc  = sum(1 for v in states.values() if v["state"] == "processing")
+        n_stop  = sum(1 for v in states.values() if v["state"] == "stopped")
+        n_err   = sum(1 for v in states.values() if v["state"] == "error")
 
-        parts = []
-        if n_proc: parts.append(f"{n_proc} processing")
-        if n_stop: parts.append(f"{n_stop} stopped")
-        if n_err:  parts.append(f"{n_err} error")
+        summary = []
+        if n_proc: summary.append(f"{n_proc} processing")
+        if n_stop: summary.append(f"{n_stop} stopped")
+        if n_err:  summary.append(f"{n_err} error")
 
         tk.Label(
             self.list_frame,
-            text="  •  ".join(parts),
+            text="  •  ".join(summary),
             font=self.f_small, bg=BG_MAIN,
             fg=COL_WARN if n_err else COL_BLOCK,
         ).pack(anchor="w", pady=(0, 4))
 
         # State colors and labels
         STATE_COLOR = {
-            "processing": COL_CHECK,
-            "stopped":    COL_BLOCK,
-            "error":      COL_WARN,
+            "processing": COL_CHECK,   # blue
+            "stopped":    COL_BLOCK,   # red
+            "error":      COL_WARN,    # yellow
         }
         STATE_LABEL = {
             "processing": "Processing...",
@@ -617,15 +795,35 @@ class TrayWindow:
 
             tk.Label(row, text=dl, font=self.f_body,
                      bg=BG_CARD, fg=color,
-                     width=6, anchor="w").pack(side=tk.LEFT)
+                     anchor="w").pack(side=tk.LEFT)
+
             tk.Label(row, text=label_txt,
                      font=self.f_small, bg=BG_CARD,
                      fg=color).pack(side=tk.LEFT, padx=(4, 8))
+
             tk.Label(row, text=ts,
                      font=self.f_small, bg=BG_CARD,
                      fg=COL_MUTED).pack(side=tk.RIGHT)
 
+    def _update_ft_dots(self) -> None:
+        """Update FT dot colors — green=connected, grey=not connected, dim=beyond setup count."""
+        with _ft_conn_lock:
+            states = dict(_ft_conn_states)
+
+        for ft_id_key, dot in self.ft_dots.items():
+            info = states.get(ft_id_key, {})
+            if info.get("connected") and info.get("last_hello"):
+                try:
+                    secs  = (datetime.now() - info['last_hello']).total_seconds()
+                    alive = secs < 3660   # ~1 hour grace (heartbeat=1800s)
+                except Exception:
+                    alive = False
+                dot.config(fg=COL_OK if alive else COL_DISC)
+            else:
+                dot.config(fg=COL_MUTED)
+
     def _check_app_status(self) -> None:
+        import subprocess
         exe = _exe_name()
         try:
             out = subprocess.run(
@@ -645,11 +843,16 @@ class TrayWindow:
                 show_toast(self.root, _popup_queue.pop(0))
         self.root.after(500, self._poll_popup_queue)
 
-    def _clear_states(self) -> None:
+    def _clear_blocked(self) -> None:
         with _state_lock:
             _dl_states.clear()
         logger.info("[tray] DL state list cleared by operator")
-        self._refresh_dl_states()
+        self._refresh_blocked()
+        # Scroll list back to top after clearing
+        try:
+            self._list_canvas.yview_moveto(0)
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -680,18 +883,18 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "spy":
         _spy_controls()
         sys.exit(0)
+    
+    root=tk.Tk()
+    tray=TrayWindow(root)
+    threading.Thread(target=_queue_worker,         daemon=True).start()
+    threading.Thread(target=_start_tcp_listener,    daemon=True).start()
+    threading.Thread(target=_start_ft_tcp_listener, daemon=True).start()
 
-    logger.info("[main] ================================================")
-    logger.info("[main] Main PC popup started")
-    logger.info(f"[main] Listening on port {_listen_port()}")
-    logger.info(f"[main] Log file: {os.path.join(_log_dir(), 'main_pc_popup.log')}")
-    logger.info("[main] ================================================")
+    logger.info(
+        f"[main] Main PC popup started — "
+        f"DL port={_listen_port()}, FT port={_ft_listen_port()}"
+    )
 
-    threading.Thread(target=_queue_worker, daemon=True).start()
-    threading.Thread(target=_start_tcp_listener, daemon=True).start()
-
-    root = tk.Tk()
-    TrayWindow(root)
     root.mainloop()
 
     _task_queue.put(None)
