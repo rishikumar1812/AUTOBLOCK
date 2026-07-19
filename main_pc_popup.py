@@ -745,18 +745,29 @@ class TrayWindow:
             dl_addr    = _conn_state["dl_pc_addr"]
 
         if connected and last_hello:
-            self._stop_dot_animation()
-            self.lbl_conn_dot.config(fg=COL_OK)
-            self.lbl_conn_status.config(
-                text=f"Connected  •  {dl_addr}",
-                fg=COL_OK,
-            )
-            self.lbl_conn_since.config(
-                text=f"since {last_hello.strftime('%H:%M:%S')}",
-                fg=COL_MUTED,
-            )
+            secs_since = (datetime.now() - last_hello).total_seconds()
+            if secs_since < 90:
+                # Recently connected — green
+                self._stop_dot_animation()
+                self.lbl_conn_dot.config(fg=COL_OK)
+                self.lbl_conn_status.config(
+                    text=f"Connected  •  {dl_addr}",
+                    fg=COL_OK)
+                self.lbl_conn_since.config(
+                    text=f"last seen: {last_hello.strftime('%H:%M:%S')}",
+                    fg=COL_MUTED)
+            else:
+                # No HELLO for 90s — show red (DL PC stopped/offline)
+                self._stop_dot_animation()
+                self.lbl_conn_dot.config(fg=COL_DISC)
+                self.lbl_conn_status.config(
+                    text=f"Disconnected  •  {dl_addr}",
+                    fg=COL_DISC)
+                self.lbl_conn_since.config(
+                    text=f"last seen: {last_hello.strftime('%H:%M:%S')}",
+                    fg=COL_MUTED)
         else:
-            # Still waiting for first HELLO
+            # Never received a HELLO yet
             self.lbl_conn_dot.config(fg=COL_CHECK)
             self.lbl_conn_since.config(text="", fg=COL_MUTED)
             if self._dot_anim_id is None:
@@ -854,9 +865,12 @@ class TrayWindow:
             info = states.get(ft_id_key, {})
             if info.get("connected") and info.get("last_hello"):
                 try:
-                    secs  = (datetime.now() -
-                             info["last_hello"]).total_seconds()
-                    alive = secs < 3660
+                    secs = (datetime.now() -
+                            info["last_hello"]).total_seconds()
+                    # Grace period = 90s
+                    # ft_dashboard sends HELLO on startup + every heartbeat_sec
+                    # Show red dot 90s after last HELLO received
+                    alive = secs < 90
                 except Exception:
                     alive = False
                 dot.config(fg=COL_OK if alive else COL_DISC)
