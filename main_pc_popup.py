@@ -503,7 +503,7 @@ class TrayWindow:
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
         # Fixed static size — cannot be resized
-        W, H = 320, 560
+        W, H = 320, 500
         x = 8
         y = max(0, sh - H - 48)
         self.root.geometry(f"{W}x{H}+{x}+{y}")
@@ -529,7 +529,7 @@ class TrayWindow:
         hdr = tk.Frame(self.root, bg=BG_HEADER, width=W, height=34)
         hdr.place(x=0, y=0)
         hdr.pack_propagate(False)
-        tk.Label(hdr, text="DL & FT Monitor  •  Main PC",
+        tk.Label(hdr, text="DL & FT Monitor  *  Main PC",
                  font=self.f_title, bg=BG_HEADER,
                  fg=COL_WHITE).pack(expand=True)
 
@@ -537,7 +537,7 @@ class TrayWindow:
         conn = tk.Frame(self.root, bg=BG_CARD, width=W, height=42)
         conn.place(x=0, y=34)
         conn.pack_propagate(False)
-        self.lbl_conn_dot = tk.Label(conn, text="●",
+        self.lbl_conn_dot = tk.Label(conn, text="*",
                                       font=self.f_conn,
                                       bg=BG_CARD, fg=COL_CHECK)
         self.lbl_conn_dot.place(x=8, y=4)
@@ -570,7 +570,7 @@ class TrayWindow:
 
         _srow("Ports",
               "lbl_listener",
-              f"● DL:{_listen_port()}  FT:{_ft_listen_port()}",
+              f"* DL:{_listen_port()}  FT:{_ft_listen_port()}",
               COL_OK, 4)
         _srow("Queue",      "lbl_queue", "0 pending",   COL_TEXT,  26)
         _srow("InLine_Pro", "lbl_app",   "checking...", COL_MUTED, 48)
@@ -589,15 +589,16 @@ class TrayWindow:
         tk.Label(ft_frame, text="Rear:",  font=self.f_small,
                  bg=BG_CARD, fg=COL_MUTED).place(x=8, y=26)
 
+        # Start dots at x=70 to leave clear gap after label
         for i, key in enumerate(["F1","F2","F3","F4"]):
             dot = tk.Label(ft_frame, text=key, font=self.f_small,
                            bg=BG_CARD, fg=COL_MUTED, padx=2)
-            dot.place(x=56 + i*52, y=4)
+            dot.place(x=70 + i*56, y=4)
             self.ft_dots[key] = dot
         for i, key in enumerate(["R1","R2","R3","R4"]):
             dot = tk.Label(ft_frame, text=key, font=self.f_small,
                            bg=BG_CARD, fg=COL_MUTED, padx=2)
-            dot.place(x=56 + i*52, y=26)
+            dot.place(x=70 + i*56, y=26)
             self.ft_dots[key] = dot
 
         # ── Separator y=194 ───────────────────────────────
@@ -608,9 +609,9 @@ class TrayWindow:
                  font=self.f_small, bg=BG_MAIN,
                  fg=COL_MUTED).place(x=10, y=198)
 
-        # ── Scrollable list y=216 h=256 ───────────────────
+        # ── Scrollable list y=216 h=200 ───────────────────
         list_outer = tk.Frame(self.root, bg=BG_MAIN,
-                              width=W-12, height=256)
+                              width=W-12, height=200)
         list_outer.place(x=6, y=216)
         list_outer.pack_propagate(False)
 
@@ -648,14 +649,14 @@ class TrayWindow:
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
         self._list_canvas = canvas
 
-        # ── Separator y=474 ───────────────────────────────
-        tk.Frame(self.root, bg=COL_BORDER, width=W, height=1).place(x=0, y=474)
+        # ── Separator y=420 ───────────────────────────────
+        tk.Frame(self.root, bg=COL_BORDER, width=W, height=1).place(x=0, y=420)
 
-        # ── Footer y=475 h=85 — always at fixed position ──
+        # ── Footer y=421 — always at fixed position ────────
         self.lbl_time = tk.Label(self.root, text="",
                                   font=self.f_small,
                                   bg=BG_MAIN, fg=COL_MUTED)
-        self.lbl_time.place(x=0, y=480, width=W, anchor="nw")
+        self.lbl_time.place(x=0, y=428, width=W, anchor="nw")
 
         self.btn_clear = tk.Button(self.root,
                                     text="Clear blocked",
@@ -664,7 +665,7 @@ class TrayWindow:
                                     font=self.f_small, relief=tk.RAISED,
                                     padx=12, pady=4,
                                     cursor="hand2", state=tk.DISABLED)
-        self.btn_clear.place(x=W//2, y=510, anchor="n")
+        self.btn_clear.place(x=W//2, y=455, anchor="n")
 
 
     # ── Connection dot animation ──────────────────────────
