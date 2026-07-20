@@ -12,6 +12,7 @@ Run continuously:
 """
 
 import os
+import json
 import time
 import logging
 import pandas as pd
@@ -19,8 +20,7 @@ from datetime import datetime, date
 
 from ft_config_loader import (
     log_dir, log_reg_dir, poll_interval, record_window,
-    warn_at_fail, block_at_fail, ft_display_label, ft_id,
-    NO_DATA_MINUTES
+    warn_at_fail, block_at_fail, ft_display_label, ft_id
 )
 from ft_network_sender import send_stop_signal
 from log_cleanup import cleanup_old_logs, DailyFileHandler
@@ -58,6 +58,80 @@ def _last_stop_path() -> str:
     return os.path.join(log_reg_dir(), f"ft_{safe_id}_last_stop.json")
 
 
+def _stats_path() -> str:
+    """Path to the latest stats JSON — read by ft_dashboard.py."""
+    safe_id = ft_id().replace("/", "_")
+    return os.path.join(log_reg_dir(), f"ft_{safe_id}_stats.json")
+
+
+def _pending_stop_path() -> str:
+    """Path to pending stop flag — written when STOP send fails."""
+    safe_id = ft_id().replace("/", "_")
+    return os.path.join(log_reg_dir(), f"ft_{safe_id}_pending_stop.json")
+
+
+def _save_pending_stop(fails, rate, fails_60, rate_60) -> None:
+    """Save blocked stats so they survive to next poll retry."""
+    path = _pending_stop_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({
+                "fails":    fails,
+                "rate":     rate,
+                "fails_60": fails_60,
+                "rate_60":  rate_60,
+                "ts":       datetime.now().isoformat(),
+            }, f)
+    except Exception as e:
+        logger.error(f"[ft_process] Failed to save pending_stop: {e}")
+
+
+def _load_pending_stop() -> dict:
+    """Load pending stop — returns dict if exists, else None."""
+    path = _pending_stop_path()
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+def _clear_pending_stop() -> None:
+    """Remove pending stop flag after successful send."""
+    path = _pending_stop_path()
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def save_stats(stats: dict) -> None:
+    """Save latest stats to JSON so dashboard can read without re-scanning."""
+    path = _stats_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(stats, f)
+    except Exception as e:
+        logger.error(f"[ft_process] Failed to save stats: {e}")
+
+
+def load_stats() -> dict:
+    """Load latest stats JSON — called by ft_dashboard.py."""
+    path = _stats_path()
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return _empty_stats("STOPPED")
+
+
 def get_last_stop():
     import json
     path = _last_stop_path()
@@ -88,7 +162,11 @@ def save_last_stop(ts: datetime) -> None:
 
 
 # =========================================================
-# Read a single CSV file — same format as DL PC
+# Read a single FT CSV file
+# Same structure as DL PC reader but adapted for FT format:
+#   - RESULT : PASS/FAIL  (space before colon, unlike DL)
+#   - No ARRAY field
+#   - DATE : 2026/07/08   (slashes, not dashes)
 # =========================================================
 def read_csv_file(filepath: str):
     sections        = []
@@ -96,6 +174,7 @@ def read_csv_file(filepath: str):
     rows            = []
     current         = {}
 
+    current_section = []
     try:
         with open(filepath, "r", errors="replace") as f:
             for line in f:
@@ -103,7 +182,8 @@ def read_csv_file(filepath: str):
                 if line.startswith("#INIT"):
                     if current_section:
                         sections.append(current_section)
-                    current_section = [line]
+                        current_section = []
+                    current_section.append(line)
                 else:
                     current_section.append(line)
         if current_section:
@@ -116,14 +196,13 @@ def read_csv_file(filepath: str):
         for line in section:
             if line.startswith("RESULT :"):
                 current["RESULT"] = line.split("RESULT :")[1].strip()
-            elif line.startswith("TIME :"):
+            if line.startswith("TIME :"):
                 current["Update_Time"] = line.split("TIME :")[1].strip()
-            elif line.startswith("DATE :"):
+            if line.startswith("DATE :"):
                 current["DATE"] = line.split("DATE :")[1].strip()
-            elif line.startswith("JIG :"):
+            if line.startswith("JIG :"):
                 current["JIG"] = line.split("JIG :")[1].strip()
-            # Collect record when all required fields found
-            # ARRAY not required — FT CSV format has no ARRAY field
+            # FT has no ARRAY field — collect on DATE+TIME+JIG+RESULT
             if all(k in current for k in
                    ["DATE", "Update_Time", "JIG", "RESULT"]):
                 rows.append(current)
@@ -132,14 +211,13 @@ def read_csv_file(filepath: str):
     if not rows:
         return None
 
-    df = pd.DataFrame(rows, columns=["DATE", "Update_Time",
-                                     "JIG", "RESULT"])
-    # DATE format is 2026/07/08 (slashes) — use infer_datetime_format
-    # DATE format: 2026/07/08 — pandas handles slashes automatically
-    df["Time_stamp"] = pd.to_datetime(
-        df["DATE"] + " " + df["Update_Time"],
-        errors="coerce")
-    return df.sort_values("Time_stamp").reset_index(drop=True)
+    data = pd.DataFrame(rows, columns=["DATE", "Update_Time",
+                                       "JIG", "RESULT"])
+    # DATE format: 2026/07/08 — pd.to_datetime handles slashes
+    data["Time_stamp"] = pd.to_datetime(
+        data["DATE"] + " " + data["Update_Time"], errors="coerce")
+    sorted_df = data.sort_values(by="Time_stamp")
+    return sorted_df
 
 
 def is_today(filepath: str) -> bool:
@@ -177,7 +255,9 @@ def scan_and_check() -> dict:
     ]
     if not all_files:
         logger.debug(f"[ft_process] {label} — no CSV files today")
-        return _empty_stats("STOPPED")
+        s = _empty_stats("STOPPED")
+        save_stats(s)
+        return s
 
     # Combine all station files
     combined = pd.DataFrame()
@@ -189,25 +269,36 @@ def scan_and_check() -> dict:
         return _empty_stats("STOPPED")
 
     combined  = combined.sort_values("Time_stamp").reset_index(drop=True)
-    print(f"[ft_process] {label} — combined {len(combined)} records from "
-          f"{len(all_files)} files")
-    print(f"combined data:\n{combined}")
     latest_ts = combined["Time_stamp"].max()
-    print(f"[ft_process] {label} — latest timestamp: {latest_ts}")
 
     try:
         minutes_since=(datetime.now()-latest_ts).total_seconds()/60
     except Exception:
         minutes_since=0
     
-    no_data_limit = NO_DATA_MINUTES()
-    if minutes_since >= no_data_limit:
+    if minutes_since>=60:
         logger.info(
-            f"[ft_process] {label} — no data for {int(minutes_since)}min "
-            f"(limit={no_data_limit}min) → STOPPED"
+            f"[ft_process] {label} - no data for {int(minutes_since)}min -> STOPPED"
         )
         return _empty_stats("STOPPED")
     last_stop_ts = get_last_stop()
+
+    # ── Last-60 from FULL combined data ────────────────────────
+    # Always computed from all today's data regardless of last_stop.
+    # This ensures fails_60/rate_60 never reset when a STOP is sent.
+    last60   = combined.tail(60)
+    fails_60 = int(last60[last60["RESULT"].str.upper() == "FAIL"].shape[0])
+    rate_60  = (fails_60 / len(last60) * 100) if len(last60) > 0 else 0.0
+
+    last_stop_str = "—"
+    if last_stop_ts:
+        last_stop_str = (
+            last_stop_ts.strftime("%H:%M:%S")
+            if last_stop_ts.date() == date.today()
+            else last_stop_ts.strftime("%b %d  %H:%M:%S")
+        )
+
+    # ── Active window — records AFTER last stop ─────────────────
     if last_stop_ts is not None:
         active = combined[combined["Time_stamp"] >
                           pd.Timestamp(last_stop_ts)]
@@ -219,24 +310,42 @@ def scan_and_check() -> dict:
 
     total = len(active)
     if total == 0:
-        return _empty_stats(
-            "BLOCKED" if last_stop_ts else "RUNNING",
-            last_stop=last_stop_ts
-        )
+        # No new records after last stop — still BLOCKED
+        # But show fails_60/rate_60 from full data
+        blocked_min = 0
+        if last_stop_ts:
+            blocked_min = int(
+                (datetime.now() - last_stop_ts).total_seconds() / 60)
+        status = "BLOCKED" if last_stop_ts else "RUNNING"
+        stats = {
+            "label":         label,
+            "ft_id":         ft_id(),
+            "status":        status,
+            "total":         0,
+            "fails":         0,
+            "rate":          0.0,
+            "fails_60":      fails_60,
+            "rate_60":       rate_60,
+            "last_stop":     last_stop_str,
+            "last_data":     latest_ts.strftime("%H:%M:%S"),
+            "blocked_min":   blocked_min,
+            "files_today":   len(all_files),
+            "minutes_since": int(minutes_since),
+        }
+        save_stats(stats)
+        return stats
 
     fails      = int(active[active["RESULT"].str.upper() == "FAIL"].shape[0])
     pass_count = int(active[active["RESULT"].str.upper() == "PASS"].shape[0])
     rate       = (fails / total * 100) if total > 0 else 0.0
 
-    # Last-60 stats for display
-    last60   = combined.tail(60)
-    fails_60 = int(last60[last60["RESULT"].str.upper() == "FAIL"].shape[0])
-    rate_60  = (fails_60 / len(last60) * 100) if len(last60) > 0 else 0.0
-
     # Determine status
-    if last_stop_ts is not None and pass_count == 0:
+    # BLOCKED if:
+    #   a) fails hit block threshold in the active window, OR
+    #   b) last_stop exists and no new PASS since then (total=0 caught above)
+    if fails >= block_at_fail():
         status = "BLOCKED"
-    elif fails >= block_at_fail():
+    elif last_stop_ts is not None and pass_count == 0 and fails > 0:
         status = "BLOCKED"
     elif fails >= warn_at_fail():
         status = "WARNING"
@@ -248,8 +357,16 @@ def scan_and_check() -> dict:
         blocked_min = int(
             (datetime.now() - last_stop_ts).total_seconds() / 60)
 
-    # Send STOP signal when threshold hit
-    if status == "BLOCKED" and fails >= block_at_fail():
+    # ── Send STOP only once when first hitting threshold ──────
+    # Only send if last_stop_ts is None or if new fails AFTER last stop
+    # This prevents re-sending STOP on every poll while still BLOCKED
+    already_stopped = (
+        last_stop_ts is not None and
+        active[active["RESULT"].str.upper() == "FAIL"].shape[0] == 0
+    )
+    should_send = status == "BLOCKED" and not already_stopped
+
+    if should_send:
         logger.warning(
             f"[ft_process] {label} — BLOCKED: {fails} fails / "
             f"{total} records ({rate:.1f}%). Sending STOP to Main PC.")
@@ -265,19 +382,12 @@ def scan_and_check() -> dict:
                 f"[ft_process] {label} — STOP signal FAILED. "
                 f"Will retry next poll.")
 
-    last_stop_str = "—"
-    if last_stop_ts:
-        if last_stop_ts.date() == date.today():
-            last_stop_str = last_stop_ts.strftime("%H:%M:%S")
-        else:
-            last_stop_str = last_stop_ts.strftime("%b %d  %H:%M:%S")
-
     logger.info(
         f"[ft_process] {label} — {status} | "
         f"fails={fails}/{total} ({rate:.1f}%) | "
         f"files={len(all_files)}")
         
-    return {
+    stats = {
         "label":         label,
         "ft_id":         ft_id(),
         "status":        status,
@@ -292,6 +402,9 @@ def scan_and_check() -> dict:
         "files_today":   len(all_files),
         "minutes_since": int(minutes_since),
     }
+    # Save stats so ft_dashboard can read without re-scanning
+    save_stats(stats)
+    return stats
 
 
 def _empty_stats(status="STOPPED", last_stop=None) -> dict:
