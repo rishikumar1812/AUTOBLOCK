@@ -21,6 +21,7 @@ import logging
 import threading
 import tkinter as tk
 from tkinter import font as tkfont
+from tray_utils import SingleInstance, TrayIconManager, hide_console
 from datetime import datetime
 
 from config_loader import get_config
@@ -893,24 +894,67 @@ def _spy_controls() -> None:
 
 
 # =========================================================
+# =========================================================
 # Entry point
 # =========================================================
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "spy":
         _spy_controls()
         sys.exit(0)
-    
-    root=tk.Tk()
-    tray=TrayWindow(root)
-    threading.Thread(target=_queue_worker,         daemon=True).start()
-    threading.Thread(target=_start_tcp_listener,    daemon=True).start()
-    threading.Thread(target=_start_ft_tcp_listener, daemon=True).start()
+
+    hide_console()
+
+    # ── Single instance check ──────────────────────────────
+    si = SingleInstance("MainPCPopup")
+    if not si.acquire():
+        si.signal_restore()
+        sys.exit(0)
+
+    # Tk root FIRST — required on Windows before starting threads
+    root     = tk.Tk()
+    tray_win = TrayWindow(root)
+
+    threading.Thread(target=_queue_worker,          daemon=True).start()
+    threading.Thread(target=_start_tcp_listener,     daemon=True).start()
+    threading.Thread(target=_start_ft_tcp_listener,  daemon=True).start()
 
     logger.info(
         f"[main] Main PC popup started — "
         f"DL port={_listen_port()}, FT port={_ft_listen_port()}"
     )
 
-    root.mainloop()
+    # ── System tray integration ────────────────────────────
+    def _show():
+        root.after(0, lambda: [root.deiconify(), root.lift(),
+                               root.focus_force()])
+
+    def _hide():
+        root.after(0, root.withdraw)
+
+    def _do_exit():
+        si.release()
+        sys_tray.stop()
+        _task_queue.put(None)
+        root.after(0, root.destroy)
+
+    sys_tray = TrayIconManager(
+        app_name="Main PC Monitor",
+        on_show=_show,
+        on_hide=_hide,
+        on_exit=_do_exit,
+    )
+    sys_tray.start()
+
+    # Close button hides to tray
+    root.protocol("WM_DELETE_WINDOW", _hide)
+
+    # Listen for restore signal from second instance
+    si.start_listener(on_restore_callback=_show)
+
+    try:
+        root.mainloop()
+    finally:
+        si.release()
+        sys_tray.stop()
 
     _task_queue.put(None)
