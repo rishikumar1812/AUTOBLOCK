@@ -767,15 +767,32 @@ if __name__ == "__main__":
     _hide_console()
     _setup_signal_handlers()
 
+    # ── Single instance — prevent two workers on same FT PC ──
+    try:
+        from tray_utils import SingleInstance
+        _si = SingleInstance(f"FTProcess_{_safe_id()}")
+        if not _si.acquire():
+            logger.error(
+                f"[ft_process] Another instance already running for "
+                f"{ft_display_label()}. Exiting.")
+            sys.exit(1)
+    except Exception as _e:
+        logger.warning(f"[ft_process] SingleInstance check failed: {_e}")
+        _si = None
+
     interval = poll_interval()
     label    = ft_display_label()
     logger.info(
         f"[ft_process] {label} monitor started. "
         f"Scanning every {interval}s.")
-    while True:
-        try:
-            scan_and_check()
-        except Exception as e:
-            logger.error(
-                f"[ft_process] Unhandled error: {e}", exc_info=True)
-        time.sleep(interval)
+    try:
+        while True:
+            try:
+                scan_and_check()
+            except Exception as e:
+                logger.error(
+                    f"[ft_process] Unhandled error: {e}", exc_info=True)
+            time.sleep(interval)
+    finally:
+        if _si:
+            _si.release()
