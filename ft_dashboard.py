@@ -506,9 +506,12 @@ class FTDashboard:
         threading.Thread(target=self._fetch, daemon=True).start()
 
     def _fetch(self):
+        """
+        Dashboard reads ONLY from the JSON stats file written by
+        ft_process_file.py. No CSV processing, no statistics
+        calculation happens here — ever.
+        """
         try:
-            # Read stats saved by ft_process_file.py (runs separately 24/7)
-            # Dashboard never calls scan_and_check() directly
             stats = load_stats()
         except Exception as e:
             print(f"[ft_dashboard] Refresh error: {e}")
