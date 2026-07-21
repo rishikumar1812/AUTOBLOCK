@@ -4,10 +4,12 @@ Small single-card dashboard showing this FT PC status.
 Run:  python ft_dashboard.py
 """
 
+import sys
 import threading
 import tkinter as tk
 from tkinter import font as tkfont, messagebox
 from datetime import datetime
+from tray_utils import SingleInstance, TrayIconManager, hide_console
 
 from ft_config_loader import (
     get_config, save_config,
@@ -520,12 +522,8 @@ class FTDashboard:
 
     # ── Config ────────────────────────────────────────────
     def _on_close(self) -> None:
-        """
-        Intercept X button — minimize to taskbar instead of closing.
-        Dashboard stays alive, monitoring and connection keep running.
-        Click taskbar icon to restore.
-        """
-        self.root.iconify()
+        """Handled by entry point — protocol set there."""
+        self.root.withdraw()
 
     def _open_config(self):
         try:
@@ -550,8 +548,55 @@ class FTDashboard:
 # Entry point
 # =========================================================
 if __name__ == "__main__":
+    hide_console()
+
+    # ── Single instance check ──────────────────────────────
+    si = SingleInstance("FTDashboard")
+    if not si.acquire():
+        si.signal_restore()
+        sys.exit(0)
+
     root = tk.Tk()
     root.geometry("420x560")
     root.minsize(380, 480)
-    FTDashboard(root)
-    root.mainloop()
+    dash = FTDashboard(root)
+
+    # ── System tray integration ────────────────────────────
+    def _show():
+        root.after(0, lambda: [root.deiconify(), root.lift(),
+                               root.focus_force()])
+
+    def _hide():
+        root.after(0, root.withdraw)
+
+    def _exit():
+        si.release()
+        tray.stop()
+        root.after(0, root.destroy)
+
+    tray = TrayIconManager(
+        app_name="FT Dashboard",
+        on_show=_show,
+        on_hide=_hide,
+        on_exit=_exit,
+    )
+    tray.start()
+
+    # Override close button to hide to tray
+    def _on_close():
+        root.withdraw()
+        tray.show_balloon(
+            "FT Dashboard",
+            "Dashboard is still running in the system tray.",
+            once_only=True)
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+
+    # Listen for restore signals from second instance
+    si.start_listener(on_restore_callback=_show)
+
+    try:
+        root.mainloop()
+    finally:
+        si.release()
+        tray.stop()
