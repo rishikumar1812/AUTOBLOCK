@@ -521,6 +521,7 @@ class TrayWindow:
         self._build()
         self._poll_popup_queue()
         self._refresh()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build(self) -> None:
         W = 320  # must match geometry W
@@ -784,22 +785,25 @@ class TrayWindow:
             label_txt = STATE_LABEL.get(state, state)
 
             row = tk.Frame(self.list_frame, bg=BG_CARD,
-                           pady=3, padx=8,
+                           pady=4, padx=8,
                            highlightbackground=color,
                            highlightthickness=1)
             row.pack(fill=tk.X, pady=2)
 
-            tk.Label(row, text=dl, font=self.f_body,
-                     bg=BG_CARD, fg=color,
-                     anchor="w").pack(side=tk.LEFT)
-
-            tk.Label(row, text=label_txt,
-                     font=self.f_small, bg=BG_CARD,
-                     fg=color).pack(side=tk.LEFT, padx=(4, 8))
-
-            tk.Label(row, text=ts,
+            # Line 1: DL/FT name on left, timestamp on right
+            line1 = tk.Frame(row, bg=BG_CARD)
+            line1.pack(fill=tk.X)
+            tk.Label(line1, text=display,
+                     font=self.f_body, bg=BG_CARD,
+                     fg=color, anchor="w").pack(side=tk.LEFT)
+            tk.Label(line1, text=ts,
                      font=self.f_small, bg=BG_CARD,
                      fg=COL_MUTED).pack(side=tk.RIGHT)
+
+            # Line 2: State label below
+            tk.Label(row, text=label_txt,
+                     font=self.f_small, bg=BG_CARD,
+                     fg=color, anchor="w").pack(fill=tk.X)
 
     def _update_ft_dots(self) -> None:
         """Update FT dot colors — green=connected, grey=not connected, dim=beyond setup count."""
@@ -838,6 +842,22 @@ class TrayWindow:
             while _popup_queue:
                 show_toast(self.root, _popup_queue.pop(0))
         self.root.after(500, self._poll_popup_queue)
+
+    def _on_close(self) -> None:
+        """
+        Intercept window close button (X).
+        Hides the window instead of destroying it so the
+        TCP listeners and queue worker keep running in background.
+        Double-click tray icon or run again to restore.
+        """
+        self.root.withdraw()
+        logger.info("[tray] Window hidden — listeners still running. "
+                    "Run again or double-click icon to restore.")
+
+    def _restore(self) -> None:
+        """Restore hidden window."""
+        self.root.deiconify()
+        self.root.lift()
 
     def _clear_blocked(self) -> None:
         with _state_lock:
