@@ -17,7 +17,7 @@ from ft_config_loader import (
     _FT_MAP
 )
 from ft_network_sender import send_hello
-from ft_process_file   import scan_and_check, _empty_stats
+from ft_process_file   import load_stats, _empty_stats
 
 # =========================================================
 # Colors
@@ -83,7 +83,7 @@ class FTConfigEditor(tk.Toplevel):
             cfg = {
                 "ft": {"ft_id": "F1"},
                 "network": {"main_pc_ip": "192.168.0.21", "main_pc_port": 8998},
-                "paths": {"log_dir": "C:\\FT\\logs"},
+                "paths": {"log_dir": "C:\\DGS\\logs"},
                 "thresholds": {"warn_at_fail": 2, "block_at_fails": 4},
             }
         self._vars = {}
@@ -227,6 +227,8 @@ class FTDashboard:
         self._last_stats = _empty_stats()
         self._dot_count  = 0
         self._dot_id     = None
+        # Intercept close button — minimize instead of quit
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.f_title    = tkfont.Font(family="Consolas", size=13, weight="bold")
         self.f_name     = tkfont.Font(family="Consolas", size=12, weight="bold")
@@ -272,12 +274,12 @@ class FTDashboard:
         hdr.pack(fill=tk.X)
 
         tk.Label(hdr, text=f"FT Monitor  •  {label}",
-                 font=self.f_title, bg=COL_TEXT,
-                 fg=BG_HEADER).pack(side=tk.LEFT, padx=14)
+                 font=self.f_sub, bg=BG_HEADER,
+                 fg=COL_WHITE).pack(side=tk.LEFT)
 
         tk.Button(hdr, text="⚙ Config",
                   command=self._open_config,
-                  bg=COL_TEXT, fg=BG_MAIN,
+                  bg=BG_HEADER, fg=COL_WHITE,
                   font=self.f_note, relief=tk.RAISED,
                   padx=10, pady=4,
                   cursor="hand2").pack(side=tk.RIGHT, padx=10, pady=4)
@@ -344,20 +346,21 @@ class FTDashboard:
         def _row(label_text, attr, fg=COL_TEXT, top_pad=2):
             row = tk.Frame(card, bg=BG_CARD)
             row.pack(fill=tk.X, pady=(top_pad, 2))
+            # width=13 so "Blocked Since:" fits without truncating
             tk.Label(row, text=label_text,
                      font=self.f_bold,
                      bg=BG_CARD, fg=COL_MUTED,
-                     width=11, anchor="w").pack(side=tk.LEFT)
-            lbl = tk.Label(row, text="—",
+                     width=13, anchor="w").pack(side=tk.LEFT)
+            lbl = tk.Label(row, text="-",
                            font=self.f_bold,
                            bg=BG_CARD, fg=fg)
-            lbl.pack(side=tk.LEFT)
+            lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
             setattr(self, attr, lbl)
 
-        _row("Fails:",     "lbl_fails",     COL_RUN)
-        _row("Rate:",      "lbl_rate",      COL_TEXT)
-        _row("Last 60:",   "lbl_fails60",   COL_TEXT)
-        _row("Rate 60:",   "lbl_rate60",    COL_TEXT)
+        _row("Fails:",         "lbl_fails",        COL_RUN)
+        _row("Rate:",          "lbl_rate",         COL_TEXT)
+        _row("Last 60:",       "lbl_fails60",      COL_TEXT)
+        _row("Rate 60:",       "lbl_rate60",       COL_TEXT)
 
         tk.Frame(card, bg=COL_BDR, height=1).pack(
             fill=tk.X, pady=(6, 4))
@@ -367,12 +370,12 @@ class FTDashboard:
         _row("Last Data:",     "lbl_last_data",    COL_MUTED)
         _row("Updated:",       "lbl_updated",      COL_MUTED)
 
-        # Blocked banner — full width
-        self.lbl_blocked = tk.Label(card, text="",
-                                     font=self.f_bold,
-                                     bg=BG_CARD, fg=COL_BLOCK,
+        # No-data footer line
+        self.lbl_no_data = tk.Label(card, text="",
+                                     font=self.f_note,
+                                     bg=BG_CARD, fg=COL_WARN,
                                      anchor="w")
-        self.lbl_blocked.pack(fill=tk.X, pady=(6, 0))
+        self.lbl_no_data.pack(fill=tk.X, pady=(4, 0))
 
         # ── Refresh button ────────────────────────────────
         tk.Button(self.root,
@@ -383,23 +386,15 @@ class FTDashboard:
                   padx=14, pady=6,
                   cursor="hand2").pack(pady=(4, 10))
 
-        # ── Footer — two lines: static config + dynamic no-data ──
-        footer_frame = tk.Frame(self.root, bg=BG_HEADER)
-        footer_frame.pack(fill=tk.X, side=tk.BOTTOM)
-
+        # ── Footer ────────────────────────────────────────
         try:
             footer_text = f"Log: {log_dir()}   Warn≥{warn_at_fail()}  Block≥{block_at_fail()}"
         except Exception:
             footer_text = "Log: not configured"
-        tk.Label(footer_frame, text=footer_text,
+        tk.Label(self.root, text=footer_text,
                  font=self.f_note, bg=BG_HEADER,
-                 fg=COL_MUTED, pady=2).pack(fill=tk.X)
-
-        # Dynamic no-data line — updated in _update_ui
-        self.lbl_no_data = tk.Label(footer_frame, text="",
-                                     font=self.f_note, bg=BG_HEADER,
-                                     fg=COL_WARN, pady=2)
-        self.lbl_no_data.pack(fill=tk.X)
+                 fg=COL_MUTED, pady=4).pack(
+            fill=tk.X, side=tk.BOTTOM)
 
         # Restart dot animation after rebuild
         self._start_dots()
@@ -429,34 +424,24 @@ class FTDashboard:
         self.lbl_rate60.config(text=f"{r60:.2f}%", fg=f60_color)
 
         self.lbl_last_stop.config(text=stats.get("last_stop", "—"))
-
-        # Blocked since row — show duration if BLOCKED, else hide
-        bmin = stats.get("blocked_min", 0)
-        if status == "BLOCKED" and bmin > 0:
-            dur = (f"{bmin//60}h {bmin%60:02d}m"
-                   if bmin >= 60 else f"{bmin}min")
-            self.lbl_blocked_since.config(
-                text=dur, fg=COL_BLOCK)
-        else:
-            self.lbl_blocked_since.config(text="—", fg=COL_MUTED)
-
         self.lbl_last_data.config(text=stats.get("last_data", "—"))
         self.lbl_updated.config(
             text=datetime.now().strftime("%H:%M:%S"))
 
-        # Blocked banner
-        if status == "BLOCKED":
-            self.lbl_blocked.config(
-                text=f"⛔   BLOCKED", fg=COL_BLOCK)
+        # Blocked Since row
+        bmin = stats.get("blocked_min", 0)
+        if status == "BLOCKED" and bmin > 0:
+            dur = (f"{bmin//60}h {bmin%60:02d}m"
+                   if bmin >= 60 else f"{bmin}min")
+            self.lbl_blocked_since.config(text=dur, fg=COL_BLOCK)
         else:
-            self.lbl_blocked.config(text="")
+            self.lbl_blocked_since.config(text="-", fg=COL_MUTED)
 
-        # Footer no-data line
+        # No-data footer
         mins = stats.get("minutes_since", 0)
         if mins > 0 and status == "STOPPED":
             self.lbl_no_data.config(
-                text=f"No data for {mins}min",
-                fg=COL_WARN)
+                text=f"No data for {mins}min", fg=COL_WARN)
         else:
             self.lbl_no_data.config(text="")
 
@@ -478,7 +463,7 @@ class FTDashboard:
             if ok:
                 self.lbl_dot.config(fg=COL_CONN)
                 self.lbl_conn.config(
-                    text=f"Connected  •  {main_pc_ip()}:{main_pc_port()}",
+                    text=f"Connected  {main_pc_ip()}:{main_pc_port()}",
                     fg=COL_CONN)
             else:
                 self.lbl_dot.config(fg=COL_DISC)
@@ -522,13 +507,23 @@ class FTDashboard:
 
     def _fetch(self):
         try:
-            stats = scan_and_check()
+            # Read stats saved by ft_process_file.py (runs separately 24/7)
+            # Dashboard never calls scan_and_check() directly
+            stats = load_stats()
         except Exception as e:
             print(f"[ft_dashboard] Refresh error: {e}")
             stats = _empty_stats()
         self.root.after(0, lambda: self._update_ui(stats))
 
     # ── Config ────────────────────────────────────────────
+    def _on_close(self) -> None:
+        """
+        Intercept X button — minimize to taskbar instead of closing.
+        Dashboard stays alive, monitoring and connection keep running.
+        Click taskbar icon to restore.
+        """
+        self.root.iconify()
+
     def _open_config(self):
         try:
             FTConfigEditor(self.root, on_save=self._on_config_saved)
@@ -552,10 +547,6 @@ class FTDashboard:
 # Entry point
 # =========================================================
 if __name__ == "__main__":
-    # ft_process_file.py runs separately as a 24/7 background process.
-    # This dashboard only displays stats — run both independently:
-    #   Terminal 1: python ft_process_file.py   (runs 24/7)
-    #   Terminal 2: python ft_dashboard.py       (UI display)
     root = tk.Tk()
     root.geometry("420x560")
     root.minsize(380, 480)
