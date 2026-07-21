@@ -416,3 +416,6 @@ class TrayIconManager:
                 self._icon.title = text
             except Exception:
                 pass
+
+
+
