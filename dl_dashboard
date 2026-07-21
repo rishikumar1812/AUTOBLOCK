@@ -16,8 +16,10 @@ import json
 import socket
 import subprocess
 import platform
+import sys
 import tkinter as tk
-from tkinter import font as tkfont, messagebox
+from tkinter import font as tkfont
+from tray_utils import SingleInstance, TrayIconManager, hide_console, messagebox
 from datetime import datetime, date, timedelta
 import pandas as pd
 import threading
@@ -476,9 +478,6 @@ class DLDashboard:
         self.root.title("DL Monitor Dashboard")
         self.root.configure(bg=BG_MAIN)
         self.root.resizable(True, True)
-        # Intercept close button — minimize to taskbar instead of quitting
-        # so the monitoring thread and connection keep running
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._after_id     = None
         self._last_stats   = []
         self._conn_state   = CONN_CHECKING
@@ -771,14 +770,6 @@ class DLDashboard:
                 "fail": lbl_fail, "rate": lbl_rate, "last": lbl_last}
 
     # ── Footer ────────────────────────────────────────────
-    def _on_close(self) -> None:
-        """
-        Intercept the X button — iconify (minimize) instead of destroying.
-        Dashboard stays alive and monitoring continues.
-        Click the taskbar icon to restore.
-        """
-        self.root.iconify()   # minimize to taskbar
-
     def _build_footer(self):
         self.footer_lbl = tk.Label(
             self.root, text=self._footer_text(),
@@ -886,6 +877,14 @@ class DLDashboard:
 # Entry point
 # =========================================================
 if __name__ == "__main__":
+    hide_console()
+
+    # ── Single instance check ──────────────────────────────
+    si = SingleInstance("DLDashboard")
+    if not si.acquire():
+        si.signal_restore()
+        sys.exit(0)
+
     cfg  = get_config()
     root = tk.Tk()
     root.geometry(
@@ -893,4 +892,40 @@ if __name__ == "__main__":
     )
     root.minsize(800, 560)
     DLDashboard(root)
-    root.mainloop()
+
+    # ── System tray integration ────────────────────────────
+    def _show():
+        root.after(0, lambda: [root.deiconify(), root.lift(),
+                               root.focus_force()])
+
+    def _hide():
+        root.after(0, root.withdraw)
+
+    def _exit():
+        si.release()
+        tray.stop()
+        root.after(0, root.destroy)
+
+    tray = TrayIconManager(
+        app_name="DL Dashboard",
+        on_show=_show,
+        on_hide=_hide,
+        on_exit=_exit,
+    )
+    tray.start()
+
+    def _on_close():
+        root.withdraw()
+        tray.show_balloon(
+            "DL Dashboard",
+            "Dashboard is still running in the system tray.",
+            once_only=True)
+
+    root.protocol("WM_DELETE_WINDOW", _on_close)
+    si.start_listener(on_restore_callback=_show)
+
+    try:
+        root.mainloop()
+    finally:
+        si.release()
+        tray.stop()
