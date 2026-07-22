@@ -1,8 +1,33 @@
-# ft_process_file — no console window at all
-pyinstaller --onefile --noconsole ft_process_file.py
+Here's a cleaner and more professional Process Details slide with 4 subheadings, each having exactly 2 bullet points.
 
-# dl_dashboard — with window (needed for tkinter)
-pyinstaller --onefile --windowed dl_dashboard.py
+Process Details
 
-# main_pc_popup — same
-pyinstaller --onefile --windowed main_pc_popup.py
+DL PC Monitoring
+
+Continuously scans production CSV logs and monitors failure counts in the active production window.
+
+Sends a STOP request to the Main PC when the configured failure threshold is exceeded.
+
+
+FT PC Monitoring
+
+Combines data from all FT stations and calculates active failures with Last-60 statistics.
+
+Detects abnormal conditions and transmits STOP requests to the Main PC.
+
+
+Main PC Automation
+
+Validates machine readiness by checking Building/Function occupancy before automation.
+
+Executes the automated STOP → SETUP → START sequence and updates system status.
+
+
+Dashboard & Reporting
+
+Displays real-time machine status, failure statistics, and blocked conditions.
+
+Provides centralized monitoring for operators while running continuously in the background.
+
+
+This format is presentation-friendly, concise, and suitable for a professional technical review.
