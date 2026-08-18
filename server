@@ -1,0 +1,303 @@
+Good. Let's build Phase 1 properly for SQL Server 2014.
+
+One important point: SQL Server 2014 does not have the native JSON functions introduced in SQL Server 2016. So for flexible DL/FT data, we'll store the raw payload as NVARCHAR(MAX) rather than depending on SQL Server JSON functions.
+
+Phase 1 — Step 1: Create Database
+
+Run this in SQL Server Management Studio (SSMS):
+
+IF DB_ID('LineMonitoring') IS NULL
+BEGIN
+    CREATE DATABASE LineMonitoring;
+END
+GO
+
+USE LineMonitoring;
+GO
+
+
+---
+
+Step 2: Create lines
+
+This is the main table containing your approximately 60 lines.
+
+CREATE TABLE dbo.lines
+(
+    line_id INT IDENTITY(1,1) NOT NULL,
+    
+    line_number NVARCHAR(50) NOT NULL,
+    line_name NVARCHAR(100) NULL,
+    
+    ip_address VARCHAR(45) NOT NULL,
+    
+    total_dl INT NOT NULL DEFAULT 0,
+    total_ft INT NOT NULL DEFAULT 0,
+    
+    enabled BIT NOT NULL DEFAULT 1,
+    
+    connection_status NVARCHAR(20) NOT NULL DEFAULT 'OFFLINE',
+    
+    last_seen_at DATETIME2 NULL,
+    
+    created_at DATETIME2 NOT NULL DEFAULT GETDATE(),
+    updated_at DATETIME2 NOT NULL DEFAULT GETDATE(),
+
+    CONSTRAINT PK_lines
+        PRIMARY KEY (line_id),
+
+    CONSTRAINT UQ_lines_line_number
+        UNIQUE (line_number),
+
+    CONSTRAINT CK_lines_total_dl
+        CHECK (total_dl >= 0),
+
+    CONSTRAINT CK_lines_total_ft
+        CHECK (total_ft >= 0),
+
+    CONSTRAINT CK_lines_connection_status
+        CHECK (connection_status IN
+        ('ONLINE', 'STALE', 'OFFLINE', 'DISABLED'))
+);
+GO
+
+What this stores
+
+For example:
+
+line_id	line_number	IP	total_dl	total_ft	status
+
+1	LINE01	192.168.1.101	20	6	ONLINE
+2	LINE02	192.168.1.102	20	6	OFFLINE
+
+
+
+---
+
+Step 3: Create line_units
+
+Instead of creating separate DL and FT tables, we'll initially keep both in one table.
+
+CREATE TABLE dbo.line_units
+(
+    unit_id INT IDENTITY(1,1) NOT NULL,
+
+    line_id INT NOT NULL,
+
+    unit_type VARCHAR(10) NOT NULL,
+    unit_number NVARCHAR(50) NOT NULL,
+
+    enabled BIT NOT NULL DEFAULT 1,
+
+    created_at DATETIME2 NOT NULL DEFAULT GETDATE(),
+    updated_at DATETIME2 NOT NULL DEFAULT GETDATE(),
+
+    CONSTRAINT PK_line_units
+        PRIMARY KEY (unit_id),
+
+    CONSTRAINT FK_line_units_lines
+        FOREIGN KEY (line_id)
+        REFERENCES dbo.lines(line_id),
+
+    CONSTRAINT CK_line_units_type
+        CHECK (unit_type IN ('DL', 'FT')),
+
+    CONSTRAINT UQ_line_units
+        UNIQUE (line_id, unit_type, unit_number)
+);
+GO
+
+This allows:
+
+LINE01
+ ├── DL01
+ ├── DL02
+ ├── DL03
+ │   ...
+ ├── FT01
+ ├── FT02
+ └── FT03
+
+
+---
+
+Step 4: Create unit_current_state
+
+This stores the latest state of every DL/FT.
+
+This is important because the dashboard should not search the entire historical database every time it wants to show the current status.
+
+CREATE TABLE dbo.unit_current_state
+(
+    unit_id INT NOT NULL,
+
+    status NVARCHAR(20) NOT NULL DEFAULT 'UNKNOWN',
+
+    last_seen_at DATETIME2 NULL,
+
+    current_data NVARCHAR(MAX) NULL,
+
+    updated_at DATETIME2 NOT NULL DEFAULT GETDATE(),
+
+    CONSTRAINT PK_unit_current_state
+        PRIMARY KEY (unit_id),
+
+    CONSTRAINT FK_unit_current_state_unit
+        FOREIGN KEY (unit_id)
+        REFERENCES dbo.line_units(unit_id),
+
+    CONSTRAINT CK_unit_current_state_status
+        CHECK (status IN
+        ('RUNNING', 'STOPPED', 'WARNING', 'ERROR', 'UNKNOWN'))
+);
+GO
+
+current_data is deliberately NVARCHAR(MAX).
+
+Later, if your actual DL/FT data looks like:
+
+{
+    "jig": "JIG01",
+    "fail_count": 4,
+    "pass_count": 120,
+    "rate": 96.7
+}
+
+we can store that raw data there.
+
+
+---
+
+Step 5: Create monitoring_events
+
+This is our historical data table.
+
+CREATE TABLE dbo.monitoring_events
+(
+    event_id BIGINT IDENTITY(1,1) NOT NULL,
+
+    line_id INT NOT NULL,
+
+    unit_id INT NULL,
+
+    event_time DATETIME2 NOT NULL,
+
+    shift_code NVARCHAR(20) NULL,
+
+    event_type NVARCHAR(50) NOT NULL,
+
+    status NVARCHAR(20) NULL,
+
+    event_data NVARCHAR(MAX) NULL,
+
+    client_message_id NVARCHAR(100) NULL,
+
+    created_at DATETIME2 NOT NULL DEFAULT GETDATE(),
+
+    CONSTRAINT PK_monitoring_events
+        PRIMARY KEY (event_id),
+
+    CONSTRAINT FK_monitoring_events_line
+        FOREIGN KEY (line_id)
+        REFERENCES dbo.lines(line_id),
+
+    CONSTRAINT FK_monitoring_events_unit
+        FOREIGN KEY (unit_id)
+        REFERENCES dbo.line_units(unit_id)
+);
+GO
+
+This table will eventually allow queries like:
+
+LINE01
+    ↓
+18-Aug-2026
+    ↓
+Shift A
+    ↓
+DL01
+    ↓
+Historical events
+
+
+---
+
+Step 6: Create Indexes
+
+These are important because eventually we'll have a lot of historical data.
+
+CREATE INDEX IX_lines_connection_status
+ON dbo.lines(connection_status);
+GO
+
+CREATE INDEX IX_lines_last_seen
+ON dbo.lines(last_seen_at);
+GO
+
+CREATE INDEX IX_line_units_line
+ON dbo.line_units(line_id);
+GO
+
+CREATE INDEX IX_line_units_type
+ON dbo.line_units(line_id, unit_type);
+GO
+
+CREATE INDEX IX_monitoring_events_line_time
+ON dbo.monitoring_events(line_id, event_time);
+GO
+
+CREATE INDEX IX_monitoring_events_line_shift_time
+ON dbo.monitoring_events(line_id, shift_code, event_time);
+GO
+
+CREATE INDEX IX_monitoring_events_unit_time
+ON dbo.monitoring_events(unit_id, event_time);
+GO
+
+Our database structure now
+
+LineMonitoring
+│
+├── dbo.lines
+│      │
+│      └──── 60 Lines
+│
+├── dbo.line_units
+│      │
+│      ├──── DL01
+│      ├──── DL02
+│      ├──── ...
+│      ├──── FT01
+│      └──── FT02
+│
+├── dbo.unit_current_state
+│      │
+│      └──── Latest DL/FT status
+│
+└── dbo.monitoring_events
+       │
+       └──── Historical data
+
+Why we are using 4 tables
+
+We are deliberately not creating dozens of tables.
+
+The separation is:
+
+lines → What lines exist and where they are.
+
+line_units → Which DL/FT units belong to each line.
+
+unit_current_state → What is happening right now.
+
+monitoring_events → What happened historically.
+
+That structure fits your 60-line monitoring requirement well.
+
+Before we go further
+
+Do not create the FastAPI or frontend yet.
+
+First run the database script in SQL Server 2014 and confirm that these four tables are created successfully.
+
+Then our next Phase 1 step will be insert 2–3 sample lines + DL/FT data and test the relationships and queries.
