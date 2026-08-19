@@ -24,9 +24,9 @@ from tkinter import font as tkfont
 from tray_utils import SingleInstance, TrayIconManager, hide_console
 from datetime import datetime
 
-from config_loader import get_config
+from config_loader import get_config,cleanup_days
 from ini_editor import uncheck_dl,uncheck_ft
-from inline_automation import run_stop_sequence
+from inline_automation import run_stop_sequence, _is_ft_task
 from log_cleanup import cleanup_old_logs, DailyFileHandler
 
 
@@ -48,7 +48,7 @@ def _setup_logger() -> logging.Logger:
     os.makedirs(log_dir, exist_ok=True)
 
     # Delete log files older than 7 days — runs once at startup
-    cleanup_old_logs(log_dir, retention_days=7)
+    cleanup_old_logs(log_dir, retention_days=cleanup_days())
 
     logger = logging.getLogger("main_pc_popup")
     if not logger.handlers:
@@ -58,7 +58,7 @@ def _setup_logger() -> logging.Logger:
         # This tray app runs 24/7 in the background (root.mainloop()),
         # so the old fixed-date filename never updated itself — this
         # handler checks the date on every emit() call instead.
-        fh = DailyFileHandler("main_pc_popup", log_dir, retention_days=7)
+        fh = DailyFileHandler("main_pc_popup", log_dir, retention_days=cleanup_days())
         logger.addHandler(fh)
 
         sh = logging.StreamHandler()
@@ -131,7 +131,7 @@ def _task_display_name(task_key:str)->str:
             ft_id=parts[1]
             rack=parts[2].capitalize()
             func=parts[3] if len(parts)>3 else ""
-            return f"{ft_id} ({rack} - {func})"
+            return f"FT_{ft_id}_{rack}_{function_label}"
         except Exception:
             return task_key
     return task_key
@@ -149,11 +149,12 @@ def _queue_worker() -> None:
             logger.info(f"[queue] Processing stop for {dl_name}")
             success = run_stop_sequence(dl_name)
 
-            ts = datetime.now().strftime("%H:%M:%S")
+            now = datetime.now()
+            ts = now.strftime("%d-%m-%Y %H:%M:%S")
             if success:
                 # Automation confirmed — mark as stopped
                 with _state_lock:
-                    _dl_states[dl_name] = {"state": "stopped", "ts": ts}
+                    _dl_states[dl_name] = {"state": "stopped", "ts": ts, "ts_dt": now}
 
                 # Queue toast
                 with _queue_lock:
@@ -162,13 +163,14 @@ def _queue_worker() -> None:
                         "dl_name": display,
                         "source":  "FT" if _is_ft_task(dl_name) else "DL",
                         "ts":      ts,
+                        "ts_dt":   now,
                     })
 
                 logger.info(f"[queue] {display} — stopped OK at {ts}")
             else:
                 # Automation failed — mark as error, operator must act
                 with _state_lock:
-                    _dl_states[dl_name] = {"state": "error", "ts": ts}
+                    _dl_states[dl_name] = {"state": "error", "ts": ts, "ts_dt": now}
 
                 # Queue error toast
                 with _queue_lock:
@@ -177,6 +179,7 @@ def _queue_worker() -> None:
                         "dl_name": display,
                         "source":  "FT" if _is_ft_task(dl_name) else "DL",
                         "ts":      ts,
+                        "ts_dt":   now,
                     })
 
                 logger.error(
@@ -185,14 +188,16 @@ def _queue_worker() -> None:
                 )
         except Exception as e:
             logger.error(f"[queue] {display} — unexpected error: {e}")
-            ts=datetime.now().strftime("%H:%M:%S")
+            now = datetime.now()
+            ts = now.strftime("%d-%m-%Y %H:%M:%S")
             with _state_lock:
-                _dl_states[dl_name]={"state":"error","ts":ts}
+                _dl_states[dl_name]={"state":"error","ts":ts,"ts_dt":now}
             with _queue_lock:
                 _popup_queue.append({
                     "type": "ERROR",
                     "dl_name": display,
                     "ts":      ts,
+                    "ts_dt":   now,
                 })
         finally:
             _task_queue.task_done()
@@ -270,9 +275,10 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
             _send_response(conn, "OK", f"Stop queued for {dl_name}")
 
             # Mark as processing immediately so operator sees it in tray
-            ts = datetime.now().strftime("%H:%M:%S")
+            now = datetime.now()
+            ts = now.strftime("%d-%m-%Y %H:%M:%S")
             with _state_lock:
-                _dl_states[dl_name] = {"state": "processing", "ts": ts}
+                _dl_states[dl_name] = {"state": "processing", "ts": ts, "ts_dt": now}
 
             # Queue automation task
             _task_queue.put(dl_name)
@@ -325,7 +331,10 @@ _FT_ID_MAP = {
 }
 
 def _ft_id_to_rack_function(ft_id: str)-> tuple:
-    return _FT_ID_MAP.get(ft_id.upper(),("front","Function 1"))
+    rack, _num, function_label = _FT_ID_MAP.get(
+        ft_id.upper(), ("front", 1, "Function 1")
+    )
+    return rack, function_label
 
 def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
     """Handle a single connection from an FT PC on port 8998."""
@@ -339,14 +348,18 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
 
         if command == "HELLO":
             _send_response(conn, "ACK", "Connected")
-            with _ft_conn_lock:
-                _ft_conn_states[ft_num] = {
-                    "connected":  True,
-                    "last_hello": datetime.now(),
-                    "addr":       addr[0],
-                    "ft_side":    ft_side,
-                }
-            logger.info(f"[ft_listener] HELLO from FT{ft_id} at {addr[0]} — ACK sent")
+            if ft_id in _FT_ID_MAP:
+                rack, _num, _label = _FT_ID_MAP[ft_id]
+                with _ft_conn_lock:
+                    _ft_conn_states[ft_id] = {
+                        "connected":  True,
+                        "last_hello": datetime.now(),
+                        "addr":       addr[0],
+                        "ft_side":    rack,
+                    }
+                logger.info(f"[ft_listener] HELLO from FT{ft_id} at {addr[0]} — ACK sent")
+            else:
+                logger.warning(f"[ft_listener] HELLO with unknown ft_id={ft_id!r} from {addr[0]}")
 
         elif command == "STOP":
             if not ft_id or ft_id not in _FT_ID_MAP:
@@ -355,7 +368,7 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
 
             rack,function_label = _ft_id_to_rack_function(ft_id)
 
-            task_key = f"FT{ft_id}_{rack}_{function_label}"
+            task_key = f"FT_{ft_id}_{rack}_{function_label}"
 
             # Duplicate check — skip if already queued or processing
             with _state_lock:
@@ -370,9 +383,10 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
 
             _send_response(conn, "OK", f"FT stop queued: {task_key}")
 
-            ts = datetime.now().strftime("%H:%M:%S")
+            now = datetime.now()
+            ts = now.strftime("%d-%m-%Y %H:%M:%S")
             with _state_lock:
-                _dl_states[task_key] = {"state": "processing", "ts": ts}
+                _dl_states[task_key] = {"state": "processing", "ts": ts, "ts_dt": now}
 
             _task_queue.put(task_key)
             logger.info(f"[ft_listener] {task_key} queued for automation")
@@ -453,8 +467,8 @@ def show_toast(root: tk.Tk, item: dict) -> None:
     body.pack(fill=tk.BOTH, expand=True)
 
     f_big = tkfont.Font(family="Consolas", size=12, weight="bold")
-    f_med = tkfont.Font(family="Consolas", size=10)
-    f_sml = tkfont.Font(family="Consolas", size=8)
+    f_med = tkfont.Font(family="Consolas", size=10, weight="bold")
+    f_sml = tkfont.Font(family="Consolas", size=8,  weight="bold")
 
     tk.Label(body, text=f"{icon}  {title}",
              font=f_big, bg=BG_CARD, fg=bar_color).pack(anchor="w")
@@ -490,6 +504,35 @@ def show_toast(root: tk.Tk, item: dict) -> None:
     toast.after(4500, fade_out)
 
 
+def _pop_next_popup_item() -> dict:
+    """
+    Pop the next item to display from _popup_queue.
+
+    STOP/ERROR history items are shown newest-first: among all
+    pending STOP/ERROR entries, the one with the latest ts_dt is
+    popped and displayed first, regardless of DL/FT name, source, or
+    queue position. This affects ONLY the display/pop order — no
+    STOP/ERROR event is ever dropped or collapsed, even multiple
+    events from the same device.
+
+    HELLO/connection items are left completely untouched: if there
+    is no pending STOP/ERROR item, the oldest queued item (FIFO,
+    exactly as before) is popped — so HELLO ordering/behavior is
+    unchanged.
+    """
+    stop_error_indices = [
+        i for i, item in enumerate(_popup_queue)
+        if item.get("type") in ("STOP", "ERROR")
+    ]
+    if stop_error_indices:
+        newest_idx = max(
+            stop_error_indices,
+            key=lambda i: _popup_queue[i].get("ts_dt", datetime.min),
+        )
+        return _popup_queue.pop(newest_idx)
+    return _popup_queue.pop(0)
+
+
 # =========================================================
 # Tray window
 # =========================================================
@@ -513,8 +556,8 @@ class TrayWindow:
 
         self.f_title = tkfont.Font(family="Consolas", size=10, weight="bold")
         self.f_conn  = tkfont.Font(family="Consolas", size=9,  weight="bold")
-        self.f_body  = tkfont.Font(family="Consolas", size=9)
-        self.f_small = tkfont.Font(family="Consolas", size=8)
+        self.f_body  = tkfont.Font(family="Consolas", size=9,  weight="bold")
+        self.f_small = tkfont.Font(family="Consolas", size=8,  weight="bold")
 
         self._dot_count   = 0
         self._dot_anim_id = None
@@ -735,9 +778,9 @@ class TrayWindow:
 
         if  states:
             self.btn_clear.config(
-                state=tk.DISABLED,
-                fg=COL_MUTED,
-                cursor="arrow")
+                state=tk.NORMAL,
+                fg=COL_TEXT,
+                cursor="hand2")
         else:
             self.btn_clear.config(
                 state=tk.DISABLED,
@@ -779,11 +822,19 @@ class TrayWindow:
             "error":      "⚠ Error — manual needed",
         }
 
-        for dl, info in sorted(states.items()):
+        # Sort by when the entry was last updated — newest first,
+        # so the most recently stopped/processing DL or FT shows at top
+        # instead of being grouped by DL/FT number.
+        def _sort_key(item):
+            _dl, info = item
+            return info.get("ts_dt") or datetime.min
+
+        for dl, info in sorted(states.items(), key=_sort_key, reverse=True):
             state     = info["state"]
             ts        = info["ts"]
             color     = STATE_COLOR.get(state, COL_MUTED)
             label_txt = STATE_LABEL.get(state, state)
+            display   = _task_display_name(dl)
 
             row = tk.Frame(self.list_frame, bg=BG_CARD,
                            pady=4, padx=8,
@@ -827,9 +878,16 @@ class TrayWindow:
         import subprocess
         exe = _exe_name()
         try:
+            si = None
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = subprocess.CREATE_NO_WINDOW
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             out = subprocess.run(
                 ["tasklist", "/FI", f"IMAGENAME eq {exe}"],
                 capture_output=True, text=True, timeout=3,
+                startupinfo=si, creationflags=creationflags,
             )
             if exe.lower() in out.stdout.lower():
                 self.lbl_app.config(text="● running", fg=COL_OK)
@@ -841,7 +899,7 @@ class TrayWindow:
     def _poll_popup_queue(self) -> None:
         with _queue_lock:
             while _popup_queue:
-                show_toast(self.root, _popup_queue.pop(0))
+                show_toast(self.root, _pop_next_popup_item())
         self.root.after(500, self._poll_popup_queue)
 
     def _on_close(self) -> None:
