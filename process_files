@@ -6,7 +6,7 @@ from datetime import datetime,date
 from register_logger import register_stop_event
 from stop_tracker import get_all_stop_times
 from config_loader import get_config
-from log_cleanup import cleanup_old_logs, DailyFileHandler
+from log_cleanup import cleanup_old_logs, DailyFileHandler,cleanup_days
 
 # configuration -> loaded from config.json, not hardcoded
 
@@ -39,7 +39,7 @@ def _setup_logger()->logging.Logger:
     os.makedirs(log_reg_dir,exist_ok=True)
 
     # Delete log files older than 7 days — runs once at startup
-    cleanup_old_logs(log_reg_dir, retention_days=7)
+    cleanup_old_logs(log_reg_dir, retention_days=cleanup_days())
 
     logger=logging.getLogger("process_files")
 
@@ -50,7 +50,7 @@ def _setup_logger()->logging.Logger:
         # automatically opens a new file at midnight — this process
         # runs 24/7 via the while-loop below, so a fixed filename
         # string (old version) would never roll over on its own.
-        fh = DailyFileHandler("process_files", log_reg_dir, retention_days=7)
+        fh = DailyFileHandler("process_files", log_reg_dir, retention_days=cleanup_days())
         logger.addHandler(fh)
 
         sh=logging.StreamHandler()
