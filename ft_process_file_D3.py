@@ -2,21 +2,14 @@
 ft_process_file.py  —  FT PC (DL PC architecture)
 
 Behaves exactly like DL_PC/process_file.py: ONE shared log_dir holds
-CSV files for every station, named "..._YYYYMMDD_SSN.csv" where the
-3-digit suffix is SS = station number (01-08) and N = substation (1-6).
-Each station has 6 substations, and all 6 of their files merge into
-that single station:
-
-    _011 _012 _013 _014 _015 _016  ->  station 01  (F1)
-    _081 _082 _083 _084 _085 _086  ->  station 08  (R4)
-
-Files are bucketed by that station key each scan, then the SAME
-detection engine used before (read -> merge -> last-60 -> active
-window -> status -> STOP-if-required -> save stats) runs once per
-station over its merged substation data. The only FT-specific piece
-is the station list, which comes from setup_type (6 or 8 stations,
-front F/ rear R) via ft_config_loader.ft_stations() — everything
-else is unchanged from the original algorithm.
+CSV files for every station, named "..._YYYYMMDD_XX.csv" where XX is a
+2-digit station number. Files are bucketed by that suffix into station
+buckets each scan, then the SAME detection engine used before (read →
+merge → last-60 → active window → status → STOP-if-required → save
+stats) runs once per station. The only FT-specific piece is the
+station list, which comes from setup_type (6 or 8 stations, front F/
+rear R) via ft_config_loader.ft_stations() — everything else is
+unchanged from the original algorithm.
 
 Architecture (per station, same as before):
   read_csv_files()           — read that station's CSVs for today
@@ -53,7 +46,7 @@ from ft_config_loader_D3 import (
     log_dir, log_reg_dir, poll_interval, record_window,
     warn_at_fail, block_at_fail, no_data_minutes,
     ft_stations, station_display, station_rack_function, setup_type,
-    heartbeat_sec,
+    heartbeat_sec,cleanup_days
 )
 from ft_network_sender_D3 import send_stop_signal, send_hello_all
 from log_cleanup_D3 import cleanup_old_logs, DailyFileHandler
@@ -65,13 +58,13 @@ from log_cleanup_D3 import cleanup_old_logs, DailyFileHandler
 def _setup_logger() -> logging.Logger:
     ldir = log_reg_dir()
     os.makedirs(ldir, exist_ok=True)
-    cleanup_old_logs(ldir, retention_days=7)
+    cleanup_old_logs(ldir, retention_days=cleanup_days())
 
     logger = logging.getLogger("ft_process")
     if not logger.handlers:
         logger.setLevel(logging.INFO)
         fh = DailyFileHandler(
-            "ft_process", ldir, retention_days=7)
+            "ft_process", ldir, retention_days=cleanup_days())
         logger.addHandler(fh)
         sh = logging.StreamHandler()
         sh.setFormatter(
@@ -241,6 +234,41 @@ def _format_last_stop(last_stop_ts: Optional[datetime]) -> str:
 
 
 # =========================================================
+# Stops-today counter
+# Tracks how many times this station has been STOPped (blocked)
+# today, mirroring DL PC's per-day stop_count. Incremented once
+# per STOP signal actually sent — see send_stop_if_required().
+# =========================================================
+def _stops_today_path(station: str) -> str:
+    today_str = date.today().strftime("%Y%m%d")
+    return os.path.join(log_reg_dir(),
+                        f"ft_{_safe_id(station)}_stops_{today_str}.json")
+
+
+def get_stops_today(station: str) -> int:
+    path = _stops_today_path(station)
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return int(json.load(f).get("count", 0))
+    except Exception as e:
+        logger.warning(f"[ft_process] {station} — Could not read stops_today: {e}")
+    return 0
+
+
+def _increment_stops_today(station: str) -> int:
+    path  = _stops_today_path(station)
+    count = get_stops_today(station) + 1
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"date": date.today().isoformat(), "count": count}, f)
+    except Exception as e:
+        logger.error(f"[ft_process] {station} — Failed to save stops_today: {e}")
+    return count
+
+
+# =========================================================
 # Step 1: read_csv_files()
 # Read all today's FT CSV files, return list of DataFrames
 # =========================================================
@@ -357,19 +385,13 @@ def read_csv_files(files: list) -> tuple:
 def bucket_files_by_station(directory: str, stations: list) -> dict:
     """
     DL-PC-style bucketing: ONE shared log_dir holds today's CSVs for
-    every station, named "..._YYYYMMDD_SSN.csv" where the 3-digit
-    suffix is SS = station number (01-08) and N = substation (1-6).
+    every station, named "..._YYYYMMDD_XX.csv" where XX is a 2-digit
+    station number (01, 02, ...). This groups today's files by that
+    suffix into {station_name: [filepaths]}, the same way
+    DL_PC/process_file.py buckets DL01..DL20 from a shared directory.
 
-    Each station has 6 substations whose files ALL merge into that one
-    station, e.g.:
-        _011 _012 _013 _014 _015 _016  ->  station 01  (F1)
-        _081 _082 _083 _084 _085 _086  ->  station 08  (R4)
-
-    So the station key is basename[-7:-5] — identical to
-    DL_PC/process_file.py, which buckets DL01..DL20 the same way.
-
-    stations[i] corresponds to station number (i+1).
-    Returns {station_name: [filepaths]}.
+    stations[i] corresponds to file suffix (i+1), e.g. stations[0]
+    ("F1" for an 8-station setup) matches files ending in "_01.csv".
     """
     buckets = {s: [] for s in stations}
     try:
@@ -384,25 +406,24 @@ def bucket_files_by_station(directory: str, stations: list) -> dict:
         return buckets
 
     for fpath in all_files:
-        # 2-digit station number, ignoring the trailing substation digit
-        key = os.path.basename(fpath)[-7:-5]
+        key = os.path.basename(fpath)[-7:-5]   # 2 digits before ".csv"
+        print(key)
         try:
             index = int(key) - 1
+            print(index)
         except ValueError:
-            logger.debug(
-                f"[ft_process] Skipping file with no station suffix: "
-                f"{os.path.basename(fpath)}")
+            logger.debug(f"[ft_process] Skipping file with no station suffix: {os.path.basename(fpath)}")
             continue
         if 0 <= index < len(stations):
             buckets[stations[index]].append(fpath)
         else:
             logger.debug(
-                f"[ft_process] Station {key} outside configured range "
-                f"(1-{len(stations)}): {os.path.basename(fpath)}")
-
-    for st, fl in buckets.items():
+                f"[ft_process] Station {key} outside configured range"
+                f"(1-{len(stations)})  : {os.path.basename(fpath)}"
+            )
+    for st , fl in buckets.items():
         if fl:
-            logger.debug(f"[ft_process] {st}: {len(fl)} substation file(s)")
+            logger.debug(f"[ft_process] {st} : {len(fl)} substation file(s)")
 
     return buckets
 
@@ -569,6 +590,7 @@ def send_stop_if_required(station: str, status: str, fails: int, rate: float,
     if sent:
         new_ts = datetime.now()
         save_last_stop(station, new_ts)
+        _increment_stops_today(station)
         _clear_pending_stop(station)
         logger.info(
             f"[ft_process] {label} — STOP sent OK "
@@ -596,19 +618,65 @@ def scan_and_check_station(station: str, files: list) -> dict:
     # They only change when new production records arrive in Step 3.
     saved_fails_60, saved_rate_60 = _load_last_saved_last60(station)
 
+    # ── Load last_stop up front ─────────────────────────────
+    # Every early-return path below needs this to decide between
+    # BLOCKED (a STOP was already sent and the machine hasn't produced
+    # a new PASS since) and STOPPED (never blocked — genuinely idle).
+    # A blocked machine produces no new data by definition, so "no
+    # fresh data" must NOT be treated as proof the machine stopped —
+    # only as proof it hasn't recovered yet.
+    last_stop_ts  = get_last_stop(station)
+    last_stop_str = _format_last_stop(last_stop_ts)
+    stops_today   = get_stops_today(station)
+
+    def _idle_status_and_blocked_min(recovered: bool = False) -> tuple:
+        """Status/blocked_min to use whenever there's no fresh data to
+        evaluate (missing/unreadable files, or the no-data timeout).
+
+        last_stop_ts is HISTORICAL — it must not by itself keep a
+        machine BLOCKED forever. If the machine already produced a
+        PASS after last_stop_ts (recovered=True), the block is
+        considered cleared, and subsequent idle time reports STOPPED
+        like any other idle machine. Only an un-recovered block (no
+        PASS after the STOP) stays BLOCKED indefinitely while idle.
+        """
+        if last_stop_ts is not None and not recovered:
+            blocked_min = int(
+                (datetime.now() - last_stop_ts).total_seconds() / 60)
+            return "BLOCKED", blocked_min
+        return "STOPPED", 0
+
+    def _recovered_after_stop(combined_df: pd.DataFrame) -> bool:
+        """True if at least one PASS record exists strictly after
+        last_stop_ts. Determines whether a prior STOP has been
+        cleared, per the recovery lifecycle: BLOCKED -> (PASS) ->
+        RUNNING -> (no data) -> STOPPED."""
+        if last_stop_ts is None:
+            return False
+        after_stop = combined_df[
+            combined_df["Time_stamp"] > pd.Timestamp(last_stop_ts)
+        ]
+        if after_stop.empty:
+            return False
+        return bool((after_stop["RESULT"].str.upper() == "PASS").any())
+
     # ── Step 1: Read this station's CSV files ───────────────
     all_files, frames = read_csv_files(files)
 
     if not all_files:
+        status, blocked_min = _idle_status_and_blocked_min()
         logger.debug(f"[ft_process] {label} — no CSV files today")
-        s = _empty_stats(station, "STOPPED",
+        s = _empty_stats(station, status, last_stop=last_stop_ts,
+                         blocked_min=blocked_min, stops_today=stops_today,
                          fails_60=saved_fails_60, rate_60=saved_rate_60)
         save_stats(station, s)
         return s
 
     if not frames:
+        status, blocked_min = _idle_status_and_blocked_min()
         logger.warning(f"[ft_process] {label} — all CSV files unreadable")
-        s = _empty_stats(station, "STOPPED",
+        s = _empty_stats(station, status, last_stop=last_stop_ts,
+                         blocked_min=blocked_min, stops_today=stops_today,
                          fails_60=saved_fails_60, rate_60=saved_rate_60)
         save_stats(station, s)
         return s
@@ -616,7 +684,9 @@ def scan_and_check_station(station: str, files: list) -> dict:
     # ── Step 2: Merge and deduplicate ──────────────────────
     combined = merge_records(frames)
     if combined is None:
-        s = _empty_stats(station, "STOPPED",
+        status, blocked_min = _idle_status_and_blocked_min()
+        s = _empty_stats(station, status, last_stop=last_stop_ts,
+                         blocked_min=blocked_min, stops_today=stops_today,
                          fails_60=saved_fails_60, rate_60=saved_rate_60)
         save_stats(station, s)
         return s
@@ -630,17 +700,26 @@ def scan_and_check_station(station: str, files: list) -> dict:
 
     no_data_limit = no_data_minutes()
     if minutes_since >= no_data_limit:
+        # A previous STOP does not permanently mean BLOCKED. If a PASS
+        # record already arrived after last_stop_ts, the station has
+        # recovered — going idle afterward reports STOPPED, not BLOCKED.
+        recovered = _recovered_after_stop(combined)
+        status, blocked_min = _idle_status_and_blocked_min(recovered)
         logger.info(
             f"[ft_process] {label} — no data for "
-            f"{int(minutes_since)}min → STOPPED")
-        # Preserve last-known fails_60/rate_60 — machine idle, not reset
-        s = _empty_stats(station, "STOPPED",
-                         fails_60=saved_fails_60, rate_60=saved_rate_60)
+            f"{int(minutes_since)}min → {status}"
+            f"{' (recovered)' if recovered else ''}")
+        # Preserve last-known fails_60/rate_60 — machine idle, not reset.
+        # last_data/minutes_since reflect the true last production
+        # record — they must NOT reset just because the station went
+        # idle (see LAST DATA RULE).
+        s = _empty_stats(station, status, last_stop=last_stop_ts,
+                         blocked_min=blocked_min, stops_today=stops_today,
+                         fails_60=saved_fails_60, rate_60=saved_rate_60,
+                         last_data=latest_ts.strftime("%H:%M:%S"),
+                         minutes_since=int(minutes_since))
         save_stats(station, s)
         return s
-
-    last_stop_ts  = get_last_stop(station)
-    last_stop_str = _format_last_stop(last_stop_ts)
 
     # ── Step 3: Last-60 (INDEPENDENT — computed from full data) ──
     # This is computed BEFORE the active window filter.
@@ -666,6 +745,8 @@ def scan_and_check_station(station: str, files: list) -> dict:
             last_stop_str=last_stop_str,
             latest_ts=latest_ts,
             blocked_min=blocked_min,
+            blocked_since=(last_stop_str if status == "BLOCKED" else "—"),
+            stops_today=stops_today,
             files_today=len(all_files),
             minutes_since=int(minutes_since),
         )
@@ -690,6 +771,7 @@ def scan_and_check_station(station: str, files: list) -> dict:
         # Recalculate last_stop_str and blocked_min after successful send
         last_stop_str = _format_last_stop(new_stop_ts)
         blocked_min   = 0  # just sent — 0 minutes blocked so far
+        stops_today   = get_stops_today(station)  # re-read — just incremented
 
     # ── Step 7: Save stats ─────────────────────────────────
     logger.info(
@@ -705,6 +787,8 @@ def scan_and_check_station(station: str, files: list) -> dict:
         last_stop_str=last_stop_str,
         latest_ts=latest_ts,
         blocked_min=blocked_min,
+        blocked_since=(last_stop_str if status == "BLOCKED" else "—"),
+        stops_today=stops_today,
         files_today=len(all_files),
         minutes_since=int(minutes_since),
     )
@@ -731,6 +815,7 @@ def scan_and_check() -> dict:
         for station in stations:
             saved_fails_60, saved_rate_60 = _load_last_saved_last60(station)
             s = _empty_stats(station, "NO DIR",
+                             stops_today=get_stops_today(station),
                              fails_60=saved_fails_60, rate_60=saved_rate_60)
             save_stats(station, s)
             results[station] = s
@@ -749,7 +834,8 @@ def scan_and_check() -> dict:
 
 def _build_stats(*, station, label, status, total, fails, rate,
                  fails_60, rate_60, last_stop_str, latest_ts,
-                 blocked_min, files_today, minutes_since) -> dict:
+                 blocked_min, blocked_since, stops_today,
+                 files_today, minutes_since) -> dict:
     """Build the stats dict that is written to JSON and read by dashboard."""
     try:
         last_data = latest_ts.strftime("%H:%M:%S")
@@ -767,6 +853,8 @@ def _build_stats(*, station, label, status, total, fails, rate,
         "last_stop":     last_stop_str,
         "last_data":     last_data,
         "blocked_min":   blocked_min,
+        "blocked_since": blocked_since,
+        "stops_today":   stops_today,
         "files_today":   files_today,
         "minutes_since": minutes_since,
     }
@@ -774,13 +862,28 @@ def _build_stats(*, station, label, status, total, fails, rate,
 
 def _empty_stats(station: str, status: str = "STOPPED",
                  last_stop: Optional[datetime] = None,
+                 blocked_min: int = 0,
+                 stops_today: int = 0,
                  fails_60: int = 0,
-                 rate_60: float = 0.0) -> dict:
+                 rate_60: float = 0.0,
+                 last_data: str = "—",
+                 minutes_since: int = 0) -> dict:
     """
     Returns a minimal stats dict for error/idle states.
     fails_60 and rate_60 are passed in from the last saved values
     so they are never reset to 0 in early-return paths.
+
+    blocked_since mirrors last_stop whenever status is BLOCKED, so the
+    dashboard can show "blocked since <time>" without recomputing it.
+
+    last_data/minutes_since default to "—"/0 for branches with no
+    data at all (missing/unreadable files). Callers that DO have a
+    real last production timestamp (e.g. the no-data timeout, where
+    combined data exists but has gone stale) should pass it through
+    so "Last Data" keeps showing the true last record instead of
+    resetting, per the recovery lifecycle.
     """
+    last_stop_str = _format_last_stop(last_stop)
     return {
         "label":         station_display(station),
         "ft_id":         station,
@@ -790,11 +893,13 @@ def _empty_stats(station: str, status: str = "STOPPED",
         "rate":          0.0,
         "fails_60":      fails_60,
         "rate_60":       round(rate_60, 2),
-        "last_stop":     _format_last_stop(last_stop),
-        "last_data":     "—",
-        "blocked_min":   0,
+        "last_stop":     last_stop_str,
+        "last_data":     last_data,
+        "blocked_min":   blocked_min,
+        "blocked_since": last_stop_str if status == "BLOCKED" else "—",
+        "stops_today":   stops_today,
         "files_today":   0,
-        "minutes_since": 0,
+        "minutes_since": minutes_since,
     }
 
 
