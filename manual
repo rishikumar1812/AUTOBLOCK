@@ -1,314 +1,582 @@
-# Line Monitoring & Data Management — Run Manual
 
-This is the complete guide to running every piece of this project: what
-each folder is, what to install, exact commands, and how to troubleshoot.
+# InLine Pro — Line Monitoring System
+## Technical Documentation & Code Execution Manual
 
-## What's in this project
-
-```
-project/
-├── backend/              FastAPI + SQL Server API — runs on the Server PC
-├── frontend/              React dashboard (real, API-connected) — Server PC
-├── frontend-static/       HTML/CSS mockup (no backend needed) — for design review
-├── line-client/            Agent that runs on each of the ~60 line PCs
-├── excel-import-tool/     One-time/occasional tool to bulk-load lines from Excel
-├── schema.sql (in backend/)  Raw SQL Server schema script
-```
-
-Two kinds of machines:
-
-- **1 Server PC** — database + backend + website. Needs a fixed LAN IP.
-- **~60 Line PCs** — one `line-client` agent per production line.
+**Version:** Phase 1–4 (Engine, Database, API, Web UI)
+**Stack:** Python, FastAPI, SQLAlchemy (SQLite dev / SQL Server 2014 production), Jinja2, HTML/CSS (no JavaScript)
 
 ---
 
-## Part A — Quick Local Test (one PC, no SQL Server needed)
+## Table of Contents
 
-Do this first, on your own laptop/dev PC, before touching the real factory
-network. It uses SQLite instead of SQL Server so there's nothing to install
-except Python and Node.
+1. [What This System Does](#1-what-this-system-does)
+2. [System Architecture](#2-system-architecture)
+3. [The Three Input Sources — Explained in Detail](#3-the-three-input-sources--explained-in-detail)
+4. [Business Logic — How a Line's Status Is Decided](#4-business-logic--how-a-lines-status-is-decided)
+5. [Module-by-Module Reference](#5-module-by-module-reference)
+6. [Database Schema](#6-database-schema)
+7. [Installation Guide](#7-installation-guide)
+8. [Configuration Guide](#8-configuration-guide)
+9. [Running the Application](#9-running-the-application)
+10. [Web Pages — User Guide](#10-web-pages--user-guide)
+11. [API Reference](#11-api-reference)
+12. [Testing Guide](#12-testing-guide)
+13. [Deploying to SQL Server 2014](#13-deploying-to-sql-server-2014)
+14. [Troubleshooting](#14-troubleshooting)
+15. [Project File Structure](#15-project-file-structure)
+16. [Known Limitations / Not Yet Built](#16-known-limitations--not-yet-built)
+
+---
+
+## 1. What This System Does
+
+InLine Pro monitors production assembly lines in a factory. Each line has:
+- **DL (Data Loggers)** — up to 20 per line, arranged as two racks of 10 (Front / Rear)
+- **FT (Function Testers)** — up to 8 per line, arranged as two racks of 4 (Front / Rear)
+
+Every **10 minutes**, the system:
+1. Reads that line's **daily log file** to determine if the line itself is physically running (a board is being scanned) or has gone idle/stale.
+2. If the line is running, reads that line's **Data.ini** configuration file to determine which individual DL/FT units are currently active (`CHECK`) or stopped (`NOT_CHECK`).
+3. Cross-references against the **Excel line master** to know which DL/FT slot numbers actually exist for that line (a line might be physically wired with fewer than the maximum 20 DL / 8 FT units).
+4. Saves a timestamped snapshot of all of this to a database.
+5. Serves the current and historical status through a web dashboard and a JSON API, including shift-wise (A/B/C) CSV/Excel export.
+
+---
+
+## 2. System Architecture
+
+```
+                    ┌─────────────────────────┐
+                    │   Excel Line Master      │   (one row per line:
+                    │   (.xlsx)                │    IP, log path, ini path,
+                    └───────────┬──────────────┘    Total DL, Total FT, Status)
+                                │ read by
+                                ▼
+┌───────────────┐      ┌───────────────────┐      ┌──────────────────┐
+│  Daily Log     │─────▶│                    │◀─────│   Data.ini        │
+│  <line>/       │ read │   STATUS ENGINE    │ read │   (per line)       │
+│  yyyymmdd_     │  by  │  (status_engine.py)│  by  │   RACK1/RACK2      │
+│  New.log       │      │                    │      │   BUILDER/FUNCTION │
+└───────────────┘      └─────────┬──────────┘      └──────────────────┘
+                                  │ every 10 minutes
+                                  ▼
+                        ┌───────────────────┐
+                        │   SCHEDULER         │  (APScheduler,
+                        │  (poller.py)         │   background job)
+                        └─────────┬──────────┘
+                                  │ writes snapshot
+                                  ▼
+                        ┌───────────────────┐
+                        │   DATABASE           │  (SQLAlchemy Core:
+                        │  (line_status table)  │   SQLite dev /
+                        └─────────┬──────────┘   SQL Server 2014 prod)
+                                  │ read by
+                    ┌─────────────┴─────────────┐
+                    ▼                            ▼
+          ┌──────────────────┐        ┌──────────────────────┐
+          │   JSON API          │        │   HTML Web Pages        │
+          │  (api/routes.py)     │        │  (api/html_routes.py,   │
+          │  /api/lines, etc.    │        │   pure HTML/CSS, no JS) │
+          └──────────────────┘        └──────────────────────┘
+```
+
+**Design principle:** every layer only depends on the layer below it, and every module was individually unit-tested against your real uploaded log file and Data.ini sample before being wired together. This means if something looks wrong in the web UI, you can isolate the problem by testing each layer in order: parser → engine → database → API → UI.
+
+
+---
+
+## 3. The Three Input Sources — Explained in Detail
+
+### 3.1 The Daily Log File
+
+**Path pattern:** `<line's log directory>\<yyyymmdd>_New.log`
+Example: `C:\InLine_Pro\logs\LINE01\20260818_New.log`
+
+Each line has **its own log folder** and its own file per day. A new file is created every day; the system reads it every 10 minutes throughout the day.
+
+**Relevant log line format:**
+```
+[ 0:00:25], [Trace Log], [Rear]ScanSendPoint: A6706153AFA59
+[10:38:15], [Trace Log], [Front]ScanSendPoint: A6713079AFYB2
+```
+
+What we extract from each line:
+| Part | Meaning |
+|---|---|
+| `[ 0:00:25]` | Time-of-day (H:MM:SS or HH:MM:SS) — **no date** is present on most lines |
+| `[Rear]` or `[Front]` | Which rack side scanned a board |
+| `ScanSendPoint:` | The literal event marker we look for |
+| `A6706153AFA59` | The scanned board's ID (not used for status, only the fact that a scan happened matters) |
+
+**Why the date isn't in the log line:** the file is date-stamped only in its **filename**. The code (`log_parser.py`) derives the date from the filename (`20260818` → 18-Aug-2026) and combines it with each line's time-of-day to build a full timestamp.
+
+**The 45-minute liveness rule:** the system finds the single most recent `ScanSendPoint` timestamp anywhere in the file (Front or Rear combined — confirmed this is a whole-line check, not separate per side). If "now" is within 45 minutes of that timestamp, the line is **RUNNING**. If more than 45 minutes have passed with no new `ScanSendPoint`, the line is **STALE** (effectively stopped/idle).
+
+### 3.2 The Data.ini File
+
+**Path:** one per line, wherever the Excel line master says (`Config File / Directory` column).
+
+**Relevant structure:**
+```ini
+[RACK1]
+BUILDER1 = CHECK
+BUILDER2 = CHECK
+BUILDER3 = CHECK
+BUILDER4 = NOT_CHECK
+...
+BUILDER10 = CHECK
+FUNCTION1 = CHECK
+FUNCTION2 = CHECK
+FUNCTION3 = CHECK
+FUNCTION4 = CHECK
+
+[RACK2]
+BUILDER1 .. BUILDER10 = CHECK / NOT_CHECK
+FUNCTION1 .. FUNCTION4 = CHECK / NOT_CHECK
+```
+
+`CHECK` means that DL/FT unit is currently **Running**. `NOT_CHECK` means it's currently **Stopped**.
+
+**Mapping to the global DL/FT numbering scheme used throughout the app:**
+
+| Global number | Maps to |
+|---|---|
+| DL 1–10 | RACK1 (Front) BUILDER1–10 |
+| DL 11–20 | RACK2 (Rear) BUILDER1–10 (i.e. DL14 = RACK2 BUILDER4) |
+| FT 1–4 | RACK1 (Front) FUNCTION1–4 |
+| FT 5–8 | RACK2 (Rear) FUNCTION1–4 (i.e. FT6 = RACK2 FUNCTION2) |
+
+This mapping is implemented in `data_ini_parser.py`'s `dl_status()` and `ft_status()` functions.
+
+### 3.3 The Excel Line Master
+
+**One row per line.** Expected columns (header row 1, matched case-insensitively — see `line_master.py` for exact alias list):
+
+| Column | Purpose |
+|---|---|
+| Line No. | Unique line identifier, e.g. `LINE 01` |
+| Line Name | Display name, e.g. `Assembly Line 01` |
+| IP Address | The line's network address (currently informational only) |
+| Data Directory (Path) | Folder containing that line's daily log files |
+| Config File / Directory | Full path to that line's `Data.ini` |
+| DL | **Total DL setup** — how many of the 20 possible DL slots physically exist on this line |
+| FT | **Total FT setup** — how many of the 8 possible FT slots physically exist on this line |
+| Status | `Enabled` / `Disabled` — whether this line should be polled at all |
+
+**Why "Total DL/FT" matters — the slot-trim rule:**
+
+A line doesn't necessarily have all 20 DL units or all 8 FT units installed. The Excel `Total DL` / `Total FT` values tell us how many actually exist — and the missing ones are **always the highest-numbered slots of each rack** (confirmed with the factory team):
+
+```
+Total DL = 18  (missing 2, split evenly = 1 per rack)
+  → DL10 (last slot of RACK1) and DL20 (last slot of RACK2) don't exist
+  → Valid DL slots: 1-9, 11-19
+
+Total DL = 16  (missing 4, split evenly = 2 per rack)
+  → DL9, DL10, DL19, DL20 don't exist
+  → Valid DL slots: 1-8, 11-18
+
+Total FT = 6  (missing 2, split evenly = 1 per rack)
+  → FT4 and FT8 don't exist
+  → Valid FT slots: 1-3, 5-7
+```
+
+This is implemented in `slot_rules.py`. **Important distinction:** a slot excluded by this rule is *not shown at all* (it doesn't exist) — this is different from a slot that exists but is `NOT_CHECK` in Data.ini (which *is* shown, as "Stopped").
+
+If a line's shortfall is odd (can't be split evenly across 2 racks), the code deliberately raises an error rather than guessing — that line would need a real per-slot exclusion list instead of the computed rule, and should be flagged for review rather than silently mis-reported.
+
+---
+
+## 4. Business Logic — How a Line's Status Is Decided
+
+This is the full decision sequence the engine runs for **every line, every 10 minutes** (`status_engine.py` → `compute_line_report()`):
+
+```
+1. Is the line marked "Disabled" in Excel?
+       YES → status = DISABLED. Stop here. (Not polled further.)
+       NO  → continue
+
+2. Look for today's log file: <log_dir>/<yyyymmdd>_New.log
+       File missing or unreadable → status = ERROR (with the reason recorded).
+                                     Stop here.
+       File found → continue
+
+3. Find the most recent ScanSendPoint timestamp in the file.
+       No ScanSendPoint events found at all → status = STALE. Stop here.
+       Gap between "now" and that timestamp > 45 minutes → status = STALE. Stop here.
+       Gap ≤ 45 minutes → status = RUNNING. Continue.
+
+4. (Only reached if RUNNING) Compute valid DL slots and valid FT slots
+   from Excel's Total DL / Total FT (the slot-trim rule, section 3.3).
+
+5. (Only reached if RUNNING) Read the line's Data.ini.
+       File missing or unreadable → keep status = RUNNING, but record the
+                                     error and leave dl_report/ft_report empty.
+       File found → for every valid slot, look up CHECK/NOT_CHECK →
+                     Running/Stopped, and build the DL/FT report.
+```
+
+**Why STALE/ERROR don't compute DL/FT status:** if the line itself isn't running (or we can't even tell), reporting individual DL/FT statuses would be misleading — those numbers are only meaningful while the line is actively producing. The web UI reflects this by showing an empty state for DL/FT when a line isn't RUNNING.
+
+**Shift definitions** (`shifts.py`):
+
+| Shift | Window |
+|---|---|
+| A | 07:00 – 15:00 (same calendar day) |
+| B | 15:00 – 23:00 (same calendar day) |
+| C | 23:00 – 07:00 (**spans into the next calendar day**) |
+
+For Shift C, "date" always refers to the day the shift **starts** — e.g. "Shift C on 2026-08-18" means 23:00 on the 18th through 07:00 on the 19th. This matches how a factory floor conventionally refers to "last night's C shift."
+
+---
+
+## 5. Module-by-Module Reference
+
+### `app/parsers/log_parser.py`
+- `parse_scan_send_points(file_path)` — streams a log file line-by-line (memory-efficient even for large files — doesn't load the whole file into RAM) and returns a list of `ScanEvent(timestamp, side, board_id)` objects.
+- `compute_line_status(events, as_of, threshold_minutes=45)` — applies the 45-minute rule and returns `LineStatusResult(status, last_seen, gap_minutes)`.
+- Handles the log's quirk of only having time-of-day (no date) by deriving the base date from the **filename**, and defensively rolls the date forward if it ever detects time going backwards by more than a minute (in case a log file happens to span midnight).
+
+### `app/parsers/data_ini_parser.py`
+- `parse_data_ini(file_path)` — reads the RACK1/RACK2 sections and returns a `DataIniStatus` object holding `{builder_number: is_running}` and `{function_number: is_running}` dictionaries for each rack.
+- `dl_status(data, dl_num)` / `ft_status(data, ft_num)` — apply the global-number-to-rack mapping (section 3.2) and return `True` (Running) / `False` (Stopped). Raises `KeyError` if that slot isn't present in the file at all (handled gracefully upstream — treated as Stopped).
+
+### `app/engine/slot_rules.py`
+- `valid_dl_slots(total_dl)` / `valid_ft_slots(total_ft)` — implement the slot-trim rule (section 3.3). Pure functions — same input always gives same output, easy to unit test (see `tests/test_engine.py`).
+
+### `app/engine/shifts.py`
+- `shift_window(date, shift)` — returns `(start_datetime, end_datetime)` for a shift, correctly handling Shift C's midnight rollover.
+- `parse_date(date_str)` — parses a `YYYY-MM-DD` string.
+
+### `app/engine/status_engine.py`
+- `compute_line_report(line, as_of=None)` — the orchestrator described in section 4. Returns a `LineStatusReport` dataclass with computed properties like `dl_running_count`, `dl_stopped_count`, and a `.to_dict()` method for JSON/DB serialization.
+- Deliberately **never raises** for expected operational issues (missing files) — it converts them into an `ERROR` status with the reason recorded, so one line's problem never crashes the whole polling cycle.
+
+### `app/config/line_master.py`
+- `load_line_master(xlsx_path)` — reads the Excel workbook via `openpyxl`, matches column headers tolerantly (see `HEADER_ALIASES` — handles minor wording/spacing differences), and returns a list of `LineConfig` objects.
+
+### `app/db/database.py` and `app/db/repository.py`
+- Uses **SQLAlchemy Core** (not raw SQL, not an ORM) so the exact same code works against SQLite (used here for dev/testing) and SQL Server 2014 (production) — only the `DATABASE_URL` environment variable changes.
+- `repository.py` provides: `save_snapshot()`, `latest_snapshot_per_line()`, `latest_snapshot_for_line()`, `history_for_line()`, `history_all_lines()`.
+- DL/FT reports are stored as plain JSON-encoded text (`NVARCHAR`), not a native JSON column type — this is deliberate, because SQL Server 2014 predates native JSON support (added in 2016).
+
+### `app/scheduler/poller.py`
+- `poll_once(xlsx_path, as_of=None)` — loads the Excel line master, computes a report for every line, and saves each as a snapshot. One line failing unexpectedly is logged and skipped — it doesn't stop the rest of the cycle.
+- `start_scheduler(xlsx_path)` — starts an APScheduler `BackgroundScheduler` that calls `poll_once` every 10 minutes, with an immediate first run on startup.
+
+### `app/export.py`
+- `_flatten(snapshots)` — converts nested snapshot rows (one row per line per cycle, with DL/FT as embedded JSON) into a flat table: one row per DL/FT slot per cycle. This is the shape used both for CSV/XLSX downloads and the Historical Data web page.
+- `to_csv_bytes()` / `to_xlsx_bytes()` — generate the actual downloadable file content.
+
+### `app/api/routes.py` (JSON API)
+See section 11 for the full endpoint reference.
+
+### `app/api/html_routes.py` (Web pages)
+See section 10 for the full page reference. Built with **zero JavaScript** per requirement — all filtering, pagination, and downloads work through plain HTML forms/links and full page reloads.
+
+### `app/main.py`
+The FastAPI application entrypoint — mounts static files, includes both routers, and wires up the DB init + scheduler start on application startup.
+
+---
+
+## 6. Database Schema
+
+Single table: `line_status`. One row is written **per line, per poll cycle** (i.e. every 10 minutes, every line gets a new row — this is intentionally a time-series log, not an upsert, so full history is preserved).
+
+| Column | Type | Meaning |
+|---|---|---|
+| id | Integer, PK, autoincrement | (`IDENTITY` on SQL Server) |
+| line_no | String(50) | e.g. `LINE 01` |
+| line_name | String(200) | e.g. `Assembly Line 01` |
+| ip_address | String(50) | |
+| as_of | String(30) | ISO 8601 timestamp of this poll cycle |
+| line_status | String(20) | `RUNNING` \| `STALE` \| `ERROR` \| `DISABLED` |
+| last_seen | String(30) | ISO 8601, last ScanSendPoint timestamp seen |
+| gap_minutes | Float | Minutes between `as_of` and `last_seen` |
+| total_dl / total_ft | Integer | From Excel, at time of this cycle |
+| dl_running / dl_stopped | Integer | Counts, for quick dashboard display |
+| ft_running / ft_stopped | Integer | Counts, for quick dashboard display |
+| dl_report_json / ft_report_json | String(4000) | JSON text, e.g. `{"1": true, "2": false, ...}` — plain text, not a native JSON column (SQL Server 2014 compatibility) |
+| error | String(1000) | Populated only for ERROR status, or partial errors during a RUNNING cycle |
+
+Indexes: `(line_no, as_of)` and `(as_of)` — supports both "give me this line's history" and "give me everyone's status at time X" query patterns efficiently.
+
+---
+
+## 7. Installation Guide
 
 ### Prerequisites
+- Python 3.10+ (tested with 3.12)
+- Access to the factory's `C:\InLine_Pro\logs\...` and Data.ini paths (read access is sufficient)
+- For production: SQL Server 2014 instance + "ODBC Driver 17 for SQL Server" installed on the app server
 
-- Python 3.11+ (`python --version`)
-- Node.js 18+ (`node --version`) — only needed for the React frontend
-- (Optional) `pip install pytest` if you want to run the test suites
+### Steps
 
-### 1. Backend
+```bash
+# 1. Extract the project and enter the folder
+cd inline_pro
 
-```
-cd backend
-pip install -r requirements.txt
-copy .env.example .env
+# 2. Create and activate a virtual environment
+python3 -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
+
+# 3. Install dependencies
+pip install fastapi uvicorn openpyxl apscheduler python-multipart jinja2 sqlalchemy
+
+# (Production only, for SQL Server 2014 — see section 13)
+pip install pyodbc
 ```
 
-Open `.env` and confirm this line is present (it is, by default):
-```
-DATABASE_URL=sqlite:///./dev.db
+No further build step is needed — this is a pure Python application, no compilation, no Node/npm, no JavaScript bundling.
+
+---
+
+## 8. Configuration Guide
+
+### 8.1 Point the app at your real Excel line master
+
+```bash
+# Linux/Mac
+export LINE_MASTER_XLSX_PATH=/path/to/line_master.xlsx
+
+# Windows PowerShell
+$env:LINE_MASTER_XLSX_PATH="C:\InLine_Pro\config\line_master.xlsx"
 ```
 
-Create the schema and start the server:
-```
-python -m alembic upgrade head
+If not set, it defaults to the bundled test fixture (`tests/fixtures/line_master.xlsx`) — fine for trying the app out, **must** be changed before real use.
+
+Your Excel file must have header row 1 with (some tolerance for wording — see `HEADER_ALIASES` in `line_master.py`):
+`Line No.` | `Line Name` | `IP Address` | `Data Directory (Path)` | `Config File / Directory` | `DL` | `FT` | `Status`
+
+### 8.2 Point the app at your real database (production)
+
+See section 13 for the full SQL Server 2014 setup. For local testing, no configuration is needed — SQLite is used automatically, stored at `data/inline_pro.db`.
+
+### 8.3 Verify each line's paths are reachable
+
+Before relying on the dashboard, it's worth manually confirming:
+- `<Data Directory Path>\<today's date>_New.log` exists and is readable for each line
+- `<Config File / Directory>` (the Data.ini path) exists and is readable for each line
+
+If either is wrong, that line will show status `ERROR` on the dashboard with the exact path and reason in the `error` field — check that field first when troubleshooting a line that never shows RUNNING.
+
+---
+
+## 9. Running the Application
+
+### Development / testing
+
+```bash
 uvicorn app.main:app --reload --port 8000
 ```
 
-Check it's alive — open a second terminal:
-```
-curl http://localhost:8000/health
-```
-Expect: `{"status":"ok"}`
+- `--reload` restarts the server automatically when you edit code — useful during development, **remove this flag in production**.
+- Visit `http://localhost:8000/dashboard` in a browser for the web UI.
+- Visit `http://localhost:8000/docs` for interactive, auto-generated API documentation (Swagger UI) — lets you try every JSON endpoint directly from the browser.
 
-### 2. Load some test lines (no Excel needed for this quick test)
+### What happens on startup
+1. `init_db()` runs — creates the `line_status` table if it doesn't already exist (does **not** create the database itself — that must exist beforehand, especially on SQL Server).
+2. The background scheduler starts and immediately runs one poll cycle (so you don't have to wait 10 minutes to see initial data), then repeats every 10 minutes for as long as the process runs.
 
-```
-cd backend
-python scripts/generate_admin_token.py
-```
-Copy the printed token. Then, using any HTTP client (or `curl`):
-```
-curl -X POST http://localhost:8000/api/v1/lines ^
-  -H "Content-Type: application/json" ^
-  -H "Authorization: Bearer PASTE_TOKEN_HERE" ^
-  -d "{\"line_number\":\"LINE01\",\"ip_address\":\"192.168.1.101\",\"total_dl\":19,\"total_ft\":8}"
-```
-(`^` is the line-continuation character in Windows `cmd`; use `\` in PowerShell/bash.)
+### Production (Windows server)
 
-```
-curl http://localhost:8000/api/v1/lines
-```
-You should see `LINE01` in the response.
+Recommended: run behind a process manager so it restarts automatically on crash/reboot. Two common options:
 
-### 3. Frontend (React)
+**Option A — NSSM (Non-Sucking Service Manager)**, wraps the command as a Windows Service:
+```
+nssm install InLineProMonitoring "C:\path\to\venv\Scripts\uvicorn.exe" "app.main:app --host 0.0.0.0 --port 8000"
+```
 
-In a new terminal:
-```
-cd frontend
-npm install
-npm run dev
-```
-Open the printed URL (usually `http://localhost:5173`). The dashboard
-should show `LINE01`. The dev server proxies `/api` and `/ws` to
-`localhost:8000` automatically (see `vite.config.ts`).
+**Option B — Task Scheduler**, run at startup:
+Create a scheduled task that runs `venv\Scripts\uvicorn.exe app.main:app --host 0.0.0.0 --port 8000` at system startup, with "Run whether user is logged on or not."
 
-### 4. Static HTML/CSS mockup (no backend needed at all)
-
-```
-cd frontend-static
-```
-Just double-click `index.html`, or serve the folder with any static file
-server. This is mock data only — useful for design review, not for real
-monitoring.
-
-### 5. Line client agent (simulate one line PC)
-
-```
-cd line-client
-pip install -r requirements.txt
-```
-Create `.env`:
-```
-LINE_NUMBER=LINE01
-SERVER_URL=http://localhost:8000
-CLIENT_SECRET=change-me-client-secret
-BASE_DIR=C:\InLine_Pro
-```
-(`CLIENT_SECRET` must match the backend's `.env` — both default to
-`change-me-client-secret` out of the box, so they already match for this
-local test.)
-
-If you don't have a real `C:\InLine_Pro\Data.ini` / `Log\` folder yet, point
-`BASE_DIR` at the test fixtures instead so you can see it work end-to-end:
-```
-BASE_DIR=line-client\tests\fixtures
-```
-Then run:
-```
-python main.py
-```
-Watch the backend terminal / the dashboard — `LINE01` should flip to
-`ONLINE` within one poll cycle (60 seconds by default;
-`POLL_INTERVAL_SECONDS` in `.env` to change it).
-
-### 6. Run the automated tests
-
-```
-cd backend
-python -m pytest tests/ -v
-```
-```
-cd line-client
-python -m pytest tests/ -v
-```
-Both should report all tests passing before you move to Part B.
+`--host 0.0.0.0` (instead of the default `127.0.0.1`) is needed if other machines on the factory network need to view the dashboard, not just the server itself.
 
 ---
 
-## Part B — Full Production Rollout
+## 10. Web Pages — User Guide
 
-Once Part A works on your own machine, repeat the real version across the
-factory network.
+All pages are pure HTML/CSS — no JavaScript anywhere. Filtering and pagination work through standard links and form submissions (full page reload each time).
 
-### Step 1 — Server PC: Database
+| Page | URL | What it shows |
+|---|---|---|
+| Dashboard | `/dashboard` (also `/`) | Latest status of every line: summary counts (Running/Stale/Error/Disabled) plus a card per line with DL/FT running counts. Click any line card to see its detail. |
+| Lines list | `/lines` | Same data as the dashboard, in a flat table — useful for scanning many lines at once. |
+| Line Detail | `/lines/{line_no}` | Full detail for one line: status, last-seen time, gap in minutes, and a color-coded grid of every valid DL and FT slot (green = Running, red = Stopped). If the line isn't currently RUNNING, the DL/FT grids show an empty-state message instead (matches the business rule in section 4). |
+| Configuration | `/configuration` | Read-only view of the Excel line master — every line's IP, log path, ini path, DL/FT totals, and enabled/disabled status. To change configuration, edit the Excel file directly; changes take effect on the next poll cycle (no restart needed). |
+| Historical Data | `/historical?date=YYYY-MM-DD&shift=A\|B\|C&line_no=...` | Pick a date and shift (and optionally one line) via the filter form, then view a flattened table of every DL/FT status recorded during that shift window, with pagination (50 rows/page) and **Download CSV** / **Download Excel** buttons. |
 
-1. Install SQL Server 2014 and SQL Server Management Studio (SSMS), or
-   confirm they're already installed.
-2. Open `backend/schema.sql` in SSMS and run it (F5). This creates the
-   `LineMonitoring` database and all four tables.
-3. In SSMS's Object Explorer, confirm `lines`, `line_units`,
-   `unit_current_state`, and `monitoring_events` all exist under
-   `LineMonitoring > Tables`.
-
-### Step 2 — Server PC: Backend
-
-1. Install Python 3.11+ and the **ODBC Driver 17 for SQL Server**
-   (download from Microsoft if not already present).
-2. Copy the `backend/` folder onto the Server PC.
-3. `cd backend && pip install -r requirements.txt`
-4. `copy .env.example .env`, then edit `.env`:
-   ```
-   DATABASE_URL=mssql+pyodbc://USER:PASSWORD@localhost:1433/LineMonitoring?driver=ODBC+Driver+17+for+SQL+Server
-   CLIENT_SECRET=<pick a real secret — every line PC will need this exact value>
-   JWT_SECRET=<pick a different secret>
-   ```
-5. **Import your Excel file now** (Step 3 below) so the dashboard has data
-   the first time it loads.
-6. Start the backend so it's reachable from other PCs on the LAN:
-   ```
-   uvicorn app.main:app --host 0.0.0.0 --port 8000
-   ```
-7. From a *different* PC on the LAN:
-   ```
-   curl http://<server-ip>:8000/health
-   ```
-   should return `{"status":"ok"}`.
-8. In Windows Firewall on the Server PC, add an inbound rule allowing TCP
-   port 8000 (and whatever port you serve the website on) from the line-PC
-   subnet.
-
-### Step 3 — Server PC: Import Your Excel File
-
-```
-cd excel-import-tool
-pip install -r requirements.txt
-copy .env.example .env
-```
-Edit `.env` — same `DATABASE_URL` as the backend's.
-
-```
-python import_lines_from_excel.py path\to\your\lines.xlsx --dry-run
-python import_lines_from_excel.py path\to\your\lines.xlsx
-```
-Accepted column headers (case-insensitive): `Line No`/`Line Number`,
-`IP Address`/`IP`, `Total DL`/`DL`, `Total FT`/`FT`. Re-run any time your
-line list changes — it updates existing lines and adds new ones, never
-deletes.
-
-### Step 4 — Server PC: Website
-
-**React app (recommended — actually connects to live data):**
-```
-cd frontend
-npm install
-npm run build
-```
-Serve the resulting `dist/` folder with IIS, nginx, or any static file
-server, configured to proxy `/api` and `/ws` requests through to
-`http://localhost:8000`.
-
-**Or the static HTML/CSS mockup** (`frontend-static/`) — just for visual
-review; it has no live data.
-
-### Step 5 — Each Line PC: Client Agent
-
-Repeat for all ~60 machines. The code is identical everywhere — only two
-`.env` values change per PC.
-
-1. Install Python 3.11+.
-2. Copy the `line-client/` folder onto the line PC.
-3. `cd line-client && pip install -r requirements.txt`
-4. Create `.env`:
-   ```
-   LINE_NUMBER=LINE01
-   SERVER_URL=http://192.168.1.10:8000
-   CLIENT_SECRET=<same value as the backend's CLIENT_SECRET>
-   ```
-   `LINE_NUMBER` must exactly match what you imported from Excel for this
-   PC. `BASE_DIR` defaults to `C:\InLine_Pro`, which should already exist
-   from the line's existing monitoring software — no need to set it unless
-   your paths differ.
-5. Test it manually first: `python main.py`, confirm no errors, then
-   `Ctrl+C` to stop.
-6. Set it to run automatically:
-   - **Simple:** Task Scheduler → New Task → Trigger: "At startup" →
-     Action: run `python.exe` with argument `main.py`, "Start in" set to
-     the `line-client` folder → check "Run whether user is logged on or
-     not".
-   - **More robust:** package as a single `.exe` with PyInstaller and point
-     Task Scheduler at that instead of raw Python (this is the intended
-     Phase 9 packaging step — not yet built).
-
-### Step 6 — Verify
-
-1. Open the dashboard on the Server PC (or any PC on the LAN).
-2. Within one poll interval, each connected line should show as `ONLINE`
-   with DL/FT counts matching `Data.ini`.
-3. Stop one line PC's agent and confirm its card goes `STALE` then
-   `OFFLINE` after the configured timeouts.
-4. Change a line's IP/DL/FT count in your Excel file, re-run the import
-   tool, and confirm the change shows up (update, not a duplicate).
+**Downloading shift data:** on the Historical Data page, after selecting a date/shift (and optional line), two buttons appear. These are plain links straight to the export API (`/api/reports/shift-download`) — clicking them downloads the file directly, no page navigation needed.
 
 ---
 
-## Day-to-Day Operations
+## 11. API Reference
 
-**Restart the backend** (after a config change):
+Base URL: `http://<server>:8000`
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/health` | Health check — returns `{"status": "ok"}` |
+| GET | `/api/lines` | Dashboard data: summary counts + latest snapshot for every line |
+| GET | `/api/lines/{line_no}` | Latest snapshot for one line. `404` if that line has no data yet. |
+| GET | `/api/lines/{line_no}/history?start=ISO&end=ISO` | All snapshots for one line within a datetime range |
+| GET | `/api/history?start=ISO&end=ISO` | All snapshots for all lines within a datetime range |
+| GET | `/api/reports/shift-download?date=YYYY-MM-DD&shift=A\|B\|C&fmt=csv\|xlsx[&line_no=...]` | Shift-wise export. Returns the file directly (`Content-Disposition: attachment`). `404` if no data found for that window; `400` if `shift` isn't A/B/C. |
+| POST | `/api/poll-now` | Triggers an on-demand poll cycle across all lines immediately (outside the normal 10-minute schedule) |
+
+**Example — fetch dashboard data:**
+```bash
+curl http://localhost:8000/api/lines
 ```
-cd backend
-# stop the running uvicorn process (Ctrl+C), then:
+
+**Example — download Shift C for a specific date and line, as Excel:**
+```bash
+curl -o shift_data.xlsx "http://localhost:8000/api/reports/shift-download?date=2026-08-18&shift=C&line_no=LINE%2001&fmt=xlsx"
+```
+
+Full interactive documentation (try-it-yourself, generated automatically from the code): `http://localhost:8000/docs`
+
+---
+
+## 12. Testing Guide
+
+Every module has a corresponding test file in `tests/`, and they were all run against your **real uploaded log file and Data.ini sample** — not synthetic data — before being trusted.
+
+```bash
+cd inline_pro
+venv/bin/python tests/test_log_parser.py       # log parsing + 45-min rule
+venv/bin/python tests/test_engine.py           # slot-trim rule + Data.ini mapping
+venv/bin/python tests/test_status_engine.py    # full per-line status computation
+venv/bin/python tests/test_shifts.py           # shift window math (incl. Shift C midnight rollover)
+venv/bin/python tests/test_full_pipeline.py    # DB + multi-cycle history + export
+venv/bin/python tests/test_api.py              # every JSON API endpoint
+venv/bin/python tests/test_html_pages.py       # every HTML page renders correctly
+```
+
+Each script prints its results and asserts expected values — a clean run with no `AssertionError` and ending in an "ALL ... PASSED" message means that layer is working correctly. If you change any business rule (e.g., the 45-minute threshold, or the slot-trim logic), re-run these before deploying — they'll catch a regression immediately.
+
+**Test fixtures used** (`tests/fixtures/`):
+- `20260818_New.log` — your real uploaded log file
+- `Data.ini` — reconstructed from your real pasted sample
+- `line_master.xlsx` — a small synthetic Excel file (4 lines, covering RUNNING, ERROR, and DISABLED cases) since a real Excel file hasn't been provided yet
+
+**Before going live**, replace `line_master.xlsx` testing with your actual Excel file and re-run `test_status_engine.py`-style checks against it to confirm every line's paths resolve correctly.
+
+---
+
+## 13. Deploying to SQL Server 2014
+
+The application defaults to SQLite (zero-config, good for testing). For production against your company's SQL Server 2014:
+
+### Step 1 — Create the database (once, in SQL Server Management Studio)
+```sql
+CREATE DATABASE InLineProDB;
+```
+(The application creates the `line_status` **table** automatically on startup — it does not create the database itself.)
+
+### Step 2 — Install the ODBC driver on the app server
+Download and install "**ODBC Driver 17 for SQL Server**" from Microsoft (compatible with SQL Server 2014).
+
+### Step 3 — Install the Python driver
+```bash
+pip install pyodbc
+```
+
+### Step 4 — Set the connection string
+
+```powershell
+# SQL Server authentication
+$env:DATABASE_URL="mssql+pyodbc://sql_user:sql_password@YOUR_SQL_SERVER/InLineProDB?driver=ODBC+Driver+17+for+SQL+Server"
+
+# OR Windows integrated authentication
+$env:DATABASE_URL="mssql+pyodbc://YOUR_SQL_SERVER/InLineProDB?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
+```
+
+### Step 5 — Run the app as normal
+```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+No code changes are required — the same `database.py`/`repository.py` code runs against either database via SQLAlchemy Core.
 
-**Add/update lines** whenever your Excel sheet changes:
-```
-cd excel-import-tool
-python import_lines_from_excel.py path\to\lines.xlsx
-```
+### Why SQL Server 2014 specifically needed care
+- **No native JSON type or JSON functions** (`OPENJSON`, `JSON_VALUE`) — those were added in SQL Server 2016. The DL/FT per-slot reports are stored as plain `NVARCHAR(4000)` text, JSON-encoded/decoded in Python — this works identically on 2014, 2016+, and SQLite.
+- **IDENTITY vs AUTOINCREMENT** — handled transparently by SQLAlchemy based on which database dialect it's talking to; no manual SQL needed.
 
-**Check a line PC's agent is running:** look for the `python main.py`
-process, or check Task Scheduler's task history. Logs print to the console
-(or redirect to a file: `python main.py >> agent.log 2>&1`).
+### If `pyodbc` can't be installed
+Some corporate environments restrict compiled C extensions. `pymssql` is an alternative pure-Python-friendlier driver — if `pyodbc` is blocked, let the development team know and the connection layer can be adjusted to support a `mssql+pymssql://...` URL instead (same SQLAlchemy Core code, different driver).
 
-**Run the tests after making any code change:**
-```
-cd backend && python -m pytest tests/ -v
-cd line-client && python -m pytest tests/ -v
-```
+**Important — this configuration is untested against a live SQL Server instance.** It was verified as *correct by construction* (valid SQLAlchemy dialect, IDENTITY-compatible schema, no JSON-type dependency), but no SQL Server 2014 instance was available during development. **The first deployment should include a smoke test**: run `tests/test_full_pipeline.py` (with `DATABASE_URL` pointed at the real SQL Server instance) as an early sanity check before relying on it in production.
 
 ---
 
-## Troubleshooting
+## 14. Troubleshooting
 
-| Symptom | Likely cause | Fix |
+| Symptom | Likely cause | Where to check |
 |---|---|---|
-| `curl http://localhost:8000/health` fails | Backend not running, or wrong port | Check the `uvicorn` terminal for errors; confirm the port matches |
-| Line PC's dashboard card never goes `ONLINE` | Wrong `CLIENT_SECRET`, or `LINE_NUMBER` doesn't match a line already in the database | Check `line-client`'s console output for a `401` or `404`; confirm the line was imported via Excel first |
-| `401 Unauthorized` on `/api/v1/line/status` | `CLIENT_SECRET` mismatch between backend `.env` and line-client `.env` | Make them identical, restart both |
-| `404 Not Found` (`LINE_NOT_FOUND`) on ingestion | The line PC's `LINE_NUMBER` isn't in the `lines` table yet | Import it via `excel-import-tool` first |
-| Excel import script errors on column names | Header text doesn't match any accepted alias | Rename the column, or add the exact header text you're using to `COLUMN_ALIASES` in `import_lines_from_excel.py` |
-| `pyodbc` install fails | ODBC Driver 17 for SQL Server not installed on that machine | Install it from Microsoft's site, then retry `pip install` |
-| Dashboard shows a line as `STALE`/`OFFLINE` even though it's running | `ScanSendPoint` hasn't appeared in the log within the 45-minute window, or the log file/date doesn't match `find_todays_log`'s expected filename pattern | Confirm `C:\InLine_Pro\Log\{YYYYMMDD}_New.Log` exists for today's date and contains recent `[Front]`/`[Rear]ScanSendPoint` lines |
-| Two browsers show different data | One is pointed at the static mockup (`frontend-static/`), the other at the real React app | Use the React app (`frontend/`) for anything that needs live data |
+| A line always shows `ERROR` | Log directory path or Data.ini path wrong/unreachable | The `error` field on that line's detail page or API response gives the exact path and OS error |
+| A line shows `STALE` even though it's running | The log file's `ScanSendPoint` events have stopped appearing, or the log file naming doesn't match `yyyymmdd_New.log` | Manually check the log file's most recent `ScanSendPoint` timestamp; confirm filename matches today's date |
+| Dashboard is empty / no lines shown | No poll cycle has run yet, or Excel line master path is misconfigured | Check server startup logs for the immediate first poll; verify `LINE_MASTER_XLSX_PATH` is set correctly |
+| A line's DL/FT counts look wrong (too many/few slots) | Total DL/Total FT in Excel doesn't match what's actually wired for that line, or the shortfall is unevenly split across racks | Check that line's `Total DL`/`Total FT` in Excel; the slot-trim rule assumes an even split — an odd shortfall raises an error rather than guessing |
+| Shift-wise download returns "No data found" (404) | No poll cycles fell within that shift's time window for that date | Confirm the scheduler was actually running during that time window; check `/api/history` for that date range directly |
+| Server won't start: `ModuleNotFoundError` | A dependency isn't installed in the active virtual environment | Re-run the `pip install` commands from section 7 inside the activated venv |
+| SQL Server connection fails | ODBC driver not installed, wrong server name, or firewall blocking the connection | Test the raw ODBC connection independently (e.g. via `sqlcmd` or SSMS) before troubleshooting the Python side |
 
 ---
 
-## Open Items Before Full Rollout
+## 15. Project File Structure
 
-These are tracked in `MEMORY.md` and worth resolving before Phase 9:
+```
+inline_pro/
+├── app/
+│   ├── parsers/
+│   │   ├── log_parser.py         # ScanSendPoint extraction + 45-min liveness rule
+│   │   └── data_ini_parser.py    # RACK1/RACK2 CHECK/NOT_CHECK -> DL/FT status
+│   ├── engine/
+│   │   ├── slot_rules.py         # Total DL/FT -> valid slot numbers (trim rule)
+│   │   ├── shifts.py             # Shift A/B/C window calculation
+│   │   └── status_engine.py      # Combines all of the above into one report per line
+│   ├── config/
+│   │   └── line_master.py        # Excel line-master reader
+│   ├── db/
+│   │   ├── database.py           # SQLAlchemy engine/schema (SQLite or SQL Server)
+│   │   └── repository.py         # save/query snapshots
+│   ├── scheduler/
+│   │   └── poller.py             # 10-minute polling job (APScheduler)
+│   ├── api/
+│   │   ├── routes.py             # JSON API endpoints
+│   │   └── html_routes.py        # HTML page routes (pure HTML/CSS, no JS)
+│   ├── templates/                # Jinja2 HTML templates
+│   │   ├── base.html
+│   │   ├── dashboard.html
+│   │   ├── lines.html
+│   │   ├── line_detail.html
+│   │   ├── configuration.html
+│   │   └── historical.html
+│   ├── static/
+│   │   └── style.css             # All styling — zero JavaScript in the project
+│   ├── export.py                 # CSV/XLSX generation for shift downloads
+│   ├── main.py                   # FastAPI app entrypoint
+│   └── settings.py                # Config (Excel path from env var)
+├── tests/                          # One test file per module, run with venv/bin/python
+│   └── fixtures/                    # Real log/Data.ini samples + synthetic Excel file
+├── docs/
+│   └── MANUAL.md                     # This document
+├── data/
+│   └── inline_pro.db                  # SQLite DB (dev only; not used when DATABASE_URL points to SQL Server)
+└── README.md                            # Quick-start summary
 
-- No login screen yet — `backend/scripts/generate_admin_token.py` is a
-  stopgap for getting a token to use Configuration's protected endpoints.
-- Line client isn't yet packaged as a `.exe` — currently run via
-  `python main.py` plus Task Scheduler.
-- Front↔RACK1 / Rear↔RACK2 mapping and the "either side active = ONLINE"
-  rule are inferred assumptions, not confirmed against the real site.
+```
+
+---
+
+## 16. Known Limitations / Not Yet Built
+
+- **Pass Count / Fail Count per DL/FT** (shown in early UI mockups) is not implemented — it requires parsing PASS/FAIL result lines from the log file, and a sample of that log format hasn't been provided yet. Everything else (line status, DL/FT running/stopped, shift-wise export) is fully working.
+- **Pass vs Fail trend charts** were explicitly descoped by request (no JavaScript charting library used).
+- **Authentication/Login, Users, and Alerts pages** are not yet built (planned as Phase 5).
+- **Editing configuration through the web UI** is not implemented — the Configuration page is currently read-only; changes must be made directly in the Excel file (picked up automatically on the next poll cycle, no restart needed).
+- The SQL Server 2014 connection path is implemented and structurally verified, but has not been tested against a live SQL Server instance (see section 13's note).
+
+---
+
+*End of document.*
