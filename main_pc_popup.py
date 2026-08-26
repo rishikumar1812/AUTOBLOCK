@@ -38,6 +38,8 @@ def _listen_port()    -> int: return int(get_config()["listener"]["port"])
 def _ft_listen_port() -> int: return int(get_config().get("ft_listener", {}).get("port", 8998))
 def _log_dir()        -> str: return get_config()["paths"]["log_dir"]
 def _exe_name()       -> str: return get_config()["app"]["exe_name"]
+def _hello_timeout_minutes() -> int:
+    return int(get_config()["dashboard"].get("hello_timeout_minutes", 16))
 
 
 # =========================================================
@@ -76,6 +78,72 @@ except Exception as _log_err:
         sh.setFormatter(logging.Formatter("%(asctime)s[%(levelname)s] %(message)s"))
         logger.addHandler(sh)
     logger.warning(f"[main] Log file setup failed: {_log_err} - using console only")
+
+
+# =========================================================
+# Connection-status logger — HELLO / connect / disconnect events
+# only. Kept separate from the general main_pc_popup log so an
+# operator can see connectivity history at a glance.
+# File: connection_status_YYYY-MM-DD.log
+# =========================================================
+def _setup_connection_logger() -> logging.Logger:
+    log_dir = _log_dir()
+    os.makedirs(log_dir, exist_ok=True)
+
+    lg = logging.getLogger("connection_status")
+    if not lg.handlers:
+        lg.setLevel(logging.INFO)
+        fh = DailyFileHandler("connection_status", log_dir, retention_days=cleanup_days())
+        lg.addHandler(fh)
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        lg.addHandler(sh)
+    return lg
+
+
+try:
+    conn_logger = _setup_connection_logger()
+except Exception as _log_err:
+    conn_logger = logging.getLogger("connection_status")
+    if not conn_logger.handlers:
+        conn_logger.setLevel(logging.INFO)
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter("%(asctime)s[%(levelname)s] %(message)s"))
+        conn_logger.addHandler(sh)
+    logger.warning(f"[main] connection_status log setup failed: {_log_err} - using console only")
+
+
+# =========================================================
+# Process logger — automation steps only (STOP received, queued,
+# processing, stopped OK, failed / manual intervention needed).
+# Kept separate from the general main_pc_popup log.
+# File: Process_YYYY-MM-DD.log
+# =========================================================
+def _setup_process_logger() -> logging.Logger:
+    log_dir = _log_dir()
+    os.makedirs(log_dir, exist_ok=True)
+
+    lg = logging.getLogger("Process")
+    if not lg.handlers:
+        lg.setLevel(logging.INFO)
+        fh = DailyFileHandler("Process", log_dir, retention_days=cleanup_days())
+        lg.addHandler(fh)
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        lg.addHandler(sh)
+    return lg
+
+
+try:
+    process_logger = _setup_process_logger()
+except Exception as _log_err:
+    process_logger = logging.getLogger("Process")
+    if not process_logger.handlers:
+        process_logger.setLevel(logging.INFO)
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter("%(asctime)s[%(levelname)s] %(message)s"))
+        process_logger.addHandler(sh)
+    logger.warning(f"[main] Process log setup failed: {_log_err} - using console only")
 
 # =========================================================
 # Shared state
@@ -139,14 +207,14 @@ def _task_display_name(task_key:str)->str:
 # Sequential task queue worker
 # =========================================================
 def _queue_worker() -> None:
-    logger.info("[queue] Worker started")
+    process_logger.info("[queue] Worker started")
     while True:
         dl_name = _task_queue.get()
         if dl_name is None:
             break
         display=_task_display_name(dl_name)
         try:
-            logger.info(f"[queue] Processing stop for {dl_name}")
+            process_logger.info(f"[queue] Processing stop for {dl_name}")
             success = run_stop_sequence(dl_name)
 
             now = datetime.now()
@@ -166,7 +234,7 @@ def _queue_worker() -> None:
                         "ts_dt":   now,
                     })
 
-                logger.info(f"[queue] {display} — stopped OK at {ts}")
+                process_logger.info(f"[queue] {display} — stopped OK at {ts}")
             else:
                 # Automation failed — mark as error, operator must act
                 with _state_lock:
@@ -182,12 +250,12 @@ def _queue_worker() -> None:
                         "ts_dt":   now,
                     })
 
-                logger.error(
+                process_logger.error(
                     f"[queue] {display} — automation FAILED at {ts}. "
                     f"Manual intervention required."
                 )
         except Exception as e:
-            logger.error(f"[queue] {display} — unexpected error: {e}")
+            process_logger.error(f"[queue] {display} — unexpected error: {e}")
             now = datetime.now()
             ts = now.strftime("%d-%m-%Y %H:%M:%S")
             with _state_lock:
@@ -249,7 +317,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
                         "ts":   datetime.now().strftime("%H:%M:%S"),
                     })
 
-            logger.info(f"[listener] HELLO from {addr[0]} — ACK sent, Connected")
+            conn_logger.info(f"[listener] HELLO from {addr[0]} — ACK sent, Connected")
 
         # ── STOP command ──────────────────────────────────
         elif command == "STOP":
@@ -263,7 +331,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
             with _state_lock:
                 existing = _dl_states.get(dl_name, {}).get("state")
             if existing == "processing":
-                logger.info(
+                process_logger.info(
                     f"[listener] {dl_name} already processing — "
                     f"duplicate signal ignored"
                 )
@@ -282,7 +350,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
 
             # Queue automation task
             _task_queue.put(dl_name)
-            logger.info(f"[listener] {dl_name} queued for automation")
+            process_logger.info(f"[listener] {dl_name} queued for automation")
 
         else:
             _send_response(conn, "ERROR", f"Unknown command: {command}")
@@ -357,9 +425,9 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
                         "addr":       addr[0],
                         "ft_side":    rack,
                     }
-                logger.info(f"[ft_listener] HELLO from FT{ft_id} at {addr[0]} — ACK sent")
+                conn_logger.info(f"[ft_listener] HELLO from FT{ft_id} at {addr[0]} — ACK sent")
             else:
-                logger.warning(f"[ft_listener] HELLO with unknown ft_id={ft_id!r} from {addr[0]}")
+                conn_logger.warning(f"[ft_listener] HELLO with unknown ft_id={ft_id!r} from {addr[0]}")
 
         elif command == "STOP":
             if not ft_id or ft_id not in _FT_ID_MAP:
@@ -374,7 +442,7 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
             with _state_lock:
                 existing = _dl_states.get(task_key, {}).get("state")
             if existing in ("processing",):
-                logger.info(
+                process_logger.info(
                     f"[ft_listener] {task_key} already processing — "
                     f"duplicate signal ignored")
                 _send_response(conn, "OK",
@@ -389,7 +457,7 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
                 _dl_states[task_key] = {"state": "processing", "ts": ts, "ts_dt": now}
 
             _task_queue.put(task_key)
-            logger.info(f"[ft_listener] {task_key} queued for automation")
+            process_logger.info(f"[ft_listener] {task_key} queued for automation")
 
         else:
             _send_response(conn, "ERROR", f"Unknown command: {command}")
@@ -546,13 +614,18 @@ class TrayWindow:
 
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
-        # Fixed static size — cannot be resized
-        W, H = 320, 500
+        # Fixed static size — cannot be resized.
+        # CONTENT_W is the original inner layout width (unchanged —
+        # every existing .place(x=...) coordinate still lines up).
+        # WINDOW_W adds room for the new outer scrollbar so it doesn't
+        # clip any existing content.
+        self.CONTENT_W = 320
+        WINDOW_W, H = 320 + 16, 500
         x = 8
         y = max(0, sh - H - 48)
-        self.root.geometry(f"{W}x{H}+{x}+{y}")
-        self.root.maxsize(W, H)
-        self.root.minsize(W, H)
+        self.root.geometry(f"{WINDOW_W}x{H}+{x}+{y}")
+        self.root.maxsize(WINDOW_W, H)
+        self.root.minsize(WINDOW_W, H)
 
         self.f_title = tkfont.Font(family="Consolas", size=10, weight="bold")
         self.f_conn  = tkfont.Font(family="Consolas", size=9,  weight="bold")
@@ -568,10 +641,49 @@ class TrayWindow:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build(self) -> None:
-        W = 320  # must match geometry W
+        W = self.CONTENT_W  # must match original inner layout width
+
+        # ── Outer scrollable wrapper ───────────────────────
+        # Whole-window scrollbar: everything below is placed onto
+        # self.content (same x/y coordinates as before) instead of
+        # self.root directly, so all existing .place() calls keep
+        # working unchanged while the whole popup becomes scrollable.
+        outer_canvas = tk.Canvas(self.root, bg=BG_MAIN, highlightthickness=0)
+        outer_scrollbar = tk.Scrollbar(self.root, orient="vertical",
+                                       command=outer_canvas.yview, width=10)
+
+        def _update_outer_scrollbar(*args):
+            lo, hi = map(float, args)
+            if lo <= 0.0 and hi >= 1.0:
+                outer_scrollbar.pack_forget()
+            else:
+                outer_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        outer_canvas.configure(yscrollcommand=_update_outer_scrollbar)
+        outer_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.content = tk.Frame(outer_canvas, bg=BG_MAIN, width=W, height=500)
+        self._content_window_id = outer_canvas.create_window(
+            (0, 0), window=self.content, anchor="nw")
+
+        def _on_content_resize(e):
+            outer_canvas.configure(scrollregion=outer_canvas.bbox("all"))
+        self.content.bind("<Configure>", _on_content_resize)
+
+        def _on_outer_canvas_resize(e):
+            # Keep content pinned to the canvas's own width, not the
+            # window's — avoids the content stretching under the
+            # scrollbar column.
+            pass
+        outer_canvas.bind("<Configure>", _on_outer_canvas_resize)
+
+        def _on_root_mousewheel(e):
+            outer_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        outer_canvas.bind_all("<MouseWheel>", _on_root_mousewheel)
+        self._outer_canvas = outer_canvas
 
         # ── Header y=0 h=34 ───────────────────────────────
-        hdr = tk.Frame(self.root, bg=BG_HEADER, width=W, height=34)
+        hdr = tk.Frame(self.content, bg=BG_HEADER, width=W, height=34)
         hdr.place(x=0, y=0)
         hdr.pack_propagate(False)
         tk.Label(hdr, text="DL & FT Monitor  *  Main PC",
@@ -579,7 +691,7 @@ class TrayWindow:
                  fg=COL_WHITE).pack(expand=True)
 
         # ── Connection y=34 h=42 ──────────────────────────
-        conn = tk.Frame(self.root, bg=BG_CARD, width=W, height=42)
+        conn = tk.Frame(self.content, bg=BG_CARD, width=W, height=42)
         conn.place(x=0, y=34)
         conn.pack_propagate(False)
         self.lbl_conn_dot = tk.Label(conn, text="*",
@@ -597,10 +709,10 @@ class TrayWindow:
         self._start_dot_animation()
 
         # ── Separator y=76 ────────────────────────────────
-        tk.Frame(self.root, bg=COL_BORDER, width=W, height=1).place(x=0, y=76)
+        tk.Frame(self.content, bg=COL_BORDER, width=W, height=1).place(x=0, y=76)
 
         # ── Status rows y=77 h=66 ─────────────────────────
-        status = tk.Frame(self.root, bg=BG_CARD, width=W, height=66)
+        status = tk.Frame(self.content, bg=BG_CARD, width=W, height=66)
         status.place(x=0, y=77)
         status.pack_propagate(False)
 
@@ -621,10 +733,10 @@ class TrayWindow:
         _srow("InLine_Pro", "lbl_app",   "checking...", COL_MUTED, 48)
 
         # ── Separator y=143 ───────────────────────────────
-        tk.Frame(self.root, bg=COL_BORDER, width=W, height=1).place(x=0, y=143)
+        tk.Frame(self.content, bg=COL_BORDER, width=W, height=1).place(x=0, y=143)
 
         # ── FT dots y=144 h=50 ────────────────────────────
-        ft_frame = tk.Frame(self.root, bg=BG_CARD, width=W, height=50)
+        ft_frame = tk.Frame(self.content, bg=BG_CARD, width=W, height=50)
         ft_frame.place(x=0, y=144)
         ft_frame.pack_propagate(False)
         self.ft_dots = {}
@@ -647,15 +759,15 @@ class TrayWindow:
             self.ft_dots[key] = dot
 
         # ── Separator y=194 ───────────────────────────────
-        tk.Frame(self.root, bg=COL_BORDER, width=W, height=1).place(x=0, y=194)
+        tk.Frame(self.content, bg=COL_BORDER, width=W, height=1).place(x=0, y=194)
 
         # ── Activity label y=196 ──────────────────────────
-        tk.Label(self.root, text="Activity today  (DL + FT)",
+        tk.Label(self.content, text="Activity today  (DL + FT)",
                  font=self.f_small, bg=BG_MAIN,
                  fg=COL_MUTED).place(x=10, y=198)
 
         # ── Scrollable list y=216 h=200 ───────────────────
-        list_outer = tk.Frame(self.root, bg=BG_MAIN,
+        list_outer = tk.Frame(self.content, bg=BG_MAIN,
                               width=W-12, height=200)
         list_outer.place(x=6, y=216)
         list_outer.pack_propagate(False)
@@ -690,20 +802,26 @@ class TrayWindow:
                         self._list_canvas_id, width=e.width))
 
         def _on_mousewheel(e):
+            # Local bind (not bind_all) so this only fires while the
+            # mouse is actually over the activity list, and returns
+            # "break" so the event doesn't also reach the outer
+            # window-level scrollbar's bind_all handler above
+            # (avoids double-scrolling both lists at once).
             canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            return "break"
+        canvas.bind("<MouseWheel>", _on_mousewheel)
         self._list_canvas = canvas
 
         # ── Separator y=420 ───────────────────────────────
-        tk.Frame(self.root, bg=COL_BORDER, width=W, height=1).place(x=0, y=420)
+        tk.Frame(self.content, bg=COL_BORDER, width=W, height=1).place(x=0, y=420)
 
         # ── Footer y=421 — always at fixed position ────────
-        self.lbl_time = tk.Label(self.root, text="",
+        self.lbl_time = tk.Label(self.content, text="",
                                   font=self.f_small,
                                   bg=BG_MAIN, fg=COL_MUTED)
         self.lbl_time.place(x=0, y=428, width=W, anchor="nw")
 
-        self.btn_clear = tk.Button(self.root,
+        self.btn_clear = tk.Button(self.content,
                                     text="Clear blocked",
                                     command=self._clear_blocked,
                                     bg=BG_HEADER, fg=COL_MUTED,
@@ -752,7 +870,25 @@ class TrayWindow:
             last_hello = _conn_state["last_hello"]
             dl_addr    = _conn_state["dl_pc_addr"]
 
+        # A HELLO must be seen at least once every hello_timeout_minutes
+        # (default 16) or DL PC is treated as disconnected — previously
+        # "connected" was set True on the first HELLO and never re-checked,
+        # so the tray kept showing "Connected" forever even after DL PC
+        # actually went offline.
+        stale = False
         if connected and last_hello:
+            age_min = (datetime.now() - last_hello).total_seconds() / 60
+            if age_min > _hello_timeout_minutes():
+                stale = True
+                with _conn_lock:
+                    _conn_state["connected"] = False
+                conn_logger.warning(
+                    f"[conn] DL PC HELLO stale — no HELLO for "
+                    f"{age_min:.1f}min (limit {_hello_timeout_minutes()}min) "
+                    f"→ Disconnected"
+                )
+
+        if connected and last_hello and not stale:
             self._stop_dot_animation()
             self.lbl_conn_dot.config(fg=COL_OK)
             self.lbl_conn_status.config(
@@ -763,8 +899,21 @@ class TrayWindow:
                 text=f"since {last_hello.strftime('%H:%M:%S')}",
                 fg=COL_MUTED,
             )
+        elif last_hello:
+            # Was connected before, HELLO went stale — show Disconnected
+            # (red), not the "waiting for first HELLO" animation.
+            self._stop_dot_animation()
+            self.lbl_conn_dot.config(fg=COL_DISC)
+            self.lbl_conn_status.config(
+                text=f"Disconnected  •  {dl_addr}",
+                fg=COL_DISC,
+            )
+            self.lbl_conn_since.config(
+                text=f"last seen {last_hello.strftime('%H:%M:%S')}",
+                fg=COL_MUTED,
+            )
         else:
-            # Still waiting for first HELLO
+            # Never connected yet
             self.lbl_conn_dot.config(fg=COL_CHECK)
             self.lbl_conn_since.config(text="", fg=COL_MUTED)
             if self._dot_anim_id is None:
@@ -836,26 +985,40 @@ class TrayWindow:
             label_txt = STATE_LABEL.get(state, state)
             display   = _task_display_name(dl)
 
+            # Split "DD-MM-YYYY HH:MM:SS" into separate date/time parts
+            # so date lines up with the DL/FT number and time lines up
+            # with the state label, instead of one combined timestamp.
+            date_part, _, time_part = ts.partition(" ")
+            if not time_part:
+                # Fallback for any legacy/short ts value (e.g. time-only)
+                date_part, time_part = "", ts
+
             row = tk.Frame(self.list_frame, bg=BG_CARD,
                            pady=4, padx=8,
                            highlightbackground=color,
                            highlightthickness=1)
             row.pack(fill=tk.X, pady=2)
 
-            # Line 1: DL/FT name on left, timestamp on right
+            # Line 1: DL/FT name on left, DATE on right
             line1 = tk.Frame(row, bg=BG_CARD)
             line1.pack(fill=tk.X)
             tk.Label(line1, text=display,
                      font=self.f_body, bg=BG_CARD,
                      fg=color, anchor="w").pack(side=tk.LEFT)
-            tk.Label(line1, text=ts,
+            tk.Label(line1, text=date_part,
                      font=self.f_small, bg=BG_CARD,
                      fg=COL_MUTED).pack(side=tk.RIGHT)
 
-            # Line 2: State label below
-            tk.Label(row, text=label_txt,
+            # Line 2: state label (Stopped / manual intervention needed)
+            # on left, TIME on right
+            line2 = tk.Frame(row, bg=BG_CARD)
+            line2.pack(fill=tk.X)
+            tk.Label(line2, text=label_txt,
                      font=self.f_small, bg=BG_CARD,
-                     fg=color, anchor="w").pack(fill=tk.X)
+                     fg=color, anchor="w").pack(side=tk.LEFT)
+            tk.Label(line2, text=time_part,
+                     font=self.f_small, bg=BG_CARD,
+                     fg=COL_MUTED).pack(side=tk.RIGHT)
 
     def _update_ft_dots(self) -> None:
         """Update FT dot colors — green=connected, grey=not connected, dim=beyond setup count."""
