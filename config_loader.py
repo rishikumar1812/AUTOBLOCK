@@ -40,6 +40,7 @@ _DEFAULTS = {
     },
     "dashboard": {
         "hello_toast_minutes": 30,
+        "hello_timeout_minutes": 16,
         "cleanup_days": 2,
     },
     "ft_listener": {
@@ -91,28 +92,16 @@ def get_config() -> dict:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            changed = False
             for section, values in _DEFAULTS.items():
                 if section not in data:
                     data[section] = values
-                    changed = True
                 elif isinstance(values, dict):
                     for k, v in values.items():
-                        if k not in data[section]:
-                            data[section][k] = v
-                            changed = True
-            if changed:
-                # Persist any newly-added default keys back to disk
-                save_config(data)
+                        data[section].setdefault(k, v)
             return data
     except Exception as e:
         print(f"[config_loader] Failed to load {path}: {e} — using defaults")
-
-    # File missing (or unreadable) — create it beside the EXE so it
-    # actually exists on disk for the user to find/edit next time.
-    defaults = dict(_DEFAULTS)
-    save_config(defaults)
-    return defaults
+    return dict(_DEFAULTS)
 def cleanup_days() -> int : return get_config()["dashboard"]["cleanup_days"]
 
 def save_config(cfg: dict) -> bool:
