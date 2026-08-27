@@ -849,20 +849,32 @@ class TrayWindow:
 
     # ── Refresh ───────────────────────────────────────────
     def _refresh(self) -> None:
-        self._update_conn_status()
-        self._update_ft_dots()
-        self._refresh_blocked()
+        # Wrapped so ONE bad tick (e.g. a malformed _dl_states entry,
+        # a Tk widget error) can never permanently freeze the tray.
+        # Previously, any exception here skipped the self.root.after()
+        # reschedule at the end — since the console is hidden
+        # (hide_console()), that failure was invisible, and the tray
+        # would silently stop refreshing forever, frozen on whatever
+        # was last rendered (which could look like a stuck/"unordered"
+        # Activity list, when really it just stopped updating).
+        try:
+            self._update_conn_status()
+            self._update_ft_dots()
+            self._refresh_blocked()
 
-        qsize = _task_queue.qsize()
-        self.lbl_queue.config(
-            text=f"{qsize} pending",
-            fg=COL_WARN if qsize > 0 else COL_TEXT,
-        )
-        self._check_app_status()
-        self.lbl_time.config(
-            text=f"Updated: {datetime.now().strftime('%H:%M:%S')}"
-        )
-        self.root.after(5000, self._refresh)
+            qsize = _task_queue.qsize()
+            self.lbl_queue.config(
+                text=f"{qsize} pending",
+                fg=COL_WARN if qsize > 0 else COL_TEXT,
+            )
+            self._check_app_status()
+            self.lbl_time.config(
+                text=f"Updated: {datetime.now().strftime('%H:%M:%S')}"
+            )
+        except Exception as e:
+            logger.error(f"[tray] _refresh() error: {e}")
+        finally:
+            self.root.after(5000, self._refresh)
 
     def _update_conn_status(self) -> None:
         with _conn_lock:
@@ -979,46 +991,54 @@ class TrayWindow:
             return info.get("ts_dt") or datetime.min
 
         for dl, info in sorted(states.items(), key=_sort_key, reverse=True):
-            state     = info["state"]
-            ts        = info["ts"]
-            color     = STATE_COLOR.get(state, COL_MUTED)
-            label_txt = STATE_LABEL.get(state, state)
-            display   = _task_display_name(dl)
+            try:
+                state     = info["state"]
+                ts        = info["ts"]
+                color     = STATE_COLOR.get(state, COL_MUTED)
+                label_txt = STATE_LABEL.get(state, state)
+                display   = _task_display_name(dl)
 
-            # Split "DD-MM-YYYY HH:MM:SS" into separate date/time parts
-            # so date lines up with the DL/FT number and time lines up
-            # with the state label, instead of one combined timestamp.
-            date_part, _, time_part = ts.partition(" ")
-            if not time_part:
-                # Fallback for any legacy/short ts value (e.g. time-only)
-                date_part, time_part = "", ts
+                # Split "DD-MM-YYYY HH:MM:SS" into separate date/time
+                # parts so date lines up with the DL/FT number and time
+                # lines up with the state label, instead of one combined
+                # timestamp.
+                date_part, _, time_part = ts.partition(" ")
+                if not time_part:
+                    # Fallback for any legacy/short ts value (time-only)
+                    date_part, time_part = "", ts
 
-            row = tk.Frame(self.list_frame, bg=BG_CARD,
-                           pady=4, padx=8,
-                           highlightbackground=color,
-                           highlightthickness=1)
-            row.pack(fill=tk.X, pady=2)
+                row = tk.Frame(self.list_frame, bg=BG_CARD,
+                               pady=4, padx=8,
+                               highlightbackground=color,
+                               highlightthickness=1)
+                row.pack(fill=tk.X, pady=2)
 
-            # Line 1: DL/FT name on left, DATE on right
-            line1 = tk.Frame(row, bg=BG_CARD)
-            line1.pack(fill=tk.X)
-            tk.Label(line1, text=display,
-                     font=self.f_body, bg=BG_CARD,
-                     fg=color, anchor="w").pack(side=tk.LEFT)
-            tk.Label(line1, text=date_part,
-                     font=self.f_small, bg=BG_CARD,
-                     fg=COL_MUTED).pack(side=tk.RIGHT)
+                # Line 1: DL/FT name on left, DATE on right
+                line1 = tk.Frame(row, bg=BG_CARD)
+                line1.pack(fill=tk.X)
+                tk.Label(line1, text=display,
+                         font=self.f_body, bg=BG_CARD,
+                         fg=color, anchor="w").pack(side=tk.LEFT)
+                tk.Label(line1, text=date_part,
+                         font=self.f_small, bg=BG_CARD,
+                         fg=COL_MUTED).pack(side=tk.RIGHT)
 
-            # Line 2: state label (Stopped / manual intervention needed)
-            # on left, TIME on right
-            line2 = tk.Frame(row, bg=BG_CARD)
-            line2.pack(fill=tk.X)
-            tk.Label(line2, text=label_txt,
-                     font=self.f_small, bg=BG_CARD,
-                     fg=color, anchor="w").pack(side=tk.LEFT)
-            tk.Label(line2, text=time_part,
-                     font=self.f_small, bg=BG_CARD,
-                     fg=COL_MUTED).pack(side=tk.RIGHT)
+                # Line 2: state label (Stopped / manual intervention
+                # needed) on left, TIME on right
+                line2 = tk.Frame(row, bg=BG_CARD)
+                line2.pack(fill=tk.X)
+                tk.Label(line2, text=label_txt,
+                         font=self.f_small, bg=BG_CARD,
+                         fg=color, anchor="w").pack(side=tk.LEFT)
+                tk.Label(line2, text=time_part,
+                         font=self.f_small, bg=BG_CARD,
+                         fg=COL_MUTED).pack(side=tk.RIGHT)
+            except Exception as e:
+                # Skip just this one malformed entry — a single bad
+                # row must not abort rendering (and therefore sorting)
+                # of the rest of the list.
+                logger.error(f"[tray] Activity row error for {dl!r}: {e}")
+                continue
 
     def _update_ft_dots(self) -> None:
         """Update FT dot colors — green=connected, grey=not connected, dim=beyond setup count."""
