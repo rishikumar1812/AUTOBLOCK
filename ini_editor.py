@@ -3,7 +3,13 @@ import logging
 import configparser
 from config_loader import get_config
 
-logger = logging.getLogger("ini_editor")
+# Use the SAME logger name ("Process") that main_pc_popup.py
+# configures with a DailyFileHandler writing to
+# Process_YYYY-MM-DD.log. Previously this used a private
+# "ini_editor" logger name with no handler ever attached to it
+# anywhere, so these Data.ini uncheck/save messages were silently
+# discarded — they never reached any log file.
+logger = logging.getLogger("Process")
 
 
 # =========================================================
