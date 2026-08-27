@@ -1,23 +1,46 @@
 import re
+import sys
 import time
 import logging
-from pywinauto import Application,Desktop
-from pywinauto.findwindows import(
-    ElementNotFoundError,
-    ElementAmbiguousError,  
-)
-from pywinauto.timings import  TimeoutError as PWTimeoutError
+
+# pywinauto is Windows-only — guard import so the file can at least
+# be imported on Mac/Linux for testing non-automation code paths.
+try:
+    from pywinauto import Application, Desktop
+    from pywinauto.findwindows import (
+        ElementNotFoundError,
+        ElementAmbiguousError,
+    )
+    from pywinauto.timings import TimeoutError as PWTimeoutError
+    _PYWINAUTO_AVAILABLE = True
+except (ImportError, Exception):
+    _PYWINAUTO_AVAILABLE = False
+    # Stub classes so the rest of the file loads without error
+    class Application:
+        def __init__(self, *a, **k): pass
+    class Desktop:
+        pass
+    class ElementNotFoundError(Exception): pass
+    class ElementAmbiguousError(Exception): pass
+    class PWTimeoutError(Exception): pass
+    if sys.platform != "win32":
+        logging.getLogger("Process").warning(
+            "[inline_automation] pywinauto not available on this platform. "
+            "Automation will not work — run on Windows Main PC."
+        )
 
 from config_loader import get_config
 from ini_editor import uncheck_dl, uncheck_ft
 
 # =========================================================
-# Use the SAME logger name as main_pc_popup.py so every
-# pywinauto step lands in the same main_pc_popup_YYYY-MM-DD.log
-# file the engineer already checks — no separate log file
-# to dig through when something fails.
+# Use the SAME logger name ("Process") that main_pc_popup.py
+# configures with a DailyFileHandler writing to
+# Process_YYYY-MM-DD.log — every pywinauto automation step lands
+# in that single dedicated automation log, separate from
+# connection_status_YYYY-MM-DD.log (HELLO/connect/disconnect).
+# main_pc_popup.log has been retired — no general catch-all log.
 # =========================================================
-logger=logging.getLogger("main_pc_popup")
+logger=logging.getLogger("Process")
 
 # config access
 def _exe_name()->str:
@@ -476,7 +499,7 @@ def _click_dialog_button(app:Application,button_name:str)->None:
 # task_key format: "FT1_FRONT_Function 1"
 # =========================================================
 def _is_ft_task(task_key: str) -> bool:
-    return task_key.upper().startswith("FT_")
+    return task_key.upper().startswith("F")
 
 
 def _parse_ft_task(task_key: str) -> tuple:
@@ -488,6 +511,7 @@ def _parse_ft_task(task_key: str) -> tuple:
     """
     # "FT_F1_front_Function 1" → ["FT", "F1", "front", "Function 1"]
     parts = task_key.split("_", 3)
+    print(parts)
     if len(parts) < 4:
         raise ValueError(f"Invalid FT task key: {task_key!r}")
     rack         = parts[2].lower()    # 'front' or 'rear'
@@ -656,6 +680,13 @@ def run_stop_sequence(dl_name:str)->bool:
                 retrying immediately won't change a board still
                 being physically present)
     """
+    if not _PYWINAUTO_AVAILABLE:
+        logger.error(
+            f"[automation] {dl_name} — pywinauto not available on this "
+            f"platform. Run on Windows Main PC."
+        )
+        return False
+
     retries=_retry_attempts()
 
     for attempt in range(1,retries+1):
@@ -770,3 +801,4 @@ def run_stop_sequence(dl_name:str)->bool:
     )
     logger.error(f"[automation] {'='*60}")
     return False
+
