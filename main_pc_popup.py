@@ -45,39 +45,30 @@ def _hello_timeout_minutes() -> int:
 # =========================================================
 # Logging
 # =========================================================
-def _setup_logger() -> logging.Logger:
-    log_dir = _log_dir()
-    os.makedirs(log_dir, exist_ok=True)
-
-    # Delete log files older than 7 days — runs once at startup
-    cleanup_old_logs(log_dir, retention_days=cleanup_days())
-
-    logger = logging.getLogger("main_pc_popup")
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-
-        # DailyFileHandler rolls to a new file at midnight automatically.
-        # This tray app runs 24/7 in the background (root.mainloop()),
-        # so the old fixed-date filename never updated itself — this
-        # handler checks the date on every emit() call instead.
-        fh = DailyFileHandler("main_pc_popup", log_dir, retention_days=cleanup_days())
-        logger.addHandler(fh)
-
-        sh = logging.StreamHandler()
-        sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-        logger.addHandler(sh)
-    return logger
+# main_pc_popup.log has been retired — every log line now goes to
+# exactly one of the two dedicated logs below:
+#   connection_status_YYYY-MM-DD.log — HELLO / connect / disconnect
+#   Process_YYYY-MM-DD.log           — automation steps, commands run,
+#                                       tray/operational messages
+#
+# `logger` still exists but is CONSOLE-ONLY (no file handler) — it's
+# only used as a last-resort fallback if setting up one of the two
+# real loggers below fails, so that failure is still visible
+# somewhere instead of silently vanishing.
+logger = logging.getLogger("main_pc_popup")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    sh = logging.StreamHandler()
+    sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(sh)
 
 try:
-    logger=_setup_logger()
+    _log_dir_path = _log_dir()
+    os.makedirs(_log_dir_path, exist_ok=True)
+    # Delete log files older than retention — runs once at startup
+    cleanup_old_logs(_log_dir_path, retention_days=cleanup_days())
 except Exception as _log_err:
-    logger=logging.getLogger("main_pc_popup")
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        sh=logging.StreamHandler()
-        sh.setFormatter(logging.Formatter("%(asctime)s[%(levelname)s] %(message)s"))
-        logger.addHandler(sh)
-    logger.warning(f"[main] Log file setup failed: {_log_err} - using console only")
+    logger.warning(f"[main] Log directory setup failed: {_log_err}")
 
 
 # =========================================================
@@ -280,7 +271,7 @@ def _send_response(conn: socket.socket, status: str, message: str = "") -> None:
             json.dumps({"status": status, "message": message}).encode("utf-8")
         )
     except Exception as e:
-        logger.error(f"[listener] Failed to send response: {e}")
+        conn_logger.error(f"[listener] Failed to send response: {e}")
 
 
 # =========================================================
@@ -293,7 +284,7 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
         data    = json.loads(raw.decode("utf-8"))
         command = data.get("command", "").upper()
 
-        logger.info(f"[listener] {addr[0]}:{addr[1]} → {command}")
+        conn_logger.info(f"[listener] {addr[0]}:{addr[1]} → {command}")
 
         # ── HELLO handshake ───────────────────────────────
         if command == "HELLO":
@@ -356,10 +347,10 @@ def _handle_connection(conn: socket.socket, addr: tuple) -> None:
             _send_response(conn, "ERROR", f"Unknown command: {command}")
 
     except json.JSONDecodeError as e:
-        logger.error(f"[listener] Bad JSON from {addr}: {e}")
+        conn_logger.error(f"[listener] Bad JSON from {addr}: {e}")
         _send_response(conn, "ERROR", "Invalid JSON")
     except Exception as e:
-        logger.error(f"[listener] Error from {addr}: {e}")
+        conn_logger.error(f"[listener] Error from {addr}: {e}")
     finally:
         conn.close()
 
@@ -374,7 +365,7 @@ def _start_tcp_listener() -> None:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((host, port))
         server.listen(20)
-        logger.info(f"[listener] Listening on {host}:{port}")
+        conn_logger.info(f"[listener] Listening on {host}:{port}")
         while True:
             try:
                 conn, addr = server.accept()
@@ -384,7 +375,7 @@ def _start_tcp_listener() -> None:
                     daemon=True,
                 ).start()
             except Exception as e:
-                logger.error(f"[listener] Accept error: {e}")
+                conn_logger.error(f"[listener] Accept error: {e}")
                 time.sleep(1)
 
 _FT_ID_MAP = {
@@ -412,7 +403,7 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
         command = data.get("command", "").upper()
         ft_id   = data.get("ft_id","").upper()
 
-        logger.info(f"[ft_listener] {addr[0]}:{addr[1]} → {command} {ft_id}")
+        conn_logger.info(f"[ft_listener] {addr[0]}:{addr[1]} → {command} {ft_id}")
 
         if command == "HELLO":
             _send_response(conn, "ACK", "Connected")
@@ -463,10 +454,10 @@ def _handle_ft_connection(conn: socket.socket, addr: tuple) -> None:
             _send_response(conn, "ERROR", f"Unknown command: {command}")
 
     except json.JSONDecodeError as e:
-        logger.error(f"[ft_listener] Bad JSON from {addr}: {e}")
+        conn_logger.error(f"[ft_listener] Bad JSON from {addr}: {e}")
         _send_response(conn, "ERROR", "Invalid JSON")
     except Exception as e:
-        logger.error(f"[ft_listener] Error from {addr}: {e}")
+        conn_logger.error(f"[ft_listener] Error from {addr}: {e}")
     finally:
         conn.close()
 
@@ -480,7 +471,7 @@ def _start_ft_tcp_listener() -> None:
             server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server.bind((host, port))
             server.listen(20)
-            logger.info(f"[ft_listener] FT listener on {host}:{port}")
+            conn_logger.info(f"[ft_listener] FT listener on {host}:{port}")
             while True:
                 try:
                     conn, addr = server.accept()
@@ -490,10 +481,10 @@ def _start_ft_tcp_listener() -> None:
                         daemon=True,
                     ).start()
                 except Exception as e:
-                    logger.error(f"[ft_listener] Accept error: {e}")
+                    conn_logger.error(f"[ft_listener] Accept error: {e}")
                     time.sleep(1)
     except Exception as e:
-        logger.error(f"[ft_listener] Failed to start on port {port}: {e}")
+        conn_logger.error(f"[ft_listener] Failed to start on port {port}: {e}")
 
 
 # =========================================================
@@ -615,17 +606,12 @@ class TrayWindow:
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
         # Fixed static size — cannot be resized.
-        # CONTENT_W is the original inner layout width (unchanged —
-        # every existing .place(x=...) coordinate still lines up).
-        # WINDOW_W adds room for the new outer scrollbar so it doesn't
-        # clip any existing content.
-        self.CONTENT_W = 320
-        WINDOW_W, H = 320 + 16, 500
+        W, H = 320, 500
         x = 8
         y = max(0, sh - H - 48)
-        self.root.geometry(f"{WINDOW_W}x{H}+{x}+{y}")
-        self.root.maxsize(WINDOW_W, H)
-        self.root.minsize(WINDOW_W, H)
+        self.root.geometry(f"{W}x{H}+{x}+{y}")
+        self.root.maxsize(W, H)
+        self.root.minsize(W, H)
 
         self.f_title = tkfont.Font(family="Consolas", size=10, weight="bold")
         self.f_conn  = tkfont.Font(family="Consolas", size=9,  weight="bold")
@@ -641,49 +627,10 @@ class TrayWindow:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build(self) -> None:
-        W = self.CONTENT_W  # must match original inner layout width
-
-        # ── Outer scrollable wrapper ───────────────────────
-        # Whole-window scrollbar: everything below is placed onto
-        # self.content (same x/y coordinates as before) instead of
-        # self.root directly, so all existing .place() calls keep
-        # working unchanged while the whole popup becomes scrollable.
-        outer_canvas = tk.Canvas(self.root, bg=BG_MAIN, highlightthickness=0)
-        outer_scrollbar = tk.Scrollbar(self.root, orient="vertical",
-                                       command=outer_canvas.yview, width=10)
-
-        def _update_outer_scrollbar(*args):
-            lo, hi = map(float, args)
-            if lo <= 0.0 and hi >= 1.0:
-                outer_scrollbar.pack_forget()
-            else:
-                outer_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        outer_canvas.configure(yscrollcommand=_update_outer_scrollbar)
-        outer_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.content = tk.Frame(outer_canvas, bg=BG_MAIN, width=W, height=500)
-        self._content_window_id = outer_canvas.create_window(
-            (0, 0), window=self.content, anchor="nw")
-
-        def _on_content_resize(e):
-            outer_canvas.configure(scrollregion=outer_canvas.bbox("all"))
-        self.content.bind("<Configure>", _on_content_resize)
-
-        def _on_outer_canvas_resize(e):
-            # Keep content pinned to the canvas's own width, not the
-            # window's — avoids the content stretching under the
-            # scrollbar column.
-            pass
-        outer_canvas.bind("<Configure>", _on_outer_canvas_resize)
-
-        def _on_root_mousewheel(e):
-            outer_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        outer_canvas.bind_all("<MouseWheel>", _on_root_mousewheel)
-        self._outer_canvas = outer_canvas
+        W = 320  # must match geometry W
 
         # ── Header y=0 h=34 ───────────────────────────────
-        hdr = tk.Frame(self.content, bg=BG_HEADER, width=W, height=34)
+        hdr = tk.Frame(self.root, bg=BG_HEADER, width=W, height=34)
         hdr.place(x=0, y=0)
         hdr.pack_propagate(False)
         tk.Label(hdr, text="DL & FT Monitor  *  Main PC",
@@ -691,7 +638,7 @@ class TrayWindow:
                  fg=COL_WHITE).pack(expand=True)
 
         # ── Connection y=34 h=42 ──────────────────────────
-        conn = tk.Frame(self.content, bg=BG_CARD, width=W, height=42)
+        conn = tk.Frame(self.root, bg=BG_CARD, width=W, height=42)
         conn.place(x=0, y=34)
         conn.pack_propagate(False)
         self.lbl_conn_dot = tk.Label(conn, text="*",
@@ -709,10 +656,10 @@ class TrayWindow:
         self._start_dot_animation()
 
         # ── Separator y=76 ────────────────────────────────
-        tk.Frame(self.content, bg=COL_BORDER, width=W, height=1).place(x=0, y=76)
+        tk.Frame(self.root, bg=COL_BORDER, width=W, height=1).place(x=0, y=76)
 
         # ── Status rows y=77 h=66 ─────────────────────────
-        status = tk.Frame(self.content, bg=BG_CARD, width=W, height=66)
+        status = tk.Frame(self.root, bg=BG_CARD, width=W, height=66)
         status.place(x=0, y=77)
         status.pack_propagate(False)
 
@@ -733,10 +680,10 @@ class TrayWindow:
         _srow("InLine_Pro", "lbl_app",   "checking...", COL_MUTED, 48)
 
         # ── Separator y=143 ───────────────────────────────
-        tk.Frame(self.content, bg=COL_BORDER, width=W, height=1).place(x=0, y=143)
+        tk.Frame(self.root, bg=COL_BORDER, width=W, height=1).place(x=0, y=143)
 
         # ── FT dots y=144 h=50 ────────────────────────────
-        ft_frame = tk.Frame(self.content, bg=BG_CARD, width=W, height=50)
+        ft_frame = tk.Frame(self.root, bg=BG_CARD, width=W, height=50)
         ft_frame.place(x=0, y=144)
         ft_frame.pack_propagate(False)
         self.ft_dots = {}
@@ -759,33 +706,31 @@ class TrayWindow:
             self.ft_dots[key] = dot
 
         # ── Separator y=194 ───────────────────────────────
-        tk.Frame(self.content, bg=COL_BORDER, width=W, height=1).place(x=0, y=194)
+        tk.Frame(self.root, bg=COL_BORDER, width=W, height=1).place(x=0, y=194)
 
         # ── Activity label y=196 ──────────────────────────
-        tk.Label(self.content, text="Activity today  (DL + FT)",
+        tk.Label(self.root, text="Activity today  (DL + FT)",
                  font=self.f_small, bg=BG_MAIN,
                  fg=COL_MUTED).place(x=10, y=198)
 
         # ── Scrollable list y=216 h=200 ───────────────────
-        list_outer = tk.Frame(self.content, bg=BG_MAIN,
+        # Scrollbar is ALWAYS visible (not auto-hidden) so it's
+        # obvious and usable once several DL/FT entries pile up
+        # (e.g. when automation keeps failing and error entries
+        # accumulate) — previously it only appeared once content
+        # overflowed, which made it easy to miss.
+        list_outer = tk.Frame(self.root, bg=BG_MAIN,
                               width=W-12, height=200)
         list_outer.place(x=6, y=216)
         list_outer.pack_propagate(False)
 
-        canvas = tk.Canvas(list_outer, bg=BG_MAIN, highlightthickness=0)
-        scrollbar = tk.Scrollbar(list_outer, orient="vertical",
-                                 command=canvas.yview,
-                                 width=6)
+        scrollbar = tk.Scrollbar(list_outer, orient="vertical", width=10)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        def _update_scrollbar(*args):
-            lo, hi = map(float, args)
-            if lo <= 0.0 and hi >= 1.0:
-                scrollbar.pack_forget()
-            else:
-                scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        canvas.configure(yscrollcommand=_update_scrollbar)
+        canvas = tk.Canvas(list_outer, bg=BG_MAIN, highlightthickness=0,
+                          yscrollcommand=scrollbar.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=canvas.yview)
 
         self.list_frame = tk.Frame(canvas, bg=BG_MAIN)
         self._list_canvas_id = canvas.create_window(
@@ -802,26 +747,20 @@ class TrayWindow:
                         self._list_canvas_id, width=e.width))
 
         def _on_mousewheel(e):
-            # Local bind (not bind_all) so this only fires while the
-            # mouse is actually over the activity list, and returns
-            # "break" so the event doesn't also reach the outer
-            # window-level scrollbar's bind_all handler above
-            # (avoids double-scrolling both lists at once).
             canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-            return "break"
-        canvas.bind("<MouseWheel>", _on_mousewheel)
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
         self._list_canvas = canvas
 
         # ── Separator y=420 ───────────────────────────────
-        tk.Frame(self.content, bg=COL_BORDER, width=W, height=1).place(x=0, y=420)
+        tk.Frame(self.root, bg=COL_BORDER, width=W, height=1).place(x=0, y=420)
 
         # ── Footer y=421 — always at fixed position ────────
-        self.lbl_time = tk.Label(self.content, text="",
+        self.lbl_time = tk.Label(self.root, text="",
                                   font=self.f_small,
                                   bg=BG_MAIN, fg=COL_MUTED)
         self.lbl_time.place(x=0, y=428, width=W, anchor="nw")
 
-        self.btn_clear = tk.Button(self.content,
+        self.btn_clear = tk.Button(self.root,
                                     text="Clear blocked",
                                     command=self._clear_blocked,
                                     bg=BG_HEADER, fg=COL_MUTED,
@@ -872,7 +811,7 @@ class TrayWindow:
                 text=f"Updated: {datetime.now().strftime('%H:%M:%S')}"
             )
         except Exception as e:
-            logger.error(f"[tray] _refresh() error: {e}")
+            process_logger.error(f"[tray] _refresh() error: {e}")
         finally:
             self.root.after(5000, self._refresh)
 
@@ -1007,37 +946,41 @@ class TrayWindow:
                     # Fallback for any legacy/short ts value (time-only)
                     date_part, time_part = "", ts
 
+                # grid() (not pack) — two columns, two rows. Avoids any
+                # side/fill keyword mixups from nested pack() frames.
                 row = tk.Frame(self.list_frame, bg=BG_CARD,
                                pady=4, padx=8,
                                highlightbackground=color,
                                highlightthickness=1)
                 row.pack(fill=tk.X, pady=2)
+                row.grid_columnconfigure(0, weight=1)
+                row.grid_columnconfigure(1, weight=0)
 
-                # Line 1: DL/FT name on left, DATE on right
-                line1 = tk.Frame(row, bg=BG_CARD)
-                line1.pack(fill=tk.X)
-                tk.Label(line1, text=display,
+                # Row 0: DL/FT name (left) — DATE (right)
+                tk.Label(row, text=display,
                          font=self.f_body, bg=BG_CARD,
-                         fg=color, anchor="w").pack(side=tk.LEFT)
-                tk.Label(line1, text=date_part,
+                         fg=color, anchor="w").grid(
+                             row=0, column=0, sticky="w")
+                tk.Label(row, text=date_part,
                          font=self.f_small, bg=BG_CARD,
-                         fg=COL_MUTED).pack(side=tk.RIGHT)
+                         fg=COL_MUTED, anchor="e").grid(
+                             row=0, column=1, sticky="e")
 
-                # Line 2: state label (Stopped / manual intervention
-                # needed) on left, TIME on right
-                line2 = tk.Frame(row, bg=BG_CARD)
-                line2.pack(fill=tk.X)
-                tk.Label(line2, text=label_txt,
+                # Row 1: state label (Stopped / manual intervention
+                # needed) (left) — TIME (right)
+                tk.Label(row, text=label_txt,
                          font=self.f_small, bg=BG_CARD,
-                         fg=color, anchor="w").pack(side=tk.LEFT)
-                tk.Label(line2, text=time_part,
+                         fg=color, anchor="w").grid(
+                             row=1, column=0, sticky="w")
+                tk.Label(row, text=time_part,
                          font=self.f_small, bg=BG_CARD,
-                         fg=COL_MUTED).pack(side=tk.RIGHT)
+                         fg=COL_MUTED, anchor="e").grid(
+                             row=1, column=1, sticky="e")
             except Exception as e:
                 # Skip just this one malformed entry — a single bad
                 # row must not abort rendering (and therefore sorting)
                 # of the rest of the list.
-                logger.error(f"[tray] Activity row error for {dl!r}: {e}")
+                process_logger.error(f"[tray] Activity row error for {dl!r}: {e}")
                 continue
 
     def _update_ft_dots(self) -> None:
@@ -1093,7 +1036,7 @@ class TrayWindow:
         Double-click tray icon or run again to restore.
         """
         self.root.withdraw()
-        logger.info("[tray] Window hidden — listeners still running. "
+        process_logger.info("[tray] Window hidden — listeners still running. "
                     "Run again or double-click icon to restore.")
 
     def _restore(self) -> None:
@@ -1104,7 +1047,7 @@ class TrayWindow:
     def _clear_blocked(self) -> None:
         with _state_lock:
             _dl_states.clear()
-        logger.info("[tray] DL state list cleared by operator")
+        process_logger.info("[tray] DL state list cleared by operator")
         self._refresh_blocked()
         # Scroll list back to top after clearing
         try:
@@ -1159,7 +1102,7 @@ if __name__ == "__main__":
     threading.Thread(target=_start_tcp_listener,     daemon=True).start()
     threading.Thread(target=_start_ft_tcp_listener,  daemon=True).start()
 
-    logger.info(
+    conn_logger.info(
         f"[main] Main PC popup started — "
         f"DL port={_listen_port()}, FT port={_ft_listen_port()}"
     )
