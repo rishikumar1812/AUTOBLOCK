@@ -1,582 +1,531 @@
+I checked your Complete_code_v6.zip. It contains these main parts:
 
-# InLine Pro — Line Monitoring System
-## Technical Documentation & Code Execution Manual
+UPDATE_SERVER → Central update server
 
-**Version:** Phase 1–4 (Engine, Database, API, Web UI)
-**Stack:** Python, FastAPI, SQLAlchemy (SQLite dev / SQL Server 2014 production), Jinja2, HTML/CSS (no JavaScript)
+MAIN_PC → Main PC application
 
----
+DL_PC → DL PC application
 
-## Table of Contents
+FT_PC_D3 → FT PC D3 application
 
-1. [What This System Does](#1-what-this-system-does)
-2. [System Architecture](#2-system-architecture)
-3. [The Three Input Sources — Explained in Detail](#3-the-three-input-sources--explained-in-detail)
-4. [Business Logic — How a Line's Status Is Decided](#4-business-logic--how-a-lines-status-is-decided)
-5. [Module-by-Module Reference](#5-module-by-module-reference)
-6. [Database Schema](#6-database-schema)
-7. [Installation Guide](#7-installation-guide)
-8. [Configuration Guide](#8-configuration-guide)
-9. [Running the Application](#9-running-the-application)
-10. [Web Pages — User Guide](#10-web-pages--user-guide)
-11. [API Reference](#11-api-reference)
-12. [Testing Guide](#12-testing-guide)
-13. [Deploying to SQL Server 2014](#13-deploying-to-sql-server-2014)
-14. [Troubleshooting](#14-troubleshooting)
-15. [Project File Structure](#15-project-file-structure)
-16. [Known Limitations / Not Yet Built](#16-known-limitations--not-yet-built)
+FT_PC_SETUP2 → FT PC Setup application
 
----
 
-## 1. What This System Does
-
-InLine Pro monitors production assembly lines in a factory. Each line has:
-- **DL (Data Loggers)** — up to 20 per line, arranged as two racks of 10 (Front / Rear)
-- **FT (Function Testers)** — up to 8 per line, arranged as two racks of 4 (Front / Rear)
-
-Every **10 minutes**, the system:
-1. Reads that line's **daily log file** to determine if the line itself is physically running (a board is being scanned) or has gone idle/stale.
-2. If the line is running, reads that line's **Data.ini** configuration file to determine which individual DL/FT units are currently active (`CHECK`) or stopped (`NOT_CHECK`).
-3. Cross-references against the **Excel line master** to know which DL/FT slot numbers actually exist for that line (a line might be physically wired with fewer than the maximum 20 DL / 8 FT units).
-4. Saves a timestamped snapshot of all of this to a database.
-5. Serves the current and historical status through a web dashboard and a JSON API, including shift-wise (A/B/C) CSV/Excel export.
-
----
-
-## 2. System Architecture
-
-```
-                    ┌─────────────────────────┐
-                    │   Excel Line Master      │   (one row per line:
-                    │   (.xlsx)                │    IP, log path, ini path,
-                    └───────────┬──────────────┘    Total DL, Total FT, Status)
-                                │ read by
-                                ▼
-┌───────────────┐      ┌───────────────────┐      ┌──────────────────┐
-│  Daily Log     │─────▶│                    │◀─────│   Data.ini        │
-│  <line>/       │ read │   STATUS ENGINE    │ read │   (per line)       │
-│  yyyymmdd_     │  by  │  (status_engine.py)│  by  │   RACK1/RACK2      │
-│  New.log       │      │                    │      │   BUILDER/FUNCTION │
-└───────────────┘      └─────────┬──────────┘      └──────────────────┘
-                                  │ every 10 minutes
-                                  ▼
-                        ┌───────────────────┐
-                        │   SCHEDULER         │  (APScheduler,
-                        │  (poller.py)         │   background job)
-                        └─────────┬──────────┘
-                                  │ writes snapshot
-                                  ▼
-                        ┌───────────────────┐
-                        │   DATABASE           │  (SQLAlchemy Core:
-                        │  (line_status table)  │   SQLite dev /
-                        └─────────┬──────────┘   SQL Server 2014 prod)
-                                  │ read by
-                    ┌─────────────┴─────────────┐
-                    ▼                            ▼
-          ┌──────────────────┐        ┌──────────────────────┐
-          │   JSON API          │        │   HTML Web Pages        │
-          │  (api/routes.py)     │        │  (api/html_routes.py,   │
-          │  /api/lines, etc.    │        │   pure HTML/CSS, no JS) │
-          └──────────────────┘        └──────────────────────┘
-```
-
-**Design principle:** every layer only depends on the layer below it, and every module was individually unit-tested against your real uploaded log file and Data.ini sample before being wired together. This means if something looks wrong in the web UI, you can isolate the problem by testing each layer in order: parser → engine → database → API → UI.
+Below is the step-by-step order to run the complete system.
 
 
 ---
 
-## 3. The Three Input Sources — Explained in Detail
+Step 1: Extract the ZIP file
 
-### 3.1 The Daily Log File
+Extract:
 
-**Path pattern:** `<line's log directory>\<yyyymmdd>_New.log`
-Example: `C:\InLine_Pro\logs\LINE01\20260818_New.log`
+Complete_code_v6.zip
 
-Each line has **its own log folder** and its own file per day. A new file is created every day; the system reads it every 10 minutes throughout the day.
+You should get a folder containing:
 
-**Relevant log line format:**
-```
-[ 0:00:25], [Trace Log], [Rear]ScanSendPoint: A6706153AFA59
-[10:38:15], [Trace Log], [Front]ScanSendPoint: A6713079AFYB2
-```
+UPDATE_SERVER
+MAIN_PC
+DL_PC
+FT_PC_D3
+FT_PC_SETUP2
 
-What we extract from each line:
-| Part | Meaning |
-|---|---|
-| `[ 0:00:25]` | Time-of-day (H:MM:SS or HH:MM:SS) — **no date** is present on most lines |
-| `[Rear]` or `[Front]` | Which rack side scanned a board |
-| `ScanSendPoint:` | The literal event marker we look for |
-| `A6706153AFA59` | The scanned board's ID (not used for status, only the fact that a scan happened matters) |
-
-**Why the date isn't in the log line:** the file is date-stamped only in its **filename**. The code (`log_parser.py`) derives the date from the filename (`20260818` → 18-Aug-2026) and combines it with each line's time-of-day to build a full timestamp.
-
-**The 45-minute liveness rule:** the system finds the single most recent `ScanSendPoint` timestamp anywhere in the file (Front or Rear combined — confirmed this is a whole-line check, not separate per side). If "now" is within 45 minutes of that timestamp, the line is **RUNNING**. If more than 45 minutes have passed with no new `ScanSendPoint`, the line is **STALE** (effectively stopped/idle).
-
-### 3.2 The Data.ini File
-
-**Path:** one per line, wherever the Excel line master says (`Config File / Directory` column).
-
-**Relevant structure:**
-```ini
-[RACK1]
-BUILDER1 = CHECK
-BUILDER2 = CHECK
-BUILDER3 = CHECK
-BUILDER4 = NOT_CHECK
-...
-BUILDER10 = CHECK
-FUNCTION1 = CHECK
-FUNCTION2 = CHECK
-FUNCTION3 = CHECK
-FUNCTION4 = CHECK
-
-[RACK2]
-BUILDER1 .. BUILDER10 = CHECK / NOT_CHECK
-FUNCTION1 .. FUNCTION4 = CHECK / NOT_CHECK
-```
-
-`CHECK` means that DL/FT unit is currently **Running**. `NOT_CHECK` means it's currently **Stopped**.
-
-**Mapping to the global DL/FT numbering scheme used throughout the app:**
-
-| Global number | Maps to |
-|---|---|
-| DL 1–10 | RACK1 (Front) BUILDER1–10 |
-| DL 11–20 | RACK2 (Rear) BUILDER1–10 (i.e. DL14 = RACK2 BUILDER4) |
-| FT 1–4 | RACK1 (Front) FUNCTION1–4 |
-| FT 5–8 | RACK2 (Rear) FUNCTION1–4 (i.e. FT6 = RACK2 FUNCTION2) |
-
-This mapping is implemented in `data_ini_parser.py`'s `dl_status()` and `ft_status()` functions.
-
-### 3.3 The Excel Line Master
-
-**One row per line.** Expected columns (header row 1, matched case-insensitively — see `line_master.py` for exact alias list):
-
-| Column | Purpose |
-|---|---|
-| Line No. | Unique line identifier, e.g. `LINE 01` |
-| Line Name | Display name, e.g. `Assembly Line 01` |
-| IP Address | The line's network address (currently informational only) |
-| Data Directory (Path) | Folder containing that line's daily log files |
-| Config File / Directory | Full path to that line's `Data.ini` |
-| DL | **Total DL setup** — how many of the 20 possible DL slots physically exist on this line |
-| FT | **Total FT setup** — how many of the 8 possible FT slots physically exist on this line |
-| Status | `Enabled` / `Disabled` — whether this line should be polled at all |
-
-**Why "Total DL/FT" matters — the slot-trim rule:**
-
-A line doesn't necessarily have all 20 DL units or all 8 FT units installed. The Excel `Total DL` / `Total FT` values tell us how many actually exist — and the missing ones are **always the highest-numbered slots of each rack** (confirmed with the factory team):
-
-```
-Total DL = 18  (missing 2, split evenly = 1 per rack)
-  → DL10 (last slot of RACK1) and DL20 (last slot of RACK2) don't exist
-  → Valid DL slots: 1-9, 11-19
-
-Total DL = 16  (missing 4, split evenly = 2 per rack)
-  → DL9, DL10, DL19, DL20 don't exist
-  → Valid DL slots: 1-8, 11-18
-
-Total FT = 6  (missing 2, split evenly = 1 per rack)
-  → FT4 and FT8 don't exist
-  → Valid FT slots: 1-3, 5-7
-```
-
-This is implemented in `slot_rules.py`. **Important distinction:** a slot excluded by this rule is *not shown at all* (it doesn't exist) — this is different from a slot that exists but is `NOT_CHECK` in Data.ini (which *is* shown, as "Stopped").
-
-If a line's shortfall is odd (can't be split evenly across 2 racks), the code deliberately raises an error rather than guessing — that line would need a real per-slot exclusion list instead of the computed rule, and should be flagged for review rather than silently mis-reported.
 
 ---
 
-## 4. Business Logic — How a Line's Status Is Decided
+Step 2: Install Python
 
-This is the full decision sequence the engine runs for **every line, every 10 minutes** (`status_engine.py` → `compute_line_report()`):
+Install Python 3.10 or newer on the machines where you want to run the Python code.
 
-```
-1. Is the line marked "Disabled" in Excel?
-       YES → status = DISABLED. Stop here. (Not polled further.)
-       NO  → continue
+During installation, check:
 
-2. Look for today's log file: <log_dir>/<yyyymmdd>_New.log
-       File missing or unreadable → status = ERROR (with the reason recorded).
-                                     Stop here.
-       File found → continue
+☑ Add Python to PATH
 
-3. Find the most recent ScanSendPoint timestamp in the file.
-       No ScanSendPoint events found at all → status = STALE. Stop here.
-       Gap between "now" and that timestamp > 45 minutes → status = STALE. Stop here.
-       Gap ≤ 45 minutes → status = RUNNING. Continue.
+Then open Command Prompt and verify:
 
-4. (Only reached if RUNNING) Compute valid DL slots and valid FT slots
-   from Excel's Total DL / Total FT (the slot-trim rule, section 3.3).
+python --version
 
-5. (Only reached if RUNNING) Read the line's Data.ini.
-       File missing or unreadable → keep status = RUNNING, but record the
-                                     error and leave dl_report/ft_report empty.
-       File found → for every valid slot, look up CHECK/NOT_CHECK →
-                     Running/Stopped, and build the DL/FT report.
-```
+Also check pip:
 
-**Why STALE/ERROR don't compute DL/FT status:** if the line itself isn't running (or we can't even tell), reporting individual DL/FT statuses would be misleading — those numbers are only meaningful while the line is actively producing. The web UI reflects this by showing an empty state for DL/FT when a line isn't RUNNING.
+pip --version
 
-**Shift definitions** (`shifts.py`):
-
-| Shift | Window |
-|---|---|
-| A | 07:00 – 15:00 (same calendar day) |
-| B | 15:00 – 23:00 (same calendar day) |
-| C | 23:00 – 07:00 (**spans into the next calendar day**) |
-
-For Shift C, "date" always refers to the day the shift **starts** — e.g. "Shift C on 2026-08-18" means 23:00 on the 18th through 07:00 on the 19th. This matches how a factory floor conventionally refers to "last night's C shift."
 
 ---
 
-## 5. Module-by-Module Reference
+PART A — RUN THE UPDATE SERVER
 
-### `app/parsers/log_parser.py`
-- `parse_scan_send_points(file_path)` — streams a log file line-by-line (memory-efficient even for large files — doesn't load the whole file into RAM) and returns a list of `ScanEvent(timestamp, side, board_id)` objects.
-- `compute_line_status(events, as_of, threshold_minutes=45)` — applies the 45-minute rule and returns `LineStatusResult(status, last_seen, gap_minutes)`.
-- Handles the log's quirk of only having time-of-day (no date) by deriving the base date from the **filename**, and defensively rolls the date forward if it ever detects time going backwards by more than a minute (in case a log file happens to span midnight).
+The update server should run on a dedicated PC/server that is accessible by all your PCs.
 
-### `app/parsers/data_ini_parser.py`
-- `parse_data_ini(file_path)` — reads the RACK1/RACK2 sections and returns a `DataIniStatus` object holding `{builder_number: is_running}` and `{function_number: is_running}` dictionaries for each rack.
-- `dl_status(data, dl_num)` / `ft_status(data, ft_num)` — apply the global-number-to-rack mapping (section 3.2) and return `True` (Running) / `False` (Stopped). Raises `KeyError` if that slot isn't present in the file at all (handled gracefully upstream — treated as Stopped).
+Step 3: Install SQL Server requirements
 
-### `app/engine/slot_rules.py`
-- `valid_dl_slots(total_dl)` / `valid_ft_slots(total_ft)` — implement the slot-trim rule (section 3.3). Pure functions — same input always gives same output, easy to unit test (see `tests/test_engine.py`).
+Your code is designed to work with SQL Server 2014.
 
-### `app/engine/shifts.py`
-- `shift_window(date, shift)` — returns `(start_datetime, end_datetime)` for a shift, correctly handling Shift C's midnight rollover.
-- `parse_date(date_str)` — parses a `YYYY-MM-DD` string.
+On the Update Server machine, make sure you have:
 
-### `app/engine/status_engine.py`
-- `compute_line_report(line, as_of=None)` — the orchestrator described in section 4. Returns a `LineStatusReport` dataclass with computed properties like `dl_running_count`, `dl_stopped_count`, and a `.to_dict()` method for JSON/DB serialization.
-- Deliberately **never raises** for expected operational issues (missing files) — it converts them into an `ERROR` status with the reason recorded, so one line's problem never crashes the whole polling cycle.
+1. SQL Server 2014
 
-### `app/config/line_master.py`
-- `load_line_master(xlsx_path)` — reads the Excel workbook via `openpyxl`, matches column headers tolerantly (see `HEADER_ALIASES` — handles minor wording/spacing differences), and returns a list of `LineConfig` objects.
 
-### `app/db/database.py` and `app/db/repository.py`
-- Uses **SQLAlchemy Core** (not raw SQL, not an ORM) so the exact same code works against SQLite (used here for dev/testing) and SQL Server 2014 (production) — only the `DATABASE_URL` environment variable changes.
-- `repository.py` provides: `save_snapshot()`, `latest_snapshot_per_line()`, `latest_snapshot_for_line()`, `history_for_line()`, `history_all_lines()`.
-- DL/FT reports are stored as plain JSON-encoded text (`NVARCHAR`), not a native JSON column type — this is deliberate, because SQL Server 2014 predates native JSON support (added in 2016).
+2. SQL Server database created
 
-### `app/scheduler/poller.py`
-- `poll_once(xlsx_path, as_of=None)` — loads the Excel line master, computes a report for every line, and saves each as a snapshot. One line failing unexpectedly is logged and skipped — it doesn't stop the rest of the cycle.
-- `start_scheduler(xlsx_path)` — starts an APScheduler `BackgroundScheduler` that calls `poll_once` every 10 minutes, with an immediate first run on startup.
 
-### `app/export.py`
-- `_flatten(snapshots)` — converts nested snapshot rows (one row per line per cycle, with DL/FT as embedded JSON) into a flat table: one row per DL/FT slot per cycle. This is the shape used both for CSV/XLSX downloads and the Historical Data web page.
-- `to_csv_bytes()` / `to_xlsx_bytes()` — generate the actual downloadable file content.
+3. ODBC Driver installed
 
-### `app/api/routes.py` (JSON API)
-See section 11 for the full endpoint reference.
 
-### `app/api/html_routes.py` (Web pages)
-See section 10 for the full page reference. Built with **zero JavaScript** per requirement — all filtering, pagination, and downloads work through plain HTML forms/links and full page reloads.
 
-### `app/main.py`
-The FastAPI application entrypoint — mounts static files, includes both routers, and wires up the DB init + scheduler start on application startup.
+The important requirement from your project is:
+
+ODBC Driver 17 for SQL Server
+
+You can also use a compatible ODBC Driver if needed.
+
 
 ---
 
-## 6. Database Schema
+Step 4: Create the database
 
-Single table: `line_status`. One row is written **per line, per poll cycle** (i.e. every 10 minutes, every line gets a new row — this is intentionally a time-series log, not an upsert, so full history is preserved).
+Open SQL Server Management Studio.
 
-| Column | Type | Meaning |
-|---|---|---|
-| id | Integer, PK, autoincrement | (`IDENTITY` on SQL Server) |
-| line_no | String(50) | e.g. `LINE 01` |
-| line_name | String(200) | e.g. `Assembly Line 01` |
-| ip_address | String(50) | |
-| as_of | String(30) | ISO 8601 timestamp of this poll cycle |
-| line_status | String(20) | `RUNNING` \| `STALE` \| `ERROR` \| `DISABLED` |
-| last_seen | String(30) | ISO 8601, last ScanSendPoint timestamp seen |
-| gap_minutes | Float | Minutes between `as_of` and `last_seen` |
-| total_dl / total_ft | Integer | From Excel, at time of this cycle |
-| dl_running / dl_stopped | Integer | Counts, for quick dashboard display |
-| ft_running / ft_stopped | Integer | Counts, for quick dashboard display |
-| dl_report_json / ft_report_json | String(4000) | JSON text, e.g. `{"1": true, "2": false, ...}` — plain text, not a native JSON column (SQL Server 2014 compatibility) |
-| error | String(1000) | Populated only for ERROR status, or partial errors during a RUNNING cycle |
+Run:
 
-Indexes: `(line_no, as_of)` and `(as_of)` — supports both "give me this line's history" and "give me everyone's status at time X" query patterns efficiently.
+CREATE DATABASE UpdateServerDB;
+
+After creating it, you don't need to manually create the tables because your Python server is designed to create its required tables automatically.
+
 
 ---
 
-## 7. Installation Guide
+Step 5: Configure server_config.json
 
-### Prerequisites
-- Python 3.10+ (tested with 3.12)
-- Access to the factory's `C:\InLine_Pro\logs\...` and Data.ini paths (read access is sufficient)
-- For production: SQL Server 2014 instance + "ODBC Driver 17 for SQL Server" installed on the app server
+Go to:
 
-### Steps
+UPDATE_SERVER/server_config.json
 
-```bash
-# 1. Extract the project and enter the folder
-cd inline_pro
+Currently, it contains something like:
 
-# 2. Create and activate a virtual environment
-python3 -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+"server": "YOUR_SQL_SERVER_NAME_OR_IP"
 
-# 3. Install dependencies
-pip install fastapi uvicorn openpyxl apscheduler python-multipart jinja2 sqlalchemy
+You must change this.
 
-# (Production only, for SQL Server 2014 — see section 13)
-pip install pyodbc
-```
+Example 1: SQL Server on the same computer
 
-No further build step is needed — this is a pure Python application, no compilation, no Node/npm, no JavaScript bundling.
+"server": "localhost"
 
----
+Example 2: Named SQL Server instance
 
-## 8. Configuration Guide
+"server": "YOUR-PC-NAME\\SQLEXPRESS"
 
-### 8.1 Point the app at your real Excel line master
+Example 3: SQL Server using IP
 
-```bash
-# Linux/Mac
-export LINE_MASTER_XLSX_PATH=/path/to/line_master.xlsx
+"server": "192.168.1.100"
 
-# Windows PowerShell
-$env:LINE_MASTER_XLSX_PATH="C:\InLine_Pro\config\line_master.xlsx"
-```
+Your configuration may look like:
 
-If not set, it defaults to the bundled test fixture (`tests/fixtures/line_master.xlsx`) — fine for trying the app out, **must** be changed before real use.
+{
+    "host": "0.0.0.0",
+    "port": 5000,
 
-Your Excel file must have header row 1 with (some tolerance for wording — see `HEADER_ALIASES` in `line_master.py`):
-`Line No.` | `Line Name` | `IP Address` | `Data Directory (Path)` | `Config File / Directory` | `DL` | `FT` | `Status`
+    "sql_server": {
+        "driver": "{ODBC Driver 17 for SQL Server}",
+        "server": "192.168.1.100",
+        "database": "UpdateServerDB",
+        "trusted_connection": true,
+        "uid": "",
+        "pwd": ""
+    },
 
-### 8.2 Point the app at your real database (production)
+    "releases_dir": "releases",
 
-See section 13 for the full SQL Server 2014 setup. For local testing, no configuration is needed — SQLite is used automatically, stored at `data/inline_pro.db`.
+    "admin_api_key": "YOUR_SECRET_KEY_HERE",
 
-### 8.3 Verify each line's paths are reachable
+    "known_products": [
+        "MAIN_PC",
+        "DL_PC",
+        "FT_PC_D3",
+        "FT_PC_SETUP2"
+    ]
+}
 
-Before relying on the dashboard, it's worth manually confirming:
-- `<Data Directory Path>\<today's date>_New.log` exists and is readable for each line
-- `<Config File / Directory>` (the Data.ini path) exists and is readable for each line
+Important: Change the admin API key
 
-If either is wrong, that line will show status `ERROR` on the dashboard with the exact path and reason in the `error` field — check that field first when troubleshooting a line that never shows RUNNING.
+Change:
 
----
+"admin_api_key": "CHANGE_ME_BEFORE_DEPLOYING"
 
-## 9. Running the Application
+to your own secret key, for example:
 
-### Development / testing
+"admin_api_key": "MySuperSecretUpdateKey2026"
 
-```bash
-uvicorn app.main:app --reload --port 8000
-```
+You can create your own key. This key is used when uploading new application versions.
 
-- `--reload` restarts the server automatically when you edit code — useful during development, **remove this flag in production**.
-- Visit `http://localhost:8000/dashboard` in a browser for the web UI.
-- Visit `http://localhost:8000/docs` for interactive, auto-generated API documentation (Swagger UI) — lets you try every JSON endpoint directly from the browser.
-
-### What happens on startup
-1. `init_db()` runs — creates the `line_status` table if it doesn't already exist (does **not** create the database itself — that must exist beforehand, especially on SQL Server).
-2. The background scheduler starts and immediately runs one poll cycle (so you don't have to wait 10 minutes to see initial data), then repeats every 10 minutes for as long as the process runs.
-
-### Production (Windows server)
-
-Recommended: run behind a process manager so it restarts automatically on crash/reboot. Two common options:
-
-**Option A — NSSM (Non-Sucking Service Manager)**, wraps the command as a Windows Service:
-```
-nssm install InLineProMonitoring "C:\path\to\venv\Scripts\uvicorn.exe" "app.main:app --host 0.0.0.0 --port 8000"
-```
-
-**Option B — Task Scheduler**, run at startup:
-Create a scheduled task that runs `venv\Scripts\uvicorn.exe app.main:app --host 0.0.0.0 --port 8000` at system startup, with "Run whether user is logged on or not."
-
-`--host 0.0.0.0` (instead of the default `127.0.0.1`) is needed if other machines on the factory network need to view the dashboard, not just the server itself.
 
 ---
 
-## 10. Web Pages — User Guide
+Step 6: Install Update Server Python packages
 
-All pages are pure HTML/CSS — no JavaScript anywhere. Filtering and pagination work through standard links and form submissions (full page reload each time).
+Open Command Prompt inside:
 
-| Page | URL | What it shows |
-|---|---|---|
-| Dashboard | `/dashboard` (also `/`) | Latest status of every line: summary counts (Running/Stale/Error/Disabled) plus a card per line with DL/FT running counts. Click any line card to see its detail. |
-| Lines list | `/lines` | Same data as the dashboard, in a flat table — useful for scanning many lines at once. |
-| Line Detail | `/lines/{line_no}` | Full detail for one line: status, last-seen time, gap in minutes, and a color-coded grid of every valid DL and FT slot (green = Running, red = Stopped). If the line isn't currently RUNNING, the DL/FT grids show an empty-state message instead (matches the business rule in section 4). |
-| Configuration | `/configuration` | Read-only view of the Excel line master — every line's IP, log path, ini path, DL/FT totals, and enabled/disabled status. To change configuration, edit the Excel file directly; changes take effect on the next poll cycle (no restart needed). |
-| Historical Data | `/historical?date=YYYY-MM-DD&shift=A\|B\|C&line_no=...` | Pick a date and shift (and optionally one line) via the filter form, then view a flattened table of every DL/FT status recorded during that shift window, with pagination (50 rows/page) and **Download CSV** / **Download Excel** buttons. |
+UPDATE_SERVER
 
-**Downloading shift data:** on the Historical Data page, after selecting a date/shift (and optional line), two buttons appear. These are plain links straight to the export API (`/api/reports/shift-download`) — clicking them downloads the file directly, no page navigation needed.
+For example:
 
----
+cd C:\Complete_code_v6\UPDATE_SERVER
 
-## 11. API Reference
+Then install:
 
-Base URL: `http://<server>:8000`
+pip install -r requirements.txt
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/health` | Health check — returns `{"status": "ok"}` |
-| GET | `/api/lines` | Dashboard data: summary counts + latest snapshot for every line |
-| GET | `/api/lines/{line_no}` | Latest snapshot for one line. `404` if that line has no data yet. |
-| GET | `/api/lines/{line_no}/history?start=ISO&end=ISO` | All snapshots for one line within a datetime range |
-| GET | `/api/history?start=ISO&end=ISO` | All snapshots for all lines within a datetime range |
-| GET | `/api/reports/shift-download?date=YYYY-MM-DD&shift=A\|B\|C&fmt=csv\|xlsx[&line_no=...]` | Shift-wise export. Returns the file directly (`Content-Disposition: attachment`). `404` if no data found for that window; `400` if `shift` isn't A/B/C. |
-| POST | `/api/poll-now` | Triggers an on-demand poll cycle across all lines immediately (outside the normal 10-minute schedule) |
+This installs:
 
-**Example — fetch dashboard data:**
-```bash
-curl http://localhost:8000/api/lines
-```
+FastAPI
 
-**Example — download Shift C for a specific date and line, as Excel:**
-```bash
-curl -o shift_data.xlsx "http://localhost:8000/api/reports/shift-download?date=2026-08-18&shift=C&line_no=LINE%2001&fmt=xlsx"
-```
+Uvicorn
 
-Full interactive documentation (try-it-yourself, generated automatically from the code): `http://localhost:8000/docs`
+python-multipart
+
+pyodbc
+
+
 
 ---
 
-## 12. Testing Guide
+Step 7: Run the Update Server
 
-Every module has a corresponding test file in `tests/`, and they were all run against your **real uploaded log file and Data.ini sample** — not synthetic data — before being trusted.
+Inside the UPDATE_SERVER folder, run:
 
-```bash
-cd inline_pro
-venv/bin/python tests/test_log_parser.py       # log parsing + 45-min rule
-venv/bin/python tests/test_engine.py           # slot-trim rule + Data.ini mapping
-venv/bin/python tests/test_status_engine.py    # full per-line status computation
-venv/bin/python tests/test_shifts.py           # shift window math (incl. Shift C midnight rollover)
-venv/bin/python tests/test_full_pipeline.py    # DB + multi-cycle history + export
-venv/bin/python tests/test_api.py              # every JSON API endpoint
-venv/bin/python tests/test_html_pages.py       # every HTML page renders correctly
-```
+uvicorn update_server:app --host 0.0.0.0 --port 5000
 
-Each script prints its results and asserts expected values — a clean run with no `AssertionError` and ending in an "ALL ... PASSED" message means that layer is working correctly. If you change any business rule (e.g., the 45-minute threshold, or the slot-trim logic), re-run these before deploying — they'll catch a regression immediately.
+If successful, you should see something similar to:
 
-**Test fixtures used** (`tests/fixtures/`):
-- `20260818_New.log` — your real uploaded log file
-- `Data.ini` — reconstructed from your real pasted sample
-- `line_master.xlsx` — a small synthetic Excel file (4 lines, covering RUNNING, ERROR, and DISABLED cases) since a real Excel file hasn't been provided yet
+Uvicorn running on http://0.0.0.0:5000
 
-**Before going live**, replace `line_master.xlsx` testing with your actual Excel file and re-run `test_status_engine.py`-style checks against it to confirm every line's paths resolve correctly.
 
 ---
 
-## 13. Deploying to SQL Server 2014
+Step 8: Test the Update Server
 
-The application defaults to SQLite (zero-config, good for testing). For production against your company's SQL Server 2014:
+On the server PC, open:
 
-### Step 1 — Create the database (once, in SQL Server Management Studio)
-```sql
-CREATE DATABASE InLineProDB;
-```
-(The application creates the `line_status` **table** automatically on startup — it does not create the database itself.)
+http://localhost:5000
 
-### Step 2 — Install the ODBC driver on the app server
-Download and install "**ODBC Driver 17 for SQL Server**" from Microsoft (compatible with SQL Server 2014).
+For API documentation:
 
-### Step 3 — Install the Python driver
-```bash
-pip install pyodbc
-```
+http://localhost:5000/docs
 
-### Step 4 — Set the connection string
+From another PC, use the Update Server machine IP:
 
-```powershell
-# SQL Server authentication
-$env:DATABASE_URL="mssql+pyodbc://sql_user:sql_password@YOUR_SQL_SERVER/InLineProDB?driver=ODBC+Driver+17+for+SQL+Server"
+http://SERVER_IP:5000
 
-# OR Windows integrated authentication
-$env:DATABASE_URL="mssql+pyodbc://YOUR_SQL_SERVER/InLineProDB?driver=ODBC+Driver+17+for+SQL+Server&trusted_connection=yes"
-```
+Example:
 
-### Step 5 — Run the app as normal
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-No code changes are required — the same `database.py`/`repository.py` code runs against either database via SQLAlchemy Core.
+http://192.168.1.100:5000/docs
 
-### Why SQL Server 2014 specifically needed care
-- **No native JSON type or JSON functions** (`OPENJSON`, `JSON_VALUE`) — those were added in SQL Server 2016. The DL/FT per-slot reports are stored as plain `NVARCHAR(4000)` text, JSON-encoded/decoded in Python — this works identically on 2014, 2016+, and SQLite.
-- **IDENTITY vs AUTOINCREMENT** — handled transparently by SQLAlchemy based on which database dialect it's talking to; no manual SQL needed.
+If this doesn't open from another PC, check:
 
-### If `pyodbc` can't be installed
-Some corporate environments restrict compiled C extensions. `pymssql` is an alternative pure-Python-friendlier driver — if `pyodbc` is blocked, let the development team know and the connection layer can be adjusted to support a `mssql+pymssql://...` URL instead (same SQLAlchemy Core code, different driver).
+Windows Firewall
 
-**Important — this configuration is untested against a live SQL Server instance.** It was verified as *correct by construction* (valid SQLAlchemy dialect, IDENTITY-compatible schema, no JSON-type dependency), but no SQL Server 2014 instance was available during development. **The first deployment should include a smoke test**: run `tests/test_full_pipeline.py` (with `DATABASE_URL` pointed at the real SQL Server instance) as an early sanity check before relying on it in production.
+Port 5000
+
+Network connectivity
+
+
 
 ---
 
-## 14. Troubleshooting
+PART B — RUN MAIN_PC
 
-| Symptom | Likely cause | Where to check |
-|---|---|---|
-| A line always shows `ERROR` | Log directory path or Data.ini path wrong/unreachable | The `error` field on that line's detail page or API response gives the exact path and OS error |
-| A line shows `STALE` even though it's running | The log file's `ScanSendPoint` events have stopped appearing, or the log file naming doesn't match `yyyymmdd_New.log` | Manually check the log file's most recent `ScanSendPoint` timestamp; confirm filename matches today's date |
-| Dashboard is empty / no lines shown | No poll cycle has run yet, or Excel line master path is misconfigured | Check server startup logs for the immediate first poll; verify `LINE_MASTER_XLSX_PATH` is set correctly |
-| A line's DL/FT counts look wrong (too many/few slots) | Total DL/Total FT in Excel doesn't match what's actually wired for that line, or the shortfall is unevenly split across racks | Check that line's `Total DL`/`Total FT` in Excel; the slot-trim rule assumes an even split — an odd shortfall raises an error rather than guessing |
-| Shift-wise download returns "No data found" (404) | No poll cycles fell within that shift's time window for that date | Confirm the scheduler was actually running during that time window; check `/api/history` for that date range directly |
-| Server won't start: `ModuleNotFoundError` | A dependency isn't installed in the active virtual environment | Re-run the `pip install` commands from section 7 inside the activated venv |
-| SQL Server connection fails | ODBC driver not installed, wrong server name, or firewall blocking the connection | Test the raw ODBC connection independently (e.g. via `sqlcmd` or SSMS) before troubleshooting the Python side |
+Go to:
 
----
+MAIN_PC
 
-## 15. Project File Structure
+First check the requirements:
 
-```
-inline_pro/
-├── app/
-│   ├── parsers/
-│   │   ├── log_parser.py         # ScanSendPoint extraction + 45-min liveness rule
-│   │   └── data_ini_parser.py    # RACK1/RACK2 CHECK/NOT_CHECK -> DL/FT status
-│   ├── engine/
-│   │   ├── slot_rules.py         # Total DL/FT -> valid slot numbers (trim rule)
-│   │   ├── shifts.py             # Shift A/B/C window calculation
-│   │   └── status_engine.py      # Combines all of the above into one report per line
-│   ├── config/
-│   │   └── line_master.py        # Excel line-master reader
-│   ├── db/
-│   │   ├── database.py           # SQLAlchemy engine/schema (SQLite or SQL Server)
-│   │   └── repository.py         # save/query snapshots
-│   ├── scheduler/
-│   │   └── poller.py             # 10-minute polling job (APScheduler)
-│   ├── api/
-│   │   ├── routes.py             # JSON API endpoints
-│   │   └── html_routes.py        # HTML page routes (pure HTML/CSS, no JS)
-│   ├── templates/                # Jinja2 HTML templates
-│   │   ├── base.html
-│   │   ├── dashboard.html
-│   │   ├── lines.html
-│   │   ├── line_detail.html
-│   │   ├── configuration.html
-│   │   └── historical.html
-│   ├── static/
-│   │   └── style.css             # All styling — zero JavaScript in the project
-│   ├── export.py                 # CSV/XLSX generation for shift downloads
-│   ├── main.py                   # FastAPI app entrypoint
-│   └── settings.py                # Config (Excel path from env var)
-├── tests/                          # One test file per module, run with venv/bin/python
-│   └── fixtures/                    # Real log/Data.ini samples + synthetic Excel file
-├── docs/
-│   └── MANUAL.md                     # This document
-├── data/
-│   └── inline_pro.db                  # SQLite DB (dev only; not used when DATABASE_URL points to SQL Server)
-└── README.md                            # Quick-start summary
+cd C:\Complete_code_v6\MAIN_PC
 
-```
+pip install -r requirements.txt
+
+Then you need to identify the main startup file.
+
+From your project files, the likely main application file is:
+
+main_pc_popup.py
+
+Run:
+
+python main_pc_popup.py
+
+If there is a configuration error, check:
+
+MAIN_PC/config.json
+
 
 ---
 
-## 16. Known Limitations / Not Yet Built
+PART C — RUN DL_PC
 
-- **Pass Count / Fail Count per DL/FT** (shown in early UI mockups) is not implemented — it requires parsing PASS/FAIL result lines from the log file, and a sample of that log format hasn't been provided yet. Everything else (line status, DL/FT running/stopped, shift-wise export) is fully working.
-- **Pass vs Fail trend charts** were explicitly descoped by request (no JavaScript charting library used).
-- **Authentication/Login, Users, and Alerts pages** are not yet built (planned as Phase 5).
-- **Editing configuration through the web UI** is not implemented — the Configuration page is currently read-only; changes must be made directly in the Excel file (picked up automatically on the next poll cycle, no restart needed).
-- The SQL Server 2014 connection path is implemented and structurally verified, but has not been tested against a live SQL Server instance (see section 13's note).
+Go to:
+
+DL_PC
+
+Your main dashboard appears to be:
+
+dl_dashboard.py
+
+Run:
+
+cd C:\Complete_code_v6\DL_PC
+
+Then:
+
+python dl_dashboard.py
+
+There are also process files such as:
+
+process_file.py
+process_files.py
+
+Depending on your workflow, these may be background worker programs.
+
+You may need to run:
+
+python process_file.py
+
+or:
+
+python process_files.py
+
+But first, start the dashboard and see how your current application is designed to launch/manage those workers.
+
 
 ---
 
-*End of document.*
+PART D — RUN FT_PC_D3
+
+Go to:
+
+FT_PC_D3
+
+The main dashboard is:
+
+ft_dashboard_D3.py
+
+Run:
+
+cd C:\Complete_code_v6\FT_PC_D3
+
+Then:
+
+python ft_dashboard_D3.py
+
+Your background worker is likely:
+
+ft_process_file_D3.py
+
+You can test it separately:
+
+python ft_process_file_D3.py
+
+
+---
+
+PART E — RUN FT_PC_SETUP2
+
+Go to:
+
+FT_PC_SETUP2
+
+The main dashboard appears to be:
+
+ft_dashboard_v1.py
+
+Run:
+
+cd C:\Complete_code_v6\FT_PC_SETUP2
+
+Then:
+
+python ft_dashboard_v1.py
+
+The worker appears to be:
+
+ft_process_file_v1.py
+
+Run separately for testing:
+
+python ft_process_file_v1.py
+
+
+---
+
+Recommended Running Order
+
+I recommend you test the system in this order:
+
+1️⃣ First start SQL Server
+
+Make sure:
+
+SQL Server 2014
+        ↓
+UpdateServerDB
+
+is working.
+
+
+---
+
+2️⃣ Start Update Server
+
+cd UPDATE_SERVER
+
+pip install -r requirements.txt
+
+uvicorn update_server:app --host 0.0.0.0 --port 5000
+
+Test:
+
+http://localhost:5000/docs
+
+
+---
+
+3️⃣ Configure each application's Update Server IP
+
+You need to add something like this to the configuration files:
+
+MAIN_PC/config.json
+
+"update_server": {
+    "base_url": "http://192.168.1.100:5000",
+    "product": "MAIN_PC"
+}
+
+DL_PC/config.json
+
+"update_server": {
+    "base_url": "http://192.168.1.100:5000",
+    "product": "DL_PC"
+}
+
+FT_PC_D3/ft_config.json
+
+"update_server": {
+    "base_url": "http://192.168.1.100:5000",
+    "product": "FT_PC_D3"
+}
+
+FT_PC_SETUP2/ft_config_v1.json
+
+"update_server": {
+    "base_url": "http://192.168.1.100:5000",
+    "product": "FT_PC_SETUP2"
+}
+
+Replace:
+
+192.168.1.100
+
+with your actual Update Server IP.
+
+
+---
+
+Very Important: Your Code Is Not Fully Connected Yet
+
+After checking your project README, the update system has instructions saying that update_client.py still needs to be integrated into the applications.
+
+You need to copy:
+
+UPDATE_SERVER/update_client.py
+
+into:
+
+MAIN_PC/
+DL_PC/
+FT_PC_D3/
+FT_PC_SETUP2/
+
+Then connect the Update button and automatic update logic.
+
+
+---
+
+Step-by-Step Architecture
+
+Your complete system should work like this:
+
+SQL SERVER 2014
+                      │
+                      │
+                      ▼
+             UPDATE SERVER PC
+              FastAPI :5000
+                      │
+          ┌───────────┼───────────┐
+          │           │           │
+          ▼           ▼           ▼
+       MAIN_PC       DL_PC      FT_PC
+          │           │           │
+          ▼           ▼           ▼
+     Dashboard     Dashboard    Dashboard
+          │           │           │
+          └───────────┼───────────┘
+                      │
+                      ▼
+              Check for Updates
+                      │
+                      ▼
+             Download New EXE
+                      │
+                      ▼
+             updater_helper.exe
+                      │
+                      ▼
+              Replace Old EXE
+                      │
+                      ▼
+                Restart Program
+
+
+---
+
+My Recommended First Test
+
+Don't try to run everything simultaneously at first.
+
+First test only:
+
+1. SQL Server
+2. UPDATE_SERVER
+3. MAIN_PC
+
+Once those are working:
+
+4. DL_PC
+5. FT_PC_D3
+6. FT_PC_SETUP2
+
+
+---
+
+If you want, I can now inspect your actual code files one by one and give you an exact command-by-command guide, including:
+
+1. Which Python file to run first
+
+
+2. Which configuration values you must change
+
+
+3. How to connect SQL Server 2014
+
+
+4. How to run MAIN_PC → DL_PC → FT_PC communication
+
+
+5. Which .exe files need to be built with PyInstaller
+
+
+6. How to test the complete update system
+
+
+
+I can also make a complete setup guide specifically for your Complete_code_v6.zip project, based on the actual code rather than only the README.
