@@ -1,29 +1,21 @@
 """
-test_read_building_status_v2.py  —  Main PC diagnostic ONLY
-Standalone, READ-ONLY. Does not click, does not touch Data.ini.
+test_read_building_status.py  —  Main PC diagnostic ONLY
+Read-only. Does not click, does not edit Data.ini.
 
-v2 — fixes v1's wrong assumptions:
-  - v1 assumed "Front Rack" container's control_type is literally "Pane".
-    It is NOT (confirmed by your last test — lookup timed out).
-  - v1 assumed status text (Wait/Down/Pass) lives in "Edit" controls.
-    Your last run found 0 Edit controls near the Building labels at all.
+One-pass screen calibration report for InLine_Pro's Auto-Status
+Windows screen. Finds the exact pixel positions of every control
+inline_automation.py depends on, in a SINGLE run:
 
-v2 makes NO assumptions about control_type. Instead it:
-  1. Finds every control with title "Front Rack" or "Rear Rack" and
-     prints its REAL control_type + class_name (whatever it actually is).
-  2. Finds every control with title "Building 6" (there will be 2 — one
-     Front, one Rear) and prints their rect + real control_type/class.
-  3. For EACH "Building 6" instance, scans ALL descendants of the window
-     and lists every control (any type) sitting in the same row (top
-     within +/-5px) ordered left-to-right, printing type/class/text for
-     each. The status word should be one of these neighbors.
-  4. Same again for "Building 1" as a second data point (different
-     row, helps confirm the pattern is consistent).
+  STEP 1 — Connect to InLine_Pro
+  STEP 2 — Building 1-10 / Function 1-4 label + value positions
+           (Front + Rear racks)          -> building_check.* config
+  STEP 3 — STOP / SETUP / START / OK / Yes button positions + state
 
-Run while InLine_Pro is open AND while you can see the live screen:
-    python test_read_building_status_v2.py
+Run while InLine_Pro is open, on the Auto-Status Windows tab:
+    python test_read_building_status.py
+    (or the built .exe — see test_read_building_status.spec)
 
-Output -> test_read_output_v2.txt (and console)
+Output -> C:\\MainPC\\logs\\test_read_output.txt + console
 """
 
 import os
@@ -31,13 +23,16 @@ import sys
 import traceback
 from datetime import datetime
 
-OUTPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "test_read_output_v2.txt")
+OUTPUT_DIR = "C:\\MainPC\\logs"
+OUTPUT_FILE = os.path.join(OUTPUT_DIR, "test_read_output.txt")
+
+if not os.path.exists(OUTPUT_DIR):
+    os.makedirs(OUTPUT_DIR)
 
 try:
     from pywinauto import Application
 except ImportError:
-    print("ERROR: pywinauto not installed. Run:  pip install pywinauto")
+    print("ERROR: pywinauto not installed. Run: pip install pywinauto")
     sys.exit(1)
 
 
@@ -46,162 +41,195 @@ def log(msg, f):
     f.write(msg + "\n")
 
 
-def sep(f, c="=", w=90):
+def sep(f, c="=", w=92):
     log(c * w, f)
 
 
-def describe(ctrl):
-    """Return a dict of everything we can safely read about a control."""
-    out = {}
+def safe_text(ctrl) -> str:
     try:
-        out["control_type"] = ctrl.element_info.control_type
-    except Exception as e:
-        out["control_type"] = f"<err: {e}>"
-    try:
-        out["class_name"] = ctrl.class_name()
-    except Exception as e:
-        out["class_name"] = f"<err: {e}>"
-    try:
-        out["window_text"] = ctrl.window_text()
-    except Exception as e:
-        out["window_text"] = f"<err: {e}>"
-    try:
-        out["rect"] = ctrl.rectangle()
-    except Exception as e:
-        out["rect"] = f"<err: {e}>"
-    try:
-        out["auto_id"] = ctrl.element_info.automation_id
+        val = ctrl.window_text()
+        return str(val).strip() if val is not None else ""
     except Exception:
-        out["auto_id"] = ""
+        return ""
+
+
+def safe_value(ctrl) -> str:
     try:
-        out["get_value"] = ctrl.get_value()
+        val = ctrl.get_value()
+        return str(val).strip() if val is not None else ""
     except Exception:
-        out["get_value"] = "<n/a>"
-    return out
+        return ""
+
+
+def safe_rect(ctrl):
+    try:
+        return ctrl.rectangle()
+    except Exception:
+        return None
+
+
+def safe_enabled(ctrl):
+    try:
+        return ctrl.is_enabled()
+    except Exception:
+        return "?"
+
+
+def safe_control_type(ctrl) -> str:
+    try:
+        return ctrl.element_info.control_type
+    except Exception:
+        return "?"
+
+
+def safe_class_name(ctrl) -> str:
+    try:
+        return ctrl.class_name()
+    except Exception:
+        return "?"
+
+
+def find_value_for_label(all_ctrls, label_ctrl, tol=5):
+    """
+    Given a label control (e.g. 'Building 6'), find the closest Edit
+    control on the same row (top within tol px). Picks the CLOSEST
+    by horizontal distance rather than assuming a fixed left
+    position — this script is what CALIBRATES that fixed position
+    for building_check.*, so it can't assume it already knows it.
+    """
+    r = safe_rect(label_ctrl)
+    if r is None:
+        return None
+    candidates = []
+    for c in all_ctrls:
+        cr = safe_rect(c)
+        if cr is None:
+            continue
+        if abs(cr.top - r.top) <= tol and safe_control_type(c) == "Edit":
+            candidates.append((abs(cr.left - r.left), c))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
 
 
 def main():
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-        log(f"Building Status Read Test v2 — {datetime.now()}", f)
+        log(f"Screen Calibration Report — {datetime.now()}", f)
         log("", f)
 
-        # ---------------------------------------------------
+        # =====================================================
+        # STEP 1 — Connect
+        # =====================================================
         sep(f)
-        log("STEP 1 — Connect", f)
+        log("STEP 1 — Connect to InLine_Pro", f)
         sep(f)
         try:
             app = Application(backend="uia").connect(title_re=".*InLine.*", timeout=10)
             win = app.window(title_re=".*InLine.*")
             log(f"  Connected: '{win.window_text()}'", f)
         except Exception as e:
-            log(f"  ERROR connecting: {e}", f)
+            log(f"  ERROR: could not connect — {e}", f)
             log(traceback.format_exc(), f)
+            print(f"\nFAILED — see {OUTPUT_FILE}")
             return
 
-        # Cache descendants once — this can be a few hundred controls,
-        # walking it repeatedly is slow and InLine_Pro is a live app
-        # (positions could shift slightly between calls otherwise).
         log("  Caching window.descendants() once for this run...", f)
         all_ctrls = win.descendants()
         log(f"  Total descendants found: {len(all_ctrls)}", f)
-
-        # ---------------------------------------------------
-        sep(f)
-        log("STEP 2 — Real control_type/class_name for 'Front Rack' / 'Rear Rack'", f)
-        sep(f)
-        for wanted in ("Front Rack", "Rear Rack"):
-            matches = [c for c in all_ctrls if (c.window_text() or "").strip() == wanted]
-            log(f"  '{wanted}': {len(matches)} match(es)", f)
-            for m in matches:
-                d = describe(m)
-                log(f"    control_type={d['control_type']}  class_name={d['class_name']}  "
-                    f"rect={d['rect']}  auto_id={d['auto_id']!r}", f)
         log("", f)
 
-        # ---------------------------------------------------
+        # =====================================================
+        # STEP 2 — Building 1-10 / Function 1-4 positions, one pass
+        # =====================================================
         sep(f)
-        log("STEP 3 — All 'Building 6' instances + their row neighbors", f)
+        log("STEP 2 — Building / Function label + value positions", f)
+        log("Used to fill in config.json's building_check.* left/tolerance values.", f)
         sep(f)
-        b6_matches = [c for c in all_ctrls if (c.window_text() or "").strip() == "Building 6"]
-        log(f"  Found {len(b6_matches)} controls titled 'Building 6'", f)
 
-        for idx, b6 in enumerate(b6_matches):
-            d = describe(b6)
-            log("", f)
-            log(f"  --- 'Building 6' instance #{idx+1} ---", f)
-            log(f"    control_type={d['control_type']}  class_name={d['class_name']}  rect={d['rect']}", f)
+        row_fmt = "  {:<12} {:<6} {:<10} {:<9} | {:<9} {:<8} {:<8} {:<18}"
+        header = row_fmt.format(
+            "Title", "Found", "LabelLeft", "LabelTop",
+            "ValLeft", "ValTop", "ValType", "ValText")
 
-            try:
-                b6_rect = b6.rectangle()
-            except Exception as e:
-                log(f"    could not get rectangle: {e}", f)
+        for group_label, count in (("Building", 10), ("Function", 4)):
+            for rack in ("Front", "Rear"):
+                log("", f)
+                log(f"  -- {group_label} 1-{count} ({rack} Rack, by visual position) --", f)
+                log(header, f)
+                log("  " + "-" * (len(header) - 2), f)
+                for n in range(1, count + 1):
+                    title = f"{group_label} {n}"
+                    title_normalized = title.replace(" ", "")
+                    # 2 real matches exist window-wide (front+rear share the
+                    # same title text) — list every one found, with its own
+                    # position, rather than guessing which side is which.
+                    # Space-tolerant: Building 10/20 render with an extra
+                    # space inside the number on this screen (e.g.
+                    # 'Building 1 0'), unlike Building 1-9 — comparing with
+                    # all internal whitespace stripped handles both without
+                    # changing anything for the already-working 1-9 case.
+                    matches = [c for c in all_ctrls
+                               if safe_text(c).replace(" ", "") == title_normalized]
+                    if not matches:
+                        log(row_fmt.format(title, "0", "-", "-", "-", "-", "-", "-"), f)
+                        continue
+                    for m in matches:
+                        r = safe_rect(m)
+                        left = r.left if r else "?"
+                        top = r.top if r else "?"
+                        val_ctrl = find_value_for_label(all_ctrls, m)
+                        if val_ctrl is not None:
+                            vr = safe_rect(val_ctrl)
+                            vleft = vr.left if vr else "?"
+                            vtop = vr.top if vr else "?"
+                            vtype = safe_control_type(val_ctrl)
+                            vtext = (safe_value(val_ctrl) or safe_text(val_ctrl))[:18]
+                        else:
+                            vleft = vtop = vtype = vtext = "<none>"
+                        log(row_fmt.format(
+                            title, str(len(matches)), str(left), str(top),
+                            str(vleft), str(vtop), str(vtype), str(vtext)), f)
+
+        log("", f)
+        log("  HOW TO READ THIS: for each title, the two rows are the Front", f)
+        log("  and Rear rack instances — whichever has the SMALLER LabelLeft", f)
+        log("  is Front, the larger is Rear (matches building_check.front_*", f)
+        log("  vs rear_* in config.json). Compare ValText against what the", f)
+        log("  screen shows right now to confirm you've got the right row.", f)
+
+        # =====================================================
+        # STEP 3 — Automation buttons
+        # =====================================================
+        log("", f)
+        sep(f)
+        log("STEP 3 — Automation button positions + enabled state", f)
+        log("Sanity-check for the buttons inline_automation.py clicks.", f)
+        sep(f)
+        btn_fmt = "  {:<10} {:<6} {:<12} {:<6} {:<6} {:<8}"
+        log(btn_fmt.format("Button", "Found", "ControlType", "Left", "Top", "Enabled"), f)
+        log("  " + "-" * 52, f)
+        for name in ("STOP", "SETUP", "START", "OK", "Yes"):
+            matches = [c for c in all_ctrls
+                       if safe_text(c) == name and safe_control_type(c) == "Button"]
+            if not matches:
+                log(btn_fmt.format(name, "0", "-", "-", "-", "-"), f)
                 continue
+            for m in matches:
+                r = safe_rect(m)
+                left = r.left if r else "?"
+                top = r.top if r else "?"
+                log(btn_fmt.format(name, str(len(matches)), safe_control_type(m),
+                                    str(left), str(top), str(safe_enabled(m))), f)
 
-            log(f"    Scanning ALL descendants for same row (top within +/-5px of {b6_rect.top})...", f)
-            row_ctrls = []
-            for c in all_ctrls:
-                try:
-                    r = c.rectangle()
-                    if abs(r.top - b6_rect.top) <= 5:
-                        row_ctrls.append(c)
-                except Exception:
-                    continue
-
-            # sort left -> right so output reads in visual order
-            row_ctrls_sorted = sorted(row_ctrls, key=lambda c: c.rectangle().left)
-            log(f"    {len(row_ctrls_sorted)} control(s) found in this row:", f)
-            log(f"    {'Left':<6} {'Type':<12} {'Class':<14} {'Text':<20} {'GetValue':<20}", f)
-            log(f"    {'-'*6} {'-'*12} {'-'*14} {'-'*20} {'-'*20}", f)
-            for c in row_ctrls_sorted:
-                cd = describe(c)
-                log(f"    {cd['rect'].left if hasattr(cd['rect'],'left') else '?':<6} "
-                    f"{str(cd['control_type']):<12} {str(cd['class_name']):<14} "
-                    f"{str(cd['window_text'])[:18]:<20} {str(cd['get_value'])[:18]:<20}", f)
-
-        # ---------------------------------------------------
+        log("", f)
         sep(f)
-        log("STEP 4 — Same check for 'Building 1' (second data point)", f)
-        sep(f)
-        b1_matches = [c for c in all_ctrls if (c.window_text() or "").strip() == "Building 1"]
-        log(f"  Found {len(b1_matches)} controls titled 'Building 1'", f)
-
-        for idx, b1 in enumerate(b1_matches):
-            d = describe(b1)
-            log("", f)
-            log(f"  --- 'Building 1' instance #{idx+1} ---", f)
-            log(f"    control_type={d['control_type']}  class_name={d['class_name']}  rect={d['rect']}", f)
-            try:
-                b1_rect = b1.rectangle()
-            except Exception as e:
-                log(f"    could not get rectangle: {e}", f)
-                continue
-
-            row_ctrls = []
-            for c in all_ctrls:
-                try:
-                    r = c.rectangle()
-                    if abs(r.top - b1_rect.top) <= 5:
-                        row_ctrls.append(c)
-                except Exception:
-                    continue
-            row_ctrls_sorted = sorted(row_ctrls, key=lambda c: c.rectangle().left)
-            log(f"    {len(row_ctrls_sorted)} control(s) found in this row:", f)
-            log(f"    {'Left':<6} {'Type':<12} {'Class':<14} {'Text':<20} {'GetValue':<20}", f)
-            log(f"    {'-'*6} {'-'*12} {'-'*14} {'-'*20} {'-'*20}", f)
-            for c in row_ctrls_sorted:
-                cd = describe(c)
-                log(f"    {cd['rect'].left if hasattr(cd['rect'],'left') else '?':<6} "
-                    f"{str(cd['control_type']):<12} {str(cd['class_name']):<14} "
-                    f"{str(cd['window_text'])[:18]:<20} {str(cd['get_value'])[:18]:<20}", f)
-
-        sep(f)
-        log("TEST COMPLETE", f)
+        log("REPORT COMPLETE", f)
         sep(f)
 
-    print(f"\nDone. Open {OUTPUT_FILE}")
-    print("Look at STEP 3 / STEP 4 row tables — find the control whose")
-    print("Text or GetValue column shows 'Wait' / 'Down' / 'Not Use' / 'PASS'")
-    print("right now, matching what you see live on screen for that Building.")
+    print(f"\nDone. Open {OUTPUT_FILE} for full results.")
+    print("STEP 2 -> config.json building_check.front_label_left / front_value_left / etc.")
+    print("STEP 3 -> confirms STOP/SETUP/START/OK/Yes are all found as expected")
 
 
 if __name__ == "__main__":
