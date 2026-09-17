@@ -30,7 +30,7 @@ except (ImportError, Exception):
         )
 
 from config_loader import get_config
-from ini_editor import uncheck_dl, uncheck_ft
+from ini_editor import uncheck_dl, uncheck_ft, check_dl, check_ft
 
 # =========================================================
 # Use the SAME logger name ("Process") that main_pc_popup.py
@@ -94,6 +94,161 @@ def _bc_enabled() -> bool:
 
 
 # =========================================================
+# Post-sequence safety re-check — config access
+#
+# Guards against a PCB rolling into this exact site DURING the
+# several seconds the stop sequence takes to run (STOP -> ini edit
+# -> SETUP -> OK -> START -> Yes -> OK). If that happens, the site
+# is left NOT_CHECK in Data.ini but physically occupied — InLine_Pro
+# can then try to download to it anyway and time out, sometimes
+# auto-stopping the whole line right after we just restarted it.
+#
+# Confirmed against a live screenshot of Auto-Status Windows
+# (InLine_Pro_Ver 3.1.8.01): a site that's correctly unchecked shows
+# "Not Use" (distinct from "Wait", which is Step 0's pre-check ready
+# state — a checked, empty site also shows "Wait", not "Not Use").
+#
+# Recovery: if the site does NOT show "Not Use" after the wait, a
+# board rolled in mid-sequence — it needs to be processed normally,
+# not left disabled. So re-CHECK the site in Data.ini (undo the
+# earlier uncheck) and restart the machine (SETUP -> OK -> START ->
+# Yes -> OK) so InLine_Pro picks it up.
+# =========================================================
+_PC_DEFAULTS = {
+    "enabled": True,
+    "recheck_wait_sec": 10,        # wait after the sequence before re-reading the site
+    "expected_text": "Not Use",    # what the site should show once correctly unchecked
+}
+
+def _pc_cfg() -> dict:
+    cfg = get_config()
+    if "post_check" not in cfg:
+        logger.warning(
+            "[automation] 'post_check' section missing from config.json "
+            "— using hardcoded defaults. Add it to config.json to customise."
+        )
+        return dict(_PC_DEFAULTS)
+    result = dict(_PC_DEFAULTS)
+    result.update(cfg["post_check"])
+    return result
+
+def _pc_enabled() -> bool:
+    return bool(_pc_cfg().get('enabled', True))
+
+
+def verify_and_recover(dl_name: str, app, window, is_ft: bool) -> None:
+    """
+    Post-sequence safety net — called after all 9 click/edit steps
+    complete successfully. Does NOT affect the return value of
+    run_stop_sequence(); the sequence is already considered a
+    success at this point. This only detects and recovers from the
+    board-rolled-in-mid-sequence race described above.
+
+    1. Wait recheck_wait_sec, re-read the site's status.
+    2. Shows 'Not Use' (expected_text) — correctly unchecked, log
+       success, done.
+    3. Shows anything else — a board rolled into this site during
+       the sequence, so it needs to be processed normally rather
+       than left disabled. Re-CHECK the site in Data.ini (undo the
+       uncheck_dl/uncheck_ft from earlier in the sequence) and
+       restart the machine (SETUP -> OK -> START -> Yes -> OK) so
+       InLine_Pro picks the board up.
+    """
+    if not _pc_enabled():
+        return
+
+    cfg = _pc_cfg()
+    wait1 = int(cfg["recheck_wait_sec"])
+    expected = cfg["expected_text"].replace(" ", "").strip()
+
+    logger.info(
+        f"[automation] STEP 10/10: post-check — waiting {wait1}s then "
+        f"re-reading {dl_name}'s status"
+    )
+    time.sleep(wait1)
+
+    try:
+        if is_ft:
+            rack, fn_num = _parse_ft_task(dl_name)
+            current_status = _read_function_status(window, rack, fn_num)
+        else:
+            rack, building_num = dl_to_rack_building(dl_name)
+            current_status = _read_building_status(window, rack, building_num)
+    except (RuntimeError, ValueError) as e:
+        logger.warning(f"[automation] STEP 10/10: post-check read failed: {e}")
+        current_status = None
+
+    if current_status == expected:
+        logger.info(
+            f"[automation] STEP 10/10: {dl_name} shows '{expected}' as "
+            f"expected — automation complete, all clear."
+        )
+        return
+
+    logger.warning(
+        f"[automation] STEP 10/10: {dl_name} shows '{current_status}' "
+        f"(expected '{expected}') — a board entered during the "
+        f"sequence. Re-checking site in Data.ini and restarting the "
+        f"machine so it's processed normally."
+    )
+
+    # Re-CHECK the site — undo the uncheck_dl/uncheck_ft from earlier
+    # in this same sequence, since the site is now genuinely occupied
+    # and InLine_Pro needs to process the board rather than skip it.
+    try:
+        if is_ft:
+            rechecked = check_ft(fn_num, rack)
+            label = f"FUNCTION{fn_num} ({rack})"
+        else:
+            rechecked = check_dl(dl_name)
+            label = dl_name
+        if rechecked:
+            logger.info(
+                f"[automation] STEP 10/10: Data.ini — {label} re-checked "
+                f"(CHECK)")
+        else:
+            logger.warning(
+                f"[automation] STEP 10/10: Data.ini — {label} re-check "
+                f"SKIPPED (already CHECK, or a read/write error — see "
+                f"ini_editor log lines above)")
+    except Exception as e:
+        logger.error(
+            f"[automation] STEP 10/10: Data.ini re-check failed: {e} — "
+            f"MANUAL INTERVENTION NEEDED, site may be stuck NOT_CHECK "
+            f"with a board physically present"
+        )
+        return
+
+    # Restart the machine so InLine_Pro reloads Data.ini (now with
+    # this site re-checked) and resumes normal processing.
+    try:
+        logger.info(f"[automation] STEP 10/10: recovery restart — Click SETUP")
+        _click_button(window, "SETUP")
+
+        logger.info(f"[automation] STEP 10/10: recovery restart — Click OK (setup dialog)")
+        _click_dialog_button(app, "OK")
+
+        logger.info(f"[automation] STEP 10/10: recovery restart — Click START")
+        _click_button(window, "START")
+
+        logger.info(f"[automation] STEP 10/10: recovery restart — Click Yes (start confirmation)")
+        _click_dialog_button(app, "Yes")
+
+        logger.info(f"[automation] STEP 10/10: recovery restart — Click OK (final dialog)")
+        _click_dialog_button(app, "OK")
+
+        logger.info(
+            f"[automation] STEP 10/10: {dl_name} — recovery restart "
+            f"complete, machine resumed"
+        )
+    except RuntimeError as e:
+        logger.error(
+            f"[automation] STEP 10/10: recovery restart failed: {e} — "
+            f"MANUAL INTERVENTION NEEDED, line may still be stopped"
+        )
+
+
+# =========================================================
 # DL name -> (rack, building_num)
 #
 # Mirrors ini_editor.dl_to_ini_key() so the rack-split logic
@@ -131,21 +286,19 @@ def dl_to_rack_building(dl_name: str) -> tuple:
             f"DL number out of range 1-20: {dl_name!r} (parsed as {dl_num})"
         )
 
-    if dl_num <= 10:
+    if dl_num <= 11:
         rack = "front"
         building_num = dl_num
     else:
         rack = "rear"
         building_num = dl_num - 10
 
-    # Screen only has Building 1-9. DL10->front-10 and DL20->rear-10
-    # don't exist on screen — catch this early with a clear message
-    # rather than silently searching for "Building 10" and failing.
-    if building_num > 9:
+    # Screen only has Building 1-10. DL10->front-10 and DL20->rear-10
+    if building_num > 10:
         raise ValueError(
             f"{dl_name!r} maps to Building {building_num} on {rack} rack "
-            f"but screen only has Buildings 1-9 "
-            f"(DL10/DL20 are not valid building positions)."
+            f"but screen only has Buildings 1-10 "
+            f"(DL11/DL21 are not valid building positions)."
         )
 
     return rack, building_num
@@ -247,16 +400,37 @@ def _find_building_label(window, rack: str, building_num: int):
     Two matches exist window-wide (front+rear) for the same title —
     disambiguate by the label's known left x-position.
     Uses _safe_text() so stale UIA elements don't crash the walk.
+
+    Building 1-9: plain exact match, confirmed working live —
+    UNTOUCHED, do not modify this part.
     """
     cfg = _bc_cfg()
     target_left = cfg['front_label_left'] if rack == "front" else cfg['rear_label_left']
     tol = cfg['row_top_tolerance_px']
     title = f"Building {building_num}"
 
+    # --- Building 10 / Building 20 special case (hardcoded) --------
+    # Two conflicting reports on the real text for this one label:
+    # test_read_building_status.py's raw captured output showed
+    # "Building 1 0" (space inside the number), but a direct look at
+    # the actual screen shows "Building10" (no space at all) — unlike
+    # Building 1-9, which render plainly as "Building N" with a
+    # normal single space. Accepting all three variants costs nothing
+    # for Building 1-9 (untouched, still strict exact match) and
+    # maximizes the chance of matching Building 10/20 correctly
+    # without needing to resolve which report was right. Comment out
+    # / remove this block if a future InLine_Pro build renders
+    # Building 10 differently.
+    acceptable_titles = {title}
+    if building_num == 10:
+        acceptable_titles.add("Building 1 0")
+        acceptable_titles.add("Building10")
+    # -----------------------------------------------------------------
+
     candidates = []
     for c in window.descendants():
         try:
-            if _safe_text(c) == title:
+            if _safe_text(c) in acceptable_titles:
                 candidates.append(c)
         except Exception:
             continue
@@ -723,16 +897,29 @@ def run_stop_sequence(dl_name:str)->bool:
                 )
                 return False
 
-            # Step 1 — ini edit (DL only)
+            # Step 1 — Click STOP FIRST, before touching Data.ini.
+            # (Reordered from the old STOP-comes-after-ini sequence.)
+            # Rationale: wait_for_building_clear() above only confirms
+            # the site was empty at the moment we last polled — a new
+            # PCB can still roll in during the gap between that read
+            # and the machine actually being stopped. Stopping the
+            # line FIRST, immediately after confirming clear, closes
+            # that window as tightly as possible. Editing Data.ini
+            # (step 2) then happens with the machine already halted,
+            # so no board is moving while NOT_CHECK is being written.
+            logger.info(f"[automation] STEP 1/9: Click STOP")
+            _click_button(window, "STOP")
+
+            # Step 2 — ini edit , now that the line is stopped
             if not is_ft:
-                logger.info(f"[automation] STEP 1/9: Edit Data.ini — uncheck {dl_name}")
+                logger.info(f"[automation] STEP 2/9: Edit Data.ini — uncheck {dl_name}")
                 updated = uncheck_dl(dl_name)
                 if updated:
                     logger.info(
-                        f"[automation] STEP 1/9: Edit Data.ini — OK")
+                        f"[automation] STEP 2/9: Edit Data.ini — OK")
                 else:
                     logger.warning(
-                        f"[automation] STEP 1/9: Edit Data.ini — SKIPPED "
+                        f"[automation] STEP 2/9: Edit Data.ini — SKIPPED "
                         f"(already unchecked or error)")
             else:
                 # FT task — uncheck FUNCTION row in Data.ini
@@ -741,21 +928,18 @@ def run_stop_sequence(dl_name:str)->bool:
                     updated = uncheck_ft(fn_num, rack)
                     if updated:
                         logger.info(
-                            f"[automation] STEP 1/9: Data.ini — OK, "
+                            f"[automation] STEP 2/9: Data.ini — OK, "
                             f"FUNCTION{fn_num} ({rack}) set to NOT_CHECK"
                         )
                     else:
                         logger.warning(
-                            f"[automation] STEP 1/9: Data.ini — SKIPPED "
+                            f"[automation] STEP 2/9: Data.ini — SKIPPED "
                             f"(FUNCTION{fn_num} already NOT_CHECK or error)"
                         )
                 except Exception as e:
                     logger.error(
-                        f"[automation] STEP 1/9: Data.ini FT edit failed: {e}"
+                        f"[automation] STEP 2/9: Data.ini FT edit failed: {e}"
                     )
-
-            logger.info(f"[automation] STEP 4/9: Click STOP")
-            _click_button(window,"STOP")
 
             logger.info(f"[automation] STEP 5/9: Click SETUP")
             _click_button(window,'SETUP')
@@ -777,6 +961,13 @@ def run_stop_sequence(dl_name:str)->bool:
                 f"(attempt {attempt}/{retries})"
             )
             logger.info(f"[automation] {'='*60}")
+
+            # Post-check: did a board roll into this site DURING the
+            # sequence above? Recovers by re-starting the machine if
+            # so. Does not change the True/False result of this
+            # function — the sequence itself already succeeded.
+            verify_and_recover(dl_name, app, window, is_ft)
+
             return True
 
         except RuntimeError as e:
