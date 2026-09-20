@@ -1423,7 +1423,7 @@ if __name__ == "__main__":
     threading.Thread(target=_start_ft_tcp_listener,  daemon=True).start()
 
     conn_logger.info(
-        f"[main] Main PC popup started — "
+        f"[main] Main PC popup started (v{APP_VERSION}) — "
         f"DL port={_listen_port()}, FT port={_ft_listen_port()}"
     )
 
