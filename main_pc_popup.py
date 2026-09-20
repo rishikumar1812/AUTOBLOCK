@@ -20,14 +20,19 @@ import socket
 import logging
 import threading
 import tkinter as tk
-from tkinter import font as tkfont
+from tkinter import font as tkfont, messagebox
 from tray_utils import SingleInstance, TrayIconManager, hide_console
 from datetime import datetime
 
-from config_loader import get_config,cleanup_days
+from config_loader import get_config,cleanup_days,update_server_url,update_product_name
 from ini_editor import uncheck_dl,uncheck_ft
-from inline_automation import run_stop_sequence, _is_ft_task
+from inline_automation import (
+    run_stop_sequence, _is_ft_task,
+    RESULT_STOPPED, RESULT_RESTARTED, RESULT_POST_CHECK_FAILED, RESULT_ERROR,
+)
 from log_cleanup import cleanup_old_logs, DailyFileHandler
+from version import APP_VERSION
+import update_client as uc
 
 
 # =========================================================
@@ -40,6 +45,16 @@ def _log_dir()        -> str: return get_config()["paths"]["log_dir"]
 def _exe_name()       -> str: return get_config()["app"]["exe_name"]
 def _hello_timeout_minutes() -> int:
     return int(get_config()["dashboard"].get("hello_timeout_minutes", 16))
+
+def _main_pc_exe_path() -> str:
+    """
+    This dashboard's own exe path — Main PC is a single exe (unlike
+    DL PC / FT PC, which each split into a dashboard + background
+    worker), so the update target IS the currently running process.
+    """
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    return os.path.abspath(__file__)  # dev mode — no real exe to swap
 
 
 # =========================================================
@@ -144,10 +159,26 @@ _popup_queue : list        = []
 _state_lock  = threading.Lock()
 _queue_lock  = threading.Lock()
 
-# DL state tracking — 3 possible states per DL:
-#   "processing" — signal received, automation running
-#   "stopped"    — automation confirmed success
-#   "error"      — automation failed, manual intervention needed
+# Set once at startup (see entry point below) so _queue_worker() can
+# push a native OS-level tray notification + tooltip update when a
+# DL/FT automation fails and needs manual intervention — a custom Tk
+# toast alone auto-fades in a few seconds and is easy to miss if
+# nobody's looking at that exact moment; the tray icon itself is the
+# durable signal that survives until the operator actually notices.
+_sys_tray_ref = None
+
+# DL state tracking — 5 possible states per DL:
+#   "processing"         — signal received, automation running
+#   "stopped"            — automation succeeded, post-check needed
+#                          no recovery at all (site was already fine)
+#   "restarted"          — automation succeeded, post-check's
+#                          recovery re-check + restart WAS needed
+#                          and succeeded — site is fine, flagged for
+#                          review since a recovery action was taken
+#   "post_check_failed"  — automation succeeded, but the post-check's
+#                          own recovery restart failed — site WAS
+#                          stopped correctly, recovery needs checking
+#   "error"              — automation itself failed, manual intervention needed
 #
 # Structure: {dl_name: {"state": str, "ts": str}}
 _dl_states : dict = {}
@@ -190,15 +221,72 @@ def _task_display_name(task_key:str)->str:
             ft_id=parts[1]
             rack=parts[2].capitalize()
             func=parts[3] if len(parts)>3 else ""
-            return f"FT_{ft_id}_{rack}_{function_label}"
+            return f"FT_{ft_id}_{rack}_{func}"
         except Exception:
             return task_key
     return task_key
+
+
+def _notify_manual_intervention(display: str, reason: str = None) -> None:
+    """
+    Called whenever a DL/FT automation needs manual intervention —
+    either the automation itself failed, or it succeeded but the
+    post-check's own recovery restart then failed (see the two
+    non-success branches in _queue_worker below, which each pass
+    their own accurate `reason` text).
+
+    Pushes TWO durable, tray-level signals — on top of the existing
+    _popup_queue toast, which auto-fades in a few seconds and is
+    easy to miss:
+      1. A native OS balloon/toast notification (persists in the
+         Windows Action Center until dismissed, unlike the custom
+         Tk toast).
+      2. The tray icon's hover tooltip updated to show how many
+         lines currently need attention, so the count is visible at
+         a glance without needing to have seen the original alert.
+
+    Safe to call even if the tray isn't up yet (_sys_tray_ref is
+    None during early startup, or the sequence-failure happened
+    before the entry point finished wiring the tray) — does nothing
+    in that case rather than raising.
+    """
+    if _sys_tray_ref is None:
+        return
+
+    if reason is None:
+        reason = "automation failed"
+
+    with _state_lock:
+        error_count = sum(
+            1 for s in _dl_states.values()
+            if s.get("state") in ("error", "post_check_failed", "restarted")
+        )
+
+    try:
+        _sys_tray_ref.show_balloon(
+            "Manual Intervention Required",
+            f"{display} {reason} — check Main PC now",
+            once_only=False,
+        )
+    except Exception as e:
+        process_logger.error(f"[queue] show_balloon failed: {e}")
+
+    try:
+        if error_count > 0:
+            _sys_tray_ref.update_tooltip(
+                f"Main PC — {error_count} line(s) need manual intervention"
+            )
+        else:
+            _sys_tray_ref.update_tooltip("Main PC")
+    except Exception as e:
+        process_logger.error(f"[queue] update_tooltip failed: {e}")
+
+
 # =========================================================
 # Sequential task queue worker
 # =========================================================
 def _queue_worker() -> None:
-    process_logger.info("[queue] Worker started")
+    process_logger.info(f"[queue] Worker started (v{APP_VERSION})")
     while True:
         dl_name = _task_queue.get()
         if dl_name is None:
@@ -206,16 +294,15 @@ def _queue_worker() -> None:
         display=_task_display_name(dl_name)
         try:
             process_logger.info(f"[queue] Processing stop for {dl_name}")
-            success = run_stop_sequence(dl_name)
+            result = run_stop_sequence(dl_name)
 
             now = datetime.now()
             ts = now.strftime("%d-%m-%Y %H:%M:%S")
-            if success:
-                # Automation confirmed — mark as stopped
+            if result == RESULT_STOPPED:
+                # Automation AND post-check both confirmed — stopped
                 with _state_lock:
                     _dl_states[dl_name] = {"state": "stopped", "ts": ts, "ts_dt": now}
 
-                # Queue toast
                 with _queue_lock:
                     _popup_queue.append({
                         "type":    "STOP",
@@ -226,12 +313,66 @@ def _queue_worker() -> None:
                     })
 
                 process_logger.info(f"[queue] {display} — stopped OK at {ts}")
-            else:
-                # Automation failed — mark as error, operator must act
+
+            elif result == RESULT_RESTARTED:
+                # Main sequence succeeded, AND a board rolled in
+                # mid-sequence that needed the recovery re-check +
+                # restart — which itself succeeded. Site is in a
+                # good state, but still flagged (not plain
+                # "Stopped") since a recovery action was taken and
+                # is worth a human glance to confirm everything's
+                # actually fine.
+                with _state_lock:
+                    _dl_states[dl_name] = {"state": "restarted", "ts": ts, "ts_dt": now}
+
+                with _queue_lock:
+                    _popup_queue.append({
+                        "type":    "RESTART_NEEDED",
+                        "dl_name": display,
+                        "source":  "FT" if _is_ft_task(dl_name) else "DL",
+                        "ts":      ts,
+                        "ts_dt":   now,
+                    })
+
+                process_logger.warning(
+                    f"[queue] {display} — stopped OK, board rolled in "
+                    f"mid-sequence, recovery restart succeeded at {ts}. "
+                    f"Flagged for review."
+                )
+                _notify_manual_intervention(
+                    display, reason="recovered from a board rolling in mid-sequence")
+
+            elif result == RESULT_POST_CHECK_FAILED:
+                # Main sequence succeeded (site WAS correctly
+                # stopped) — but the post-check's own recovery
+                # restart then failed. Distinct state from a full
+                # automation failure: the operator needs to know the
+                # site itself is fine, only the recovery attempt
+                # afterward needs checking.
+                with _state_lock:
+                    _dl_states[dl_name] = {"state": "post_check_failed", "ts": ts, "ts_dt": now}
+
+                with _queue_lock:
+                    _popup_queue.append({
+                        "type":    "POST_CHECK_ERROR",
+                        "dl_name": display,
+                        "source":  "FT" if _is_ft_task(dl_name) else "DL",
+                        "ts":      ts,
+                        "ts_dt":   now,
+                    })
+
+                process_logger.error(
+                    f"[queue] {display} — stopped OK but post-check "
+                    f"recovery FAILED at {ts}. Manual intervention required."
+                )
+                _notify_manual_intervention(
+                    display, reason="stopped OK, but recovery restart failed")
+
+            else:  # RESULT_ERROR
+                # Automation itself failed — mark as error, operator must act
                 with _state_lock:
                     _dl_states[dl_name] = {"state": "error", "ts": ts, "ts_dt": now}
 
-                # Queue error toast
                 with _queue_lock:
                     _popup_queue.append({
                         "type":    "ERROR",
@@ -245,6 +386,7 @@ def _queue_worker() -> None:
                     f"[queue] {display} — automation FAILED at {ts}. "
                     f"Manual intervention required."
                 )
+                _notify_manual_intervention(display, reason="automation failed")
         except Exception as e:
             process_logger.error(f"[queue] {display} — unexpected error: {e}")
             now = datetime.now()
@@ -258,6 +400,7 @@ def _queue_worker() -> None:
                     "ts":      ts,
                     "ts_dt":   now,
                 })
+            _notify_manual_intervention(display, reason="hit an unexpected error")
         finally:
             _task_queue.task_done()
 
@@ -510,6 +653,27 @@ def show_toast(root: tk.Tk, item: dict) -> None:
         icon      = "⚠"
         title     = f"{source} AUTOMATION FAILED"
         body_text = f"{dl_name}  manual intervention required"
+    elif kind == "RESTART_NEEDED":
+        # Main 9-step sequence succeeded, AND a board rolled in
+        # mid-sequence that needed the recovery re-check + restart —
+        # which itself succeeded. Site is in a good state, but still
+        # flagged (not a plain STOP toast) since a recovery action
+        # was taken and is worth a human glance.
+        bar_color = COL_WARN
+        icon      = "⚠"
+        title     = f"{source} RESTART — MANUAL INTERVENTION REQUIRED"
+        body_text = f"{dl_name}  stopped OK, recovered from a board mid-sequence"
+    elif kind == "POST_CHECK_ERROR":
+        # Main 9-step sequence succeeded (site WAS correctly
+        # stopped) — a board rolled in during the sequence and the
+        # automatic recovery re-check + restart then failed. Same
+        # alert color as ERROR (still needs a human), distinct
+        # wording so the operator knows the site itself did stop
+        # correctly, only the recovery attempt afterward didn't.
+        bar_color = COL_WARN
+        icon      = "⚠"
+        title     = f"{source} FAILED-RESTART — MANUAL INTERVENTION"
+        body_text = f"{dl_name}  stopped OK, but recovery restart failed"
     else:   # HELLO
         bar_color = COL_OK
         icon      = "🔗"
@@ -560,7 +724,16 @@ def show_toast(root: tk.Tk, item: dict) -> None:
         for ww in w.winfo_children():
             ww.bind("<Button-1>", dismiss)
 
-    toast.after(4500, fade_out)
+    # ERROR toasts (manual intervention required) stay up longer than
+    # a routine STOP/HELLO notification (10s vs 4.5s) so there's more
+    # time to notice a critical alert — still click-to-dismiss early
+    # if you catch it sooner. The tray-level signals in
+    # _notify_manual_intervention() (native OS balloon + tooltip) are
+    # the durable, always-visible backup for this same event even
+    # after this toast fades.
+    toast.after(
+        10_000 if kind in ("ERROR", "POST_CHECK_ERROR", "RESTART_NEEDED") else 4500,
+        fade_out)
 
 
 def _pop_next_popup_item() -> dict:
@@ -624,6 +797,7 @@ class TrayWindow:
         self._build()
         self._poll_popup_queue()
         self._refresh()
+        self._schedule_daily_update_check()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build(self) -> None:
@@ -633,7 +807,7 @@ class TrayWindow:
         hdr = tk.Frame(self.root, bg=BG_HEADER, width=W, height=34)
         hdr.place(x=0, y=0)
         hdr.pack_propagate(False)
-        tk.Label(hdr, text="DL & FT Monitor  *  Main PC",
+        tk.Label(hdr, text=f"DL & FT Monitor  *  Main PC  v{APP_VERSION}",
                  font=self.f_title, bg=BG_HEADER,
                  fg=COL_WHITE).pack(expand=True)
 
@@ -765,9 +939,19 @@ class TrayWindow:
                                     command=self._clear_blocked,
                                     bg=BG_HEADER, fg=COL_MUTED,
                                     font=self.f_small, relief=tk.RAISED,
-                                    padx=12, pady=4,
+                                    padx=8, pady=4,
                                     cursor="hand2", state=tk.DISABLED)
-        self.btn_clear.place(x=W//2, y=455, anchor="n")
+        self.btn_clear.place(x=W//2 - 6, y=455, anchor="ne")
+
+        # Placeholder — not yet wired to the update server (TBD).
+        self.btn_update = tk.Button(self.root,
+                                    text="Update",
+                                    command=self._on_update_clicked,
+                                    bg=BG_HEADER, fg=COL_MUTED,
+                                    font=self.f_small, relief=tk.RAISED,
+                                    padx=8, pady=4,
+                                    cursor="hand2")
+        self.btn_update.place(x=W//2 + 6, y=455, anchor="nw")
 
 
     # ── Connection dot animation ──────────────────────────
@@ -896,30 +1080,38 @@ class TrayWindow:
         # Count each state for summary header
         n_proc  = sum(1 for v in states.values() if v["state"] == "processing")
         n_stop  = sum(1 for v in states.values() if v["state"] == "stopped")
+        n_rst   = sum(1 for v in states.values() if v["state"] == "restarted")
+        n_pcf   = sum(1 for v in states.values() if v["state"] == "post_check_failed")
         n_err   = sum(1 for v in states.values() if v["state"] == "error")
 
         summary = []
         if n_proc: summary.append(f"{n_proc} processing")
         if n_stop: summary.append(f"{n_stop} stopped")
+        if n_rst:  summary.append(f"{n_rst} restarted")
+        if n_pcf:  summary.append(f"{n_pcf} failed-restart")
         if n_err:  summary.append(f"{n_err} error")
 
         tk.Label(
             self.list_frame,
             text="  •  ".join(summary),
             font=self.f_small, bg=BG_MAIN,
-            fg=COL_WARN if n_err else COL_BLOCK,
+            fg=COL_WARN if (n_err or n_pcf or n_rst) else COL_BLOCK,
         ).pack(anchor="w", pady=(0, 4))
 
         # State colors and labels
         STATE_COLOR = {
-            "processing": COL_CHECK,   # blue
-            "stopped":    COL_BLOCK,   # red
-            "error":      COL_WARN,    # yellow
+            "processing":         COL_CHECK,   # blue
+            "stopped":            COL_BLOCK,   # red
+            "restarted":          COL_WARN,    # yellow
+            "post_check_failed":  COL_WARN,    # yellow
+            "error":              COL_WARN,    # yellow
         }
         STATE_LABEL = {
-            "processing": "Processing...",
-            "stopped":    "Stopped",
-            "error":      "⚠ Error — manual needed",
+            "processing":         "Processing...",
+            "stopped":            "Stopped",
+            "restarted":          "⚠ Restart — Manual Intervention Required",
+            "post_check_failed":  "⚠ Failed-Restart — Manual Intervention",
+            "error":              "⚠ Manual Intervention Required",
         }
 
         # Sort by when the entry was last updated — newest first,
@@ -1055,6 +1247,134 @@ class TrayWindow:
         except Exception:
             pass
 
+    def _on_update_clicked(self) -> None:
+        """
+        Manual "update this line now" action (button press). Shows
+        every dialog: connection errors, already-up-to-date,
+        apply-now confirmation, success/failure. For the SILENT
+        scheduled path, see _run_scheduled_update_check /
+        _daily_update_check_tick instead — that one shows nothing
+        and never asks for confirmation, since nobody is watching an
+        unattended 7am run.
+        """
+        self.btn_update.config(state=tk.DISABLED, text="Checking...")
+        threading.Thread(
+            target=self._run_update_check, args=(True,), daemon=True).start()
+
+    def _run_scheduled_update_check(self) -> None:
+        """
+        Silent counterpart to _on_update_clicked, used ONLY by the
+        7am automatic check. Never shows a dialog and never asks for
+        confirmation — if an update is found, it's applied straight
+        away. Everything that would have been a dialog is logged
+        instead, so there's still a full record in the log file even
+        though nobody's watching an unattended run.
+        """
+        threading.Thread(
+            target=self._run_update_check, args=(False,), daemon=True).start()
+
+    def _run_update_check(self, manual: bool):
+        result = uc.check_and_download(
+            server_url=update_server_url(),
+            product=update_product_name(),
+            current_version=APP_VERSION,
+            staging_dir=_log_dir(),
+        )
+        self.root.after(0, lambda: self._on_update_check_done(result, manual))
+
+    def _on_update_check_done(self, result: dict, manual: bool) -> None:
+        if manual:
+            try:
+                self.btn_update.config(state=tk.NORMAL, text="Update")
+            except tk.TclError:
+                pass
+
+        if not result.get("update_available"):
+            # A checkin error (server unreachable, timeout, etc.) also
+            # ends up with update_available=False, same as "genuinely
+            # up to date" — needs telling apart, especially for the
+            # unattended 7am automatic check, where this is the ONLY
+            # trace left of what happened.
+            if result.get("error"):
+                conn_logger.warning(
+                    f"[main] Update check could not reach server: "
+                    f"{result.get('error')}")
+                if manual:
+                    messagebox.showerror(
+                        "Update",
+                        "Could not reach the update server — check "
+                        "network connectivity and that the server is "
+                        f"running.\n\n{result.get('error')}",
+                        parent=self.root)
+                # else: scheduled path — already logged, no dialog.
+            else:
+                conn_logger.info(
+                    f"[main] Update check: already up to date (v{APP_VERSION})")
+                if manual:
+                    messagebox.showinfo(
+                        "Update", f"Already up to date (v{APP_VERSION}).",
+                        parent=self.root)
+            return
+
+        if not result.get("downloaded"):
+            conn_logger.warning(
+                f"[main] Update available (v{result.get('latest_version')}) "
+                f"but download failed: {result.get('error', 'unknown error')}")
+            if manual:
+                messagebox.showerror(
+                    "Update",
+                    f"Update available (v{result.get('latest_version')}) but "
+                    f"download failed: {result.get('error', 'unknown error')}",
+                    parent=self.root)
+            return
+
+        if manual:
+            ok = messagebox.askyesno(
+                "Update",
+                f"Downloaded v{result['latest_version']}. Apply and restart "
+                f"Main PC now?\n\nThis will close the tray and reopen it "
+                f"automatically — the DL/FT listeners will briefly stop "
+                f"during the restart.",
+                parent=self.root)
+            if not ok:
+                return
+        else:
+            conn_logger.info(
+                f"[main] Scheduled check: applying v{result['latest_version']} "
+                f"without confirmation")
+
+        target_exe = _main_pc_exe_path()
+        applied = uc.apply_update(target_exe, result["new_exe_path"])
+        if applied:
+            conn_logger.info(
+                f"[main] Update to v{result['latest_version']} applied — "
+                f"updater helper launched, restarting")
+            self.root.destroy()
+            sys.exit(0)
+        else:
+            conn_logger.error(
+                "[main] Could not start the updater helper for "
+                "main_pc_popup.exe.")
+            if manual:
+                messagebox.showerror(
+                    "Update",
+                    "Could not start the updater helper. Make sure "
+                    "updater_helper.exe is next to main_pc_popup.exe.",
+                    parent=self.root)
+
+    # ── 7am daily automatic update check ───────────────────
+    def _schedule_daily_update_check(self):
+        self._last_update_check_date = None
+        self.root.after(60_000, self._daily_update_check_tick)
+
+    def _daily_update_check_tick(self):
+        now = datetime.now()
+        if now.hour == 7 and self._last_update_check_date != now.date():
+            self._last_update_check_date = now.date()
+            delay_ms = uc.startup_jitter_seconds() * 1000
+            self.root.after(delay_ms, self._run_scheduled_update_check)
+        self.root.after(60_000, self._daily_update_check_tick)
+
 
 # =========================================================
 # Spy helper
@@ -1128,6 +1448,15 @@ if __name__ == "__main__":
         on_exit=_do_exit,
     )
     sys_tray.start()
+
+    # Wire up the module-level reference so _queue_worker() (already
+    # running in its own thread, started earlier at startup) can push
+    # tray-level manual-intervention alerts — see
+    # _notify_manual_intervention() near the top of this file.
+    # (No `global` keyword here — this is top-level module code
+    # inside `if __name__ == "__main__":`, not a function body, so a
+    # plain assignment already modifies the module-level name.)
+    _sys_tray_ref = sys_tray
 
     # Close button hides to tray
     root.protocol("WM_DELETE_WINDOW", _hide)
