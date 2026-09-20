@@ -33,6 +33,35 @@ from config_loader import get_config
 from ini_editor import uncheck_dl, uncheck_ft, check_dl, check_ft
 
 # =========================================================
+# run_stop_sequence() result codes
+#
+# Four distinguishable outcomes, not just True/False — a site can
+# succeed OR fail in meaningfully different ways depending on
+# whether the Step 10/10 post-check needed to use its recovery
+# restart at all, and if so, whether that restart worked:
+#   RESULT_STOPPED           — 9 steps succeeded, post-check found
+#                               the site already correctly 'Not
+#                               Use', no recovery needed at all
+#   RESULT_RESTARTED         — 9 steps succeeded, but a board rolled
+#                               in mid-sequence; post-check's
+#                               recovery re-check + restart BOTH
+#                               succeeded — site is in a good state,
+#                               but it's still flagged for review
+#                               since a recovery action was taken
+#   RESULT_POST_CHECK_FAILED — 9 steps succeeded, a board rolled in,
+#                               but the recovery re-check or restart
+#                               itself then failed — genuinely needs
+#                               a human to check
+#   RESULT_ERROR              — the 9-step sequence itself failed
+# These need different operator-facing labels (see
+# main_pc_popup.py's STATE_LABEL/STATE_COLOR).
+# =========================================================
+RESULT_STOPPED           = "stopped"
+RESULT_RESTARTED         = "restarted"
+RESULT_POST_CHECK_FAILED = "post_check_failed"
+RESULT_ERROR             = "error"
+
+# =========================================================
 # Use the SAME logger name ("Process") that main_pc_popup.py
 # configures with a DailyFileHandler writing to
 # Process_YYYY-MM-DD.log — every pywinauto automation step lands
@@ -136,13 +165,31 @@ def _pc_enabled() -> bool:
     return bool(_pc_cfg().get('enabled', True))
 
 
-def verify_and_recover(dl_name: str, app, window, is_ft: bool) -> None:
+def verify_and_recover(dl_name: str, app, window, is_ft: bool) -> str:
     """
     Post-sequence safety net — called after all 9 click/edit steps
-    complete successfully. Does NOT affect the return value of
-    run_stop_sequence(); the sequence is already considered a
-    success at this point. This only detects and recovers from the
-    board-rolled-in-mid-sequence race described above.
+    complete successfully.
+
+    Returns one of (see the RESULT_* constants above — reused here
+    directly since these map 1:1 to run_stop_sequence()'s own
+    result):
+        RESULT_STOPPED           — site already correctly shows
+                                    'Not Use', no recovery needed
+        RESULT_RESTARTED         — a board rolled in mid-sequence;
+                                    recovery re-check + restart BOTH
+                                    succeeded
+        RESULT_POST_CHECK_FAILED — a board rolled in, but the
+                                    recovery re-check or restart
+                                    itself then failed — genuinely
+                                    needs a human to go look
+
+    Previously this returned a plain bool that collapsed
+    RESULT_STOPPED and RESULT_RESTARTED into the same True — so a
+    site that needed its recovery restart, and successfully got it,
+    was indistinguishable on the dashboard from one that never
+    needed any recovery at all. This return value is what lets
+    run_stop_sequence() (see its call site) and main_pc_popup.py's
+    state tracking tell all three cases apart.
 
     1. Wait recheck_wait_sec, re-read the site's status.
     2. Shows 'Not Use' (expected_text) — correctly unchecked, log
@@ -155,7 +202,7 @@ def verify_and_recover(dl_name: str, app, window, is_ft: bool) -> None:
        InLine_Pro picks the board up.
     """
     if not _pc_enabled():
-        return
+        return RESULT_STOPPED
 
     cfg = _pc_cfg()
     wait1 = int(cfg["recheck_wait_sec"])
@@ -183,7 +230,7 @@ def verify_and_recover(dl_name: str, app, window, is_ft: bool) -> None:
             f"[automation] STEP 10/10: {dl_name} shows '{expected}' as "
             f"expected — automation complete, all clear."
         )
-        return
+        return RESULT_STOPPED
 
     logger.warning(
         f"[automation] STEP 10/10: {dl_name} shows '{current_status}' "
@@ -207,21 +254,33 @@ def verify_and_recover(dl_name: str, app, window, is_ft: bool) -> None:
                 f"[automation] STEP 10/10: Data.ini — {label} re-checked "
                 f"(CHECK)")
         else:
-            logger.warning(
-                f"[automation] STEP 10/10: Data.ini — {label} re-check "
-                f"SKIPPED (already CHECK, or a read/write error — see "
-                f"ini_editor log lines above)")
+            logger.info(
+                f"[automation] STEP 10/10: Data.ini — {label} already "
+                f"CHECK, no change needed")
     except Exception as e:
         logger.error(
             f"[automation] STEP 10/10: Data.ini re-check failed: {e} — "
             f"MANUAL INTERVENTION NEEDED, site may be stuck NOT_CHECK "
             f"with a board physically present"
         )
-        return
+        return RESULT_POST_CHECK_FAILED
 
     # Restart the machine so InLine_Pro reloads Data.ini (now with
     # this site re-checked) and resumes normal processing.
+    #
+    # IMPORTANT: by this point the main 9-step sequence has already
+    # clicked STOP (step 1) *and* SETUP -> OK -> START -> Yes -> OK
+    # (steps 5-9) — so the machine is already RUNNING again by the
+    # time this post-check runs. SETUP is only clickable right after
+    # STOP; clicking it while the machine is running is a no-op (the
+    # button click fires but changes nothing), which is exactly why
+    # the recovery restart appeared to silently do nothing. Click
+    # STOP again here first so the machine is actually stopped before
+    # driving through SETUP -> OK -> START -> Yes -> OK a second time.
     try:
+        logger.info(f"[automation] STEP 10/10: recovery restart — Click STOP")
+        _click_button(window, "STOP")
+
         logger.info(f"[automation] STEP 10/10: recovery restart — Click SETUP")
         _click_button(window, "SETUP")
 
@@ -241,11 +300,13 @@ def verify_and_recover(dl_name: str, app, window, is_ft: bool) -> None:
             f"[automation] STEP 10/10: {dl_name} — recovery restart "
             f"complete, machine resumed"
         )
+        return RESULT_RESTARTED
     except RuntimeError as e:
         logger.error(
             f"[automation] STEP 10/10: recovery restart failed: {e} — "
             f"MANUAL INTERVENTION NEEDED, line may still be stopped"
         )
+        return RESULT_POST_CHECK_FAILED
 
 
 # =========================================================
@@ -286,7 +347,14 @@ def dl_to_rack_building(dl_name: str) -> tuple:
             f"DL number out of range 1-20: {dl_name!r} (parsed as {dl_num})"
         )
 
-    if dl_num <= 11:
+    # DL01-DL10 -> front rack, DL11-DL20 -> rear rack — must match
+    # ini_editor.dl_to_ini_key()'s RACK1/RACK2 split exactly (<=10,
+    # not <=11). The old "<=11" here mapped DL11 to
+    # (front, building_num=11), which then always failed the
+    # "screen only has Buildings 1-10" check below — DL11 could
+    # never be stopped. DL13 etc. happened to still come out right
+    # because both boundaries only disagree on DL11 itself.
+    if dl_num <= 10:
         rack = "front"
         building_num = dl_num
     else:
@@ -832,7 +900,7 @@ def wait_for_function_clear(task_key: str, app, window) -> bool:
         time.sleep(poll_interval)
 
 
-def run_stop_sequence(dl_name:str)->bool:
+def run_stop_sequence(dl_name:str)->str:
     """
     Full stop sequence for a DL or FT task.
     Accepts either:
@@ -846,20 +914,33 @@ def run_stop_sequence(dl_name:str)->bool:
     Retries up to retry_attempts times on failure.
     Every step is logged to main_pc_popup_YYYY-MM-DD.log so an
     engineer can find the EXACT step that failed.
-    Returns:
-        True  — sequence completed successfully
-        False — all retries failed, OR Step 0 timed out waiting
-                for the building to clear (no retries are spent
-                on a Step-0 timeout — that's not a transient error,
-                retrying immediately won't change a board still
-                being physically present)
+
+    Returns one of (see the RESULT_* constants above):
+        RESULT_STOPPED           — sequence AND post-check both
+                                    completed successfully
+        RESULT_POST_CHECK_FAILED — the 9-step sequence completed
+                                    successfully, but Step 10/10's
+                                    post-check recovery then failed
+                                    (a board rolled in mid-sequence
+                                    and the automatic re-check +
+                                    restart didn't work) — the site
+                                    WAS correctly stopped, but needs
+                                    a human to check the recovery
+        RESULT_ERROR              — the 9-step sequence itself
+                                    failed after all retries, OR
+                                    Step 0 timed out waiting for the
+                                    building to clear (no retries are
+                                    spent on a Step-0 timeout — that's
+                                    not a transient error, retrying
+                                    immediately won't change a board
+                                    still being physically present)
     """
     if not _PYWINAUTO_AVAILABLE:
         logger.error(
             f"[automation] {dl_name} — pywinauto not available on this "
             f"platform. Run on Windows Main PC."
         )
-        return False
+        return RESULT_ERROR
 
     retries=_retry_attempts()
 
@@ -895,7 +976,7 @@ def run_stop_sequence(dl_name:str)->bool:
                     f"[automation] {dl_name} — STEP 0/9: slot never cleared. "
                     f"ABORTING — no Data.ini edit, no clicks."
                 )
-                return False
+                return RESULT_ERROR
 
             # Step 1 — Click STOP FIRST, before touching Data.ini.
             # (Reordered from the old STOP-comes-after-ini sequence.)
@@ -910,7 +991,21 @@ def run_stop_sequence(dl_name:str)->bool:
             logger.info(f"[automation] STEP 1/9: Click STOP")
             _click_button(window, "STOP")
 
-            # Step 2 — ini edit , now that the line is stopped
+            # Step 2 — ini edit (DL only), now that the line is stopped.
+            #
+            # uncheck_dl()/uncheck_ft() RAISE IniEditError for any
+            # GENUINE failure (Data.ini not found, section/key
+            # missing, bad DL/FT identity) — they only return False
+            # for the harmless "already NOT_CHECK, nothing to change"
+            # case. Deliberately NOT catching that exception here:
+            # letting it propagate up to this function's own
+            # `except Exception` below means a genuine Data.ini
+            # failure now correctly ABORTS this attempt (and retries/
+            # fails per the normal retry logic) with the line left
+            # STOPPED — instead of logging a vague "SKIPPED (already
+            # unchecked or error)" warning and proceeding straight to
+            # SETUP/START anyway, restarting the line with the
+            # blocked site never actually disabled.
             if not is_ft:
                 logger.info(f"[automation] STEP 2/9: Edit Data.ini — uncheck {dl_name}")
                 updated = uncheck_dl(dl_name)
@@ -918,27 +1013,25 @@ def run_stop_sequence(dl_name:str)->bool:
                     logger.info(
                         f"[automation] STEP 2/9: Edit Data.ini — OK")
                 else:
-                    logger.warning(
-                        f"[automation] STEP 2/9: Edit Data.ini — SKIPPED "
-                        f"(already unchecked or error)")
+                    logger.info(
+                        f"[automation] STEP 2/9: Edit Data.ini — "
+                        f"{dl_name} already NOT_CHECK, no change needed")
             else:
-                # FT task — uncheck FUNCTION row in Data.ini
-                try:
-                    rack, fn_num = _parse_ft_task(dl_name)
-                    updated = uncheck_ft(fn_num, rack)
-                    if updated:
-                        logger.info(
-                            f"[automation] STEP 2/9: Data.ini — OK, "
-                            f"FUNCTION{fn_num} ({rack}) set to NOT_CHECK"
-                        )
-                    else:
-                        logger.warning(
-                            f"[automation] STEP 2/9: Data.ini — SKIPPED "
-                            f"(FUNCTION{fn_num} already NOT_CHECK or error)"
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"[automation] STEP 2/9: Data.ini FT edit failed: {e}"
+                # FT task — uncheck FUNCTION row in Data.ini. (No
+                # local try/except here — see comment above: a
+                # genuine failure must propagate to this function's
+                # own except block, not be swallowed.)
+                rack, fn_num = _parse_ft_task(dl_name)
+                updated = uncheck_ft(fn_num, rack)
+                if updated:
+                    logger.info(
+                        f"[automation] STEP 2/9: Data.ini — OK, "
+                        f"FUNCTION{fn_num} ({rack}) set to NOT_CHECK"
+                    )
+                else:
+                    logger.info(
+                        f"[automation] STEP 2/9: Data.ini — FUNCTION{fn_num} "
+                        f"already NOT_CHECK, no change needed"
                     )
 
             logger.info(f"[automation] STEP 5/9: Click SETUP")
@@ -964,11 +1057,22 @@ def run_stop_sequence(dl_name:str)->bool:
 
             # Post-check: did a board roll into this site DURING the
             # sequence above? Recovers by re-starting the machine if
-            # so. Does not change the True/False result of this
-            # function — the sequence itself already succeeded.
-            verify_and_recover(dl_name, app, window, is_ft)
-
-            return True
+            # so. verify_and_recover() now returns one of the three
+            # RESULT_* codes directly — pass it straight through,
+            # since it already distinguishes "no recovery needed"
+            # from "recovery needed and succeeded" from "recovery
+            # needed and failed". This is what makes the toast, tray
+            # alert, and dashboard state label all correctly tell
+            # these three outcomes apart instead of collapsing the
+            # first two into a single generic "success".
+            post_check_result = verify_and_recover(dl_name, app, window, is_ft)
+            if post_check_result == RESULT_POST_CHECK_FAILED:
+                logger.error(
+                    f"[automation] {dl_name} — post-check recovery FAILED, "
+                    f"reporting this attempt as failed despite the main "
+                    f"sequence completing (see STEP 10/10 lines above)."
+                )
+            return post_check_result
 
         except RuntimeError as e:
             logger.error(
@@ -991,5 +1095,4 @@ def run_stop_sequence(dl_name:str)->bool:
         f"Manual intervention required. Check STEP lines above for exact failure point."
     )
     logger.error(f"[automation] {'='*60}")
-    return False
-
+    return RESULT_ERROR
